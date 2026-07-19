@@ -264,7 +264,23 @@ def src_jobspy(cfg):
                     print(f"  [jobspy] {site} '{term}' [{loc}{' remote' if is_rem else ''}]: {len(df)}")
                 except Exception as e:
                     print(f"  [jobspy] {site} '{term}' [{loc}] FAIL: {str(e)[:80]}", file=sys.stderr)
-    return out
+    # De-dup within the run and drop reposting floods: aggregator queries overlap heavily
+    # (~40% dup URLs) and staffing agencies repost one job dozens of times. Keep first-seen
+    # URLs, and at most JOBSPY_TITLE_CAP copies of any one company+title.
+    seen_urls, title_ct, cleaned = set(), {}, []
+    cap = jcfg.get("title_cap", 5)
+    for r_ in out:
+        u = r_.get("url")
+        if not u or u in seen_urls:
+            continue
+        seen_urls.add(u)
+        k = ((r_.get("company") or "").lower(), (r_.get("title") or "").lower())
+        title_ct[k] = title_ct.get(k, 0) + 1
+        if title_ct[k] > cap:
+            continue
+        cleaned.append(r_)
+    print(f"  [jobspy] deduped {len(out)} -> {len(cleaned)} rows (dropped dups + reposting floods)")
+    return cleaned
 
 # ---------------- iCIMS / Eightfold / Phenom ----------------
 def src_icims(host, name, search_terms=None):

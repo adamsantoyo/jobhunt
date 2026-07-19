@@ -446,6 +446,10 @@ FAMILY = {
  "tpm": ["technical program manager","program manager","tpm","technical project manager"],
  "tam": ["technical account manager","solutions engineer","customer success engineer","forward deployed"],
 }
+# The ONLY in-scope role families (2026-07-19). Anything outside this set — TPM, solutions
+# engineer, account management — is excluded from the output entirely, not just down-ranked.
+# Widen this tuple to re-open those lanes.
+IN_SCOPE_FAMILIES = ("support", "techops", "validation")
 # config-driven (single source of truth: config.json profile), memoized
 _P = _METRO_C = _BAY_C = _EXCL_C = None
 def _profile():
@@ -578,8 +582,13 @@ def score_row(r, desc):
     if hits2: why.append("domain: " + ",".join(h.replace("\\b", "").replace("\\", "") for h in hits2[:3]))
     elif hits1: why.append("domain: " + ",".join(h.replace("\\b", "").replace("\\", "") for h in hits1[:2]))
     score += dom
-    if fam is None and dom == 0:
-        return 0, "no function or domain match", ["skip"]
+    # No support/validation/techops/tpm/tam role family = it doesn't relate — exclude it from
+    # the output entirely (a lone domain keyword like "azure" on a Data/Silicon Engineer role
+    # is not a support job). Previously these were kept as tier-2 noise.
+    if fam is None:
+        return 0, "no role-family match", ["skip"]
+    if fam not in IN_SCOPE_FAMILIES:
+        return 0, "off-focus role (tpm/solutions/account-mgmt)", ["skip"]
     if any(re.search(p, company) for p in TARGET_CO) and fam:
         score += 1; flags.append("target-co"); why.append("named-target employer")
     why.append("Bay Area" if bay_area else "US-remote")
@@ -615,10 +624,8 @@ def score_row(r, desc):
     if re.search(r"bachelor'?s? degree (is )?required", d) and "equivalent" not in d:
         score -= 1; flags.append("degree-gated")
     tier = max(1, min(5, score))
-    # RUBRIC tier mapping enforced: 5 requires Function 3; no family at all = volume tier
-    if fam is None:
-        tier = min(tier, 2); flags.append("no-function-family")
-    elif func < 3 and tier > 4:
+    # RUBRIC tier mapping enforced: 5 requires Function 3 (fam is None already excluded above)
+    if func < 3 and tier > 4:
         tier = 4; flags.append("func-cap")
     if not desc and tier > 3:
         tier = 3; flags.append("needs-desc")  # rule zero: no 4/5 without a read description
