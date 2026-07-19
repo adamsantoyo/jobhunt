@@ -5,6 +5,8 @@ config.json
 RUBRIC.md
 # personal targeting narrative
 WORKFLOW.md
+# personal build plans (salary band, target companies)
+plans/
 # personal shortlists
 picks.json
 picks_llm.json

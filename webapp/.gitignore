@@ -1,0 +1,4 @@
+app.db*
+.venv-web/
+frontend/dist/
+frontend/node_modules/

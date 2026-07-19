@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Sweep orchestrator. Each shell call runs `python3 sweep.py --next` until DONE.
 Designed for ~45s execution windows: one chunk per call, state persisted between calls.
-  --next    run the next pending step (fixture gate runs first, aborts sweep on failure)
-  --status  show step states
-  --reset   clear state for a fresh weekly run (keeps seen.jsonl ledger)
+  --next        run the next pending step (fixture gate runs first, aborts sweep on failure)
+  --status      show step states
+  --reset       clear state for a fresh weekly run (keeps seen.jsonl ledger)
+  --skip NAME   mark a persistently-stuck step done so --next moves past it
 """
 import json, os, subprocess, sys, time
 
@@ -85,17 +86,29 @@ def main():
         for name, _ in STEPS:
             print(f"  {st.get(name, {}).get('status', 'pending'):9s} {name}")
         return
+    if arg == "--skip":
+        name = sys.argv[2] if len(sys.argv) > 2 else ""
+        if name not in {n for n, _ in STEPS}:
+            print(f"unknown step: {name}"); sys.exit(1)
+        st[name] = {"status": "done", "skipped": True, "rc": None}
+        save(st); print(f"skipped {name}"); return
     # --next
     for name, cmd in STEPS:
         if st.get(name, {}).get("status") == "done":
             continue
         t0 = time.time()
         print(f">>> {name}")
-        p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=40)
-        out = (p.stdout + p.stderr).strip()
+        try:
+            p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=40)
+            out = (p.stdout + p.stderr).strip()
+            rc = p.returncode
+        except subprocess.TimeoutExpired as e:
+            partial = "".join(s for s in (e.stdout, e.stderr) if isinstance(s, str))
+            out = (partial.strip() + "\n[timeout] step exceeded the 40s window; marked failed, retried next call").strip()
+            rc = -9
         print(out[-1200:])
-        ok = p.returncode == 0
-        st[name] = {"status": "done" if ok else "failed", "secs": round(time.time() - t0), "rc": p.returncode}
+        ok = rc == 0
+        st[name] = {"status": "done" if ok else "failed", "secs": round(time.time() - t0), "rc": rc}
         save(st)
         if name == "tests" and not ok:
             print("FIXTURES FAILED — sweep aborted per rubric gate."); sys.exit(2)

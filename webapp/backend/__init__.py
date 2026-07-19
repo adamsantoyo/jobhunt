@@ -1,0 +1,1 @@
+"""JobHunt webapp backend package."""
