@@ -219,7 +219,7 @@
       "indeed",
       "linkedin"
     ],
-    "results_wanted_per_site": 200,
+    "results_wanted_per_site": 1000,
     "results_wanted_linkedin": 60,
     "country_indeed": "USA",
     "hours_old": 720,
@@ -234,6 +234,7 @@
       }
     ],
     "searches_note": "Bay Area on-site + US-remote only (2026-07-18 directive). Each entry runs per term per site.",
-    "note": "glassdoor/zip_recruiter/google return empty from sandbox; ZipRecruiter + Dice covered by their MCP connectors; Glassdoor mirrors Indeed (same parent co)"
+    "note": "glassdoor/zip_recruiter/google return empty from sandbox; ZipRecruiter + Dice covered by their MCP connectors; Glassdoor mirrors Indeed (same parent co)",
+    "title_cap": 5
   }
 }

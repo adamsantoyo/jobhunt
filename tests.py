@@ -50,17 +50,17 @@ check("crusoe case", canon_company("CRUSOE") == canon_company("Crusoe"))
 check("boeing", canon_company("The Boeing Company") == canon_company("Boeing"))
 
 print("== score_row blockers/levels ==")
-t, w, f = score_row(row("Technical Program Manager II - Finance Data & Experiences", "Microsoft", "San Francisco, CA"), GOOD_DESC)
-check("TPM II not people-mgr", t > 0 and "tpm-ii-stretch" in f, (t, f))
+t, w, f = score_row(row("Technical Support Engineer II", "Datadog", "San Francisco, CA"), GOOD_DESC)
+check("'II' support role not people-mgr-blocked", t > 0, (t, f))
 t, _, _ = score_row(row("Manager, Technical Support Engineer", "CoreWeave", "San Jose, CA"), GOOD_DESC)
 check("Manager-comma blocked", t == 0)
 t, _, _ = score_row(row("Sr. Manager of Programs", "Wipro", "Oakland, CA"), GOOD_DESC)
 check("Manager-of blocked", t == 0)
-t, _, f = score_row(row("Senior Technical Program Manager", "Ring", "Palo Alto, CA"), GOOD_DESC)
-check("Senior TPM capped", t <= 3 and "too-senior" in f, (t, f))
+t, _, _ = score_row(row("Technical Program Manager", "Ring", "Palo Alto, CA"), GOOD_DESC)
+check("TPM excluded from output", t == 0, t)
 t, _, _ = score_row(row("Internal Support Engineer"), GOOD_DESC)
 check("'Internal' not blocked by intern", t > 0, t)
-t, _, _ = score_row(row("International Program Manager"), GOOD_DESC)
+t, _, _ = score_row(row("International Support Engineer"), GOOD_DESC)
 check("'International' not blocked by intern", t > 0, t)
 t, _, _ = score_row(row("Software Engineering Intern"), GOOD_DESC)
 check("Intern blocked", t == 0)
@@ -141,6 +141,29 @@ t, _, f = score_row(row("Technical Support Engineer", company="Okta"), "")
 check("no-desc caps at 3", t <= 3 and "desc-unavailable" in f, (t, f))
 t, w, f = score_row(row("Support Engineer"), "hands-on Azure support role. salary range $90,000 - $110,000. 2+ years of experience.")
 check("salary-from-desc fires", "salary-from-desc" in f and "comp in band" in w, (t, w, f))
+
+print("== unrelated-role exclusion ==")
+# a non-support role that only matches a domain keyword must be EXCLUDED, not kept as tier 2
+t, why, f = score_row(row("Infrastructure Engineer", loc="San Francisco, CA"),
+                      "Build cloud infrastructure on Azure. Python, Terraform. 3 years.")
+check("Infrastructure Engineer w/ azure keyword excluded", t == 0 and "role-family" in why, (t, why))
+t, _, _ = score_row(row("Silicon Design Verification Engineer", loc="San Jose, CA"),
+                    "Own RTL verification and datacenter silicon bring-up.")
+check("Silicon Design Verification excluded", t == 0, t)
+t, _, f = score_row(row("Technical Support Engineer", loc="San Francisco, CA"),
+                    "Support customers on Azure and Intune. 2 years.")
+check("real support role still kept", t > 0, (t, f))
+
+print("== in-scope gate (only support/validation/techops survive) ==")
+STRONG = "Support enterprise customers on Azure and Intune identity. 2+ years. salary range $110,000 - $140,000."
+t, _, _ = score_row(row("Technical Program Manager", loc="San Francisco, CA"), STRONG)
+check("TPM excluded", t == 0, t)
+t, _, _ = score_row(row("Solutions Engineer", loc="San Francisco, CA"), STRONG)
+check("Solutions Engineer excluded", t == 0, t)
+t, _, f = score_row(row("Technical Support Engineer", loc="San Francisco, CA"), STRONG)
+check("Support Engineer survives", t > 0, (t, f))
+t, _, f = score_row(row("Hardware Validation Engineer", loc="San Jose, CA"), "Validate firmware and BIOS on servers. 2 years.")
+check("Hardware validation survives", t > 0, (t, f))
 
 print("== hireability (odds axis) ==")
 from rubric import hireability
