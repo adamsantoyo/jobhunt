@@ -1,0 +1,20 @@
+# ---- personal data: never publish ----
+# personal profile (targets, salary band)
+config.json
+# personal resume / scoring calibration
+RUBRIC.md
+# personal targeting narrative
+WORKFLOW.md
+# personal shortlists
+picks.json
+picks_llm.json
+# scraped jobs, scored CSVs, tracker .xlsx, all caches
+results/
+*.xlsx
+~$*.xlsx
+
+# ---- environment / generated ----
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
