@@ -223,17 +223,33 @@ def main():
         rubric_text = load_rubric_text()
         for i in range(0, len(targets), BATCH):
             batch = targets[i:i + BATCH]
+            batch_urls = {r["url"] for r in batch}
             try:
                 verdicts = review(build_prompt(rubric_text, batch, descs))
             except Exception as e:
                 print(f"batch {i//BATCH}: FAILED {str(e)[:120]}", file=sys.stderr)
                 continue
+            # LLM output is untrusted (job descriptions are injected into the prompt): accept a
+            # verdict only if its URL was in this batch, its tier is 1-5, and it isn't a duplicate.
+            clean, seen_urls = [], set()
+            for v in verdicts:
+                u = v.get("url")
+                if u not in batch_urls or u in seen_urls:
+                    continue
+                try:
+                    t = int(v.get("tier"))
+                except (TypeError, ValueError):
+                    continue
+                if not (1 <= t <= 5):
+                    continue
+                v["tier"] = t; seen_urls.add(u); clean.append(v)
             with open(REVIEW, "a") as f:
-                for v in verdicts:
-                    if v.get("url"):
-                        done[v["url"]] = v
-                        f.write(json.dumps(v) + "\n")
-            print(f"batch {i//BATCH + 1}/{(len(targets)+BATCH-1)//BATCH}: {len(verdicts)} verdicts")
+                for v in clean:
+                    done[v["url"]] = v
+                    f.write(json.dumps(v) + "\n")
+            dropped = len(verdicts) - len(clean)
+            print(f"batch {i//BATCH + 1}/{(len(targets)+BATCH-1)//BATCH}: {len(clean)} verdicts"
+                  + (f" ({dropped} rejected)" if dropped else ""))
 
     changed, n_picks = apply_verdicts(csv_path, rows, done)
     print(f"applied {changed} verdicts to {os.path.basename(csv_path)}; "

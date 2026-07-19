@@ -30,6 +30,9 @@ tests.py             regression fixtures for the rubric engine (run before every
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install python-jobspy openpyxl requests
+# optional: the LLM judgment pass (llm_review.py) uses the Anthropic SDK when
+# ANTHROPIC_API_KEY is set, and otherwise falls back to the local `claude` CLI:
+./.venv/bin/pip install anthropic
 cp config.example.json config.json      # then edit the "profile" block for yourself
 ```
 

@@ -33,7 +33,8 @@
       "redmond"
     ],
     "include_remote_us": true,
-    "salary_floor_note": "record and flag salary; do not hard-filter"
+    "salary_floor_note": "record and flag salary; do not hard-filter",
+    "employer_scrape_location": "California, United States"
   },
   "companies": {
     "greenhouse": {

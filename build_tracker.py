@@ -23,6 +23,18 @@ if os.path.exists(rp):
         report = json.load(_f)
 
 
+def _safe(v):
+    """Neutralize spreadsheet formula injection: scraped titles/companies/descriptions flow
+    into cells, and Excel/openpyxl treats a leading =,+,-,@ (or a control char) as a formula.
+    Prefix those with an apostrophe so the value renders as literal text."""
+    if isinstance(v, str) and v and (v[0] in "=+-@\t\r" or v[:1] == "\x00"):
+        return "'" + v
+    return v
+
+def _safe_url(u):
+    """Only allow http(s) apply links to become live hyperlinks (blocks file:/javascript: etc.)."""
+    return u if isinstance(u, str) and u.lower().startswith(("http://", "https://")) else None
+
 def _col_index(ws, header):
     """0-based index of a column by its header cell text (layout-robust)."""
     for j, c in enumerate(ws[1]):
@@ -99,12 +111,16 @@ tp.append(["Odds", "New", "Title", "Company", "Location", "Salary", "Why it fits
 style_header(tp); tp.add_data_validation(status_dv)
 LINK_COL, STATUS_COL = 10, 11
 for r in sorted([r for r in rows if r["tier"] == "5"], key=odds_sort_key):
-    tp.append([r.get("odds", ""), r.get("new", ""), r["title"], r["company"], r["location"], sal(r),
-               r["why"], r.get("odds_why", ""), r["flags"], "Apply",
-               prev.get(r["url"], {}).get("status", "")])
+    tp.append([r.get("odds", ""), r.get("new", ""), _safe(r["title"]), _safe(r["company"]), _safe(r["location"]),
+               _safe(sal(r)), _safe(r["why"]), _safe(r.get("odds_why", "")), _safe(r["flags"]), "Apply",
+               _safe(prev.get(r["url"], {}).get("status", ""))])
     i = tp.max_row
-    link = tp.cell(row=i, column=LINK_COL); link.hyperlink = r["url"]
-    link.font = Font(name="Arial", color="0563C1", underline="single")
+    link = tp.cell(row=i, column=LINK_COL); hl = _safe_url(r["url"])
+    if hl:
+        link.hyperlink = hl
+        link.font = Font(name="Arial", color="0563C1", underline="single")
+    else:
+        link.value = "Apply (link withheld)"; link.font = ARIAL
     status_dv.add(tp.cell(row=i, column=STATUS_COL))
     for col in range(1, 12):
         if col != LINK_COL:
@@ -123,13 +139,19 @@ hdr = ["Tier", "Odds", "New", "Title", "Company", "Location", "Salary", "Posted"
 ws.append(hdr); style_header(ws); ws.add_data_validation(status_dv)
 LINK_C, STATUS_C = 14, 16
 for r in rows:
-    ws.append([int(r["tier"]), r.get("odds", ""), r.get("new", ""), r["title"], r["company"], r["location"], sal(r),
-               r["posted"], r.get("first_seen", ""), "Yes" if r["remote"] == "True" else "",
-               r["source"], r["flags"], r["why"], "Apply", r["req_id"],
-               prev.get(r["url"], {}).get("status", ""), prev.get(r["url"], {}).get("notes", ""), r.get("odds_why", "")])
+    ws.append([int(r["tier"]), r.get("odds", ""), r.get("new", ""), _safe(r["title"]), _safe(r["company"]),
+               _safe(r["location"]), _safe(sal(r)), _safe(r["posted"]), r.get("first_seen", ""),
+               "Yes" if r["remote"] == "True" else "", _safe(r["source"]), _safe(r["flags"]), _safe(r["why"]),
+               "Apply", _safe(r["req_id"]),
+               _safe(prev.get(r["url"], {}).get("status", "")), _safe(prev.get(r["url"], {}).get("notes", "")),
+               _safe(r.get("odds_why", ""))])
     i = ws.max_row
-    link = ws.cell(row=i, column=LINK_C); link.hyperlink = r["url"]
-    link.font = Font(name="Arial", color="0563C1", underline="single")
+    link = ws.cell(row=i, column=LINK_C); hl = _safe_url(r["url"])
+    if hl:
+        link.hyperlink = hl
+        link.font = Font(name="Arial", color="0563C1", underline="single")
+    else:
+        link.value = "Apply (link withheld)"; link.font = ARIAL
     status_dv.add(ws.cell(row=i, column=STATUS_C))
     fill = t5fill if r["tier"] == "5" else (t4fill if r["tier"] == "4" else None)
     for col in range(1, 19):

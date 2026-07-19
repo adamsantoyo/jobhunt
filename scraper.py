@@ -143,6 +143,18 @@ def src_workday(entry, search_terms, max_pages=5):
     return out
 
 # ---------------- Microsoft (Eightfold PCSX) ----------------
+_EMP_LOC = None
+def _emp_loc():
+    """Location filter for employer-own APIs (Microsoft/Amazon), config-driven so it
+    tracks the same geography policy as the rest of the pipeline instead of a hard-coded WA."""
+    global _EMP_LOC
+    if _EMP_LOC is None:
+        try:
+            _EMP_LOC = load_config()["profile"].get("employer_scrape_location", "California, United States")
+        except Exception:
+            _EMP_LOC = "California, United States"
+    return _EMP_LOC
+
 def src_microsoft(search_terms):
     out, seen = [], set()
     base = "https://apply.careers.microsoft.com/api/pcsx/search"
@@ -151,7 +163,7 @@ def src_microsoft(search_terms):
         for _ in range(10):
             try:
                 r = get(base, params={"domain": "microsoft.com", "query": term,
-                                      "location": "Washington, United States",
+                                      "location": _emp_loc(),
                                       "start": start, "num": 10, "sort_by": "relevance"})
                 if r.status_code != 200: break
                 d = r.json().get("data", {})
@@ -189,7 +201,7 @@ def src_amazon(search_terms):
         for _ in range(5):
             try:
                 r = get("https://www.amazon.jobs/en/search.json",
-                        params={"base_query": term, "loc_query": "Seattle, WA",
+                        params={"base_query": term, "loc_query": _emp_loc(),
                                 "result_limit": 100, "offset": offset, "radius": "40km"})
                 if r.status_code != 200: break
                 d = r.json(); jobs = d.get("jobs", [])
@@ -548,32 +560,47 @@ def dedupe(rows):
 RAW = os.path.join(HERE, "results", "raw.jsonl")
 HEALTH = os.path.join(HERE, "results", "source_health.json")
 
-def _record_health(group, n):
+def _record_health(group, n, refreshed=True):
     """Per-group harvest counts so zero-row sources (markup change, block, outage)
-    surface in the run report instead of failing silently (RUBRIC standard #5)."""
+    surface in the run report instead of failing silently (RUBRIC standard #5).
+    refreshed=False means an empty refresh was rejected and prior data was kept."""
     h = {}
     if os.path.exists(HEALTH):
         try:
             with open(HEALTH) as f: h = json.load(f)
         except Exception: h = {}
-    h[group] = {"rows": n, "at": datetime.datetime.now().isoformat(timespec="seconds")}
+    h[group] = {"rows": n, "refreshed": refreshed,
+                "at": datetime.datetime.now().isoformat(timespec="seconds")}
     with open(HEALTH, "w") as f:
         json.dump(h, f, indent=1)
-    if n == 0:
+    if n == 0 and refreshed:
         print(f"[{group}] WARNING: 0 rows harvested — source may be broken or blocking", file=sys.stderr)
 
-def save_raw(group, rows):
-    """Append rows to the resumable raw cache (idempotent per group: replaces prior rows of that group)."""
+def save_raw(group, rows, allow_empty=False):
+    """Replace prior rows of this group in the resumable raw cache. A swallowed adapter
+    error returns [] and looks identical to 'no jobs', so an empty refresh KEEPS the
+    last-known-good group data unless allow_empty=True — a transient outage must not wipe
+    the cache and still report success. Written atomically (os.replace) so a crash
+    mid-write can't truncate the file."""
     os.makedirs(os.path.dirname(RAW), exist_ok=True)
-    old = []
+    all_old = []
     if os.path.exists(RAW):
         with open(RAW) as f:
-            old = [json.loads(l) for l in f if l.strip()]
-    old = [r_ for r_ in old if r_.get("_group") != group]
+            all_old = [json.loads(l) for l in f if l.strip()]
+    prior = [r_ for r_ in all_old if r_.get("_group") == group]
+    if not rows and prior and not allow_empty:
+        _record_health(group, len(prior), refreshed=False)
+        print(f"[{group}] refresh returned 0 rows — KEPT {len(prior)} cached (possible transient failure)",
+              file=sys.stderr)
+        return
+    old = [r_ for r_ in all_old if r_.get("_group") != group]
     for r_ in rows: r_["_group"] = group
-    with open(RAW, "w") as f:
+    tmp = RAW + ".tmp"
+    with open(tmp, "w") as f:
         for r_ in old + rows:
             f.write(json.dumps(r_) + "\n")
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, RAW)
     _record_health(group, len(rows))
     print(f"[{group}] cached {len(rows)} rows (raw total {len(old)+len(rows)})")
 
