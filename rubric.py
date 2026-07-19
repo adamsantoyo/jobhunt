@@ -418,7 +418,10 @@ NON_US = [r"\bchina\b", r"\bcanada\b", r"\bindia\b", r"\buk\b", r"united kingdom
  r"abu dhabi", r"saudi", r"riyadh", r"\bqatar\b", r"\bdoha\b", r"hong kong", r"south africa",
  r"johannesburg", r"cape town", r"\begypt\b", r"\bcairo\b", r"\bkenya\b", r"nairobi", r"\bnigeria\b",
  r"\blagos\b", r"lisbon", r"portugal", r"\bspain\b", r"\bmunich\b", r"germany", r"\bfrance\b",
- r"netherlands", r"ireland", r"\bbelgium\b", r"brussels"]
+ r"netherlands", r"ireland", r"\bbelgium\b", r"brussels",
+ # multi-region tags: a bare "remote" must not read as US-remote when the region is foreign
+ r"\bemea\b", r"\bapac\b", r"\bmena\b", r"\bcemea\b", r"europe", r"asia[\s-]?pacific",
+ r"middle east", r"\banz\b"]
 # California carved out entirely — Bay Area is the active target metro, SoCal the long-term home
 OTHER_STATE = r"\b(alabama|alaska|arizona|arkansas|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|west virginia|wisconsin|wyoming|district of columbia|atlanta|austin|boston|denver|chicago|herndon|reston)\b"
 # two-letter state abbreviations after a separator ("Bastrop, TX", "Remote - CO") — WA and CA excluded
@@ -770,12 +773,23 @@ def cmd_resolve():
     with open(RES, "a") as f:
         for e in new: f.write(json.dumps(e) + "\n")
     if desc_new: save_desc(desc_new)
-    picks = load_picks(); changed = 0
-    for p in picks:
-        if p.get("url") in res:
-            p["url"] = res[p["url"]]["canonical_url"]; changed += 1
-    if changed:
-        json.dump(picks, open(os.path.join(HERE, "picks.json"), "w"), indent=1)
+    # Upgrade pinned pick URLs to their canonical posting PER STORE — never merge the LLM
+    # store back into picks.json, which would relabel LLM picks as human picks (provenance).
+    changed = 0
+    for fname in ("picks.json", "picks_llm.json"):
+        path = os.path.join(HERE, fname)
+        if not os.path.exists(path):
+            continue
+        try:
+            entries = json.load(open(path))
+        except Exception:
+            continue
+        touched = False
+        for p in entries:
+            if p.get("url") in res:
+                p["url"] = res[p["url"]]["canonical_url"]; changed += 1; touched = True
+        if touched:
+            json.dump(entries, open(path, "w"), indent=1)
     print(f"resolved {len(new)} new (total {len(res)}); pick links upgraded: {changed}")
 
 SEEN = os.path.join(HERE, "results", "seen.jsonl")
@@ -881,7 +895,8 @@ def cmd_score():
               "blocked": blocked,
               "by_source": {s: {"kept": src_counts[s], "with_desc": desc_counts.get(s, 0)} for s in src_counts},
               "source_health": health,
-              "zero_row_sources": sorted(g for g, v in health.items() if not v.get("rows"))}
+              "zero_row_sources": sorted(g for g, v in health.items() if not v.get("rows")),
+              "stale_refresh_sources": sorted(g for g, v in health.items() if v.get("refreshed") is False)}
     with open(os.path.join(HERE, "results", "run_report.json"), "w") as f:
         json.dump(report, f, indent=1)
     print("tiers:", report["tiers"])
@@ -890,6 +905,8 @@ def cmd_score():
     print("stale>30d:", report["stale_30d"], "| ghost-risk:", report["ghost_risk"])
     if report["zero_row_sources"]:
         print("WARNING zero-row sources:", ", ".join(report["zero_row_sources"]))
+    if report["stale_refresh_sources"]:
+        print("WARNING kept-stale (empty refresh rejected):", ", ".join(report["stale_refresh_sources"]))
     print("blocked:", blocked)
     print("wrote", path)
 

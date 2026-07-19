@@ -10,26 +10,46 @@ import json, os, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "results", "sweep_state.json")
 
+def _py(*a):
+    return [sys.executable, *a]
+
+def _chunks(seq, n):
+    return [seq[i:i + n] for i in range(0, len(seq), n)]
+
+def _dynamic_scrape_steps():
+    """Derive jobspy term-index and Workday tenant coverage from config so no search
+    term or tenant is ever silently skipped (was hard-coded, diverged from config)."""
+    try:
+        cfg = json.load(open(os.path.join(HERE, "config.json")))
+    except Exception:
+        cfg = {"profile": {"search_terms": []}, "companies": {}}
+    n_terms = len(cfg.get("profile", {}).get("search_terms", []))
+    idx = list(range(n_terms))
+    wd = list(cfg.get("companies", {}).get("workday", {}).keys())
+    steps = []
+    for ch in _chunks(wd, 3):
+        steps.append((f"scrape:wd_{ch[0]}", _py("scraper.py", "--only", "workday", "--wd-tenant", ",".join(ch))))
+    for ch in _chunks(idx, 2):  # Indeed: cover EVERY term
+        steps.append((f"scrape:indeed_{'_'.join(map(str, ch))}",
+                      _py("scraper.py", "--only", "jobspy", "--js-site", "indeed", "--js-terms", ",".join(map(str, ch)))))
+    for ch in _chunks(idx, 2):  # LinkedIn: best-effort (rate-limits), but still cover every term
+        steps.append((f"scrape:linkedin_{'_'.join(map(str, ch))}",
+                      _py("scraper.py", "--only", "jobspy", "--js-site", "linkedin", "--js-terms", ",".join(map(str, ch)))))
+    return steps
+
 STEPS = [
-    ("tests",            [sys.executable, "tests.py"]),
-    ("scrape:ats",       [sys.executable, "scraper.py", "--only", "ats"]),
-    ("scrape:microsoft", [sys.executable, "scraper.py", "--only", "microsoft"]),
-    ("scrape:amazon",    [sys.executable, "scraper.py", "--only", "amazon"]),
-    ("scrape:yc",        [sys.executable, "scraper.py", "--only", "yc"]),
-    ("scrape:builtin",   [sys.executable, "scraper.py", "--only", "builtin"]),
-    ("scrape:wd1",       [sys.executable, "scraper.py", "--only", "workday", "--wd-tenant", "tmobile,nordstrom"]),
-    ("scrape:wd2",       [sys.executable, "scraper.py", "--only", "workday", "--wd-tenant", "boeing,salesforce,blueorigin"]),
-    ("scrape:wd3",       [sys.executable, "scraper.py", "--only", "workday", "--wd-tenant", "expedia,ffive,intel,nvidia,zillow"]),
-    ("scrape:indeed01",  [sys.executable, "scraper.py", "--only", "jobspy", "--js-site", "indeed", "--js-terms", "0,1"]),
-    ("scrape:indeed23",  [sys.executable, "scraper.py", "--only", "jobspy", "--js-site", "indeed", "--js-terms", "2,3"]),
-    ("scrape:indeed4",   [sys.executable, "scraper.py", "--only", "jobspy", "--js-site", "indeed", "--js-terms", "4"]),
-    ("scrape:linkedin0", [sys.executable, "scraper.py", "--only", "jobspy", "--js-site", "linkedin", "--js-terms", "0"]),
-    ("scrape:linkedin2", [sys.executable, "scraper.py", "--only", "jobspy", "--js-site", "linkedin", "--js-terms", "2"]),
-    ("scrape:icims",     [sys.executable, "scraper.py", "--only", "icims"]),
-    ("scrape:eightfold", [sys.executable, "scraper.py", "--only", "eightfold"]),
-    ("scrape:phenom",    [sys.executable, "scraper.py", "--only", "phenom"]),
-    ("scrape:costco",    [sys.executable, "scraper.py", "--only", "costco"]),
-    ("scrape:jibe",      [sys.executable, "scraper.py", "--only", "jibe"]),
+    ("tests",            _py("tests.py")),
+    ("scrape:ats",       _py("scraper.py", "--only", "ats")),
+    ("scrape:microsoft", _py("scraper.py", "--only", "microsoft")),
+    ("scrape:amazon",    _py("scraper.py", "--only", "amazon")),
+    ("scrape:yc",        _py("scraper.py", "--only", "yc")),
+    ("scrape:builtin",   _py("scraper.py", "--only", "builtin")),
+    *_dynamic_scrape_steps(),
+    ("scrape:icims",     _py("scraper.py", "--only", "icims")),
+    ("scrape:eightfold", _py("scraper.py", "--only", "eightfold")),
+    ("scrape:phenom",    _py("scraper.py", "--only", "phenom")),
+    ("scrape:costco",    _py("scraper.py", "--only", "costco")),
+    ("scrape:jibe",      _py("scraper.py", "--only", "jibe")),
     ("desc:ats",         [sys.executable, "rubric.py", "fetch", "--group", "ats"]),
     ("desc:workday",     [sys.executable, "rubric.py", "fetch", "--group", "workday"]),
     ("desc:amazon",      [sys.executable, "rubric.py", "fetch", "--group", "amazon"]),
