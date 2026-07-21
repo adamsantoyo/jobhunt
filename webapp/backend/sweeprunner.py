@@ -33,6 +33,7 @@ SWEEP_WALL_CAP = 45 * 60          # total full-sweep wall clock
 SWEEP_STEP_ATTEMPT_CAP = 25       # attempts on the same step before --skip
 EXTERNAL_SWEEP_WINDOW = 180       # seconds: a fresh sweep_state.json => external run
 HEARTBEAT_SECS = 15
+STREAM_MAX_SECS = 300             # recycle an SSE connection rather than pin its socket
 
 _STEP_RE = re.compile(r"^>>>\s+(.*\S)\s*$")
 _PROGRESS_RE = re.compile(r"\[(\d+)/(\d+) done\]\s*next:\s*(.+?)\s*$")
@@ -350,9 +351,19 @@ class Runner:
 runner = Runner()
 
 
-async def sse_stream():
-    """Async generator yielding SSE frames: snapshot replay + live tail + heartbeats."""
+async def sse_stream(request=None):
+    """Async generator yielding SSE frames: snapshot replay + live tail + heartbeats.
+
+    Ends on client disconnect, or after STREAM_MAX_SECS regardless. Both matter:
+    a stream that outlives its client keeps a socket pinned, and browsers allow
+    only ~6 per origin, so leaked streams eventually starve the whole app. The
+    disconnect check is best-effort (BaseHTTPMiddleware can swallow the signal),
+    so the lifetime cap is the backstop that guarantees the socket is released.
+    EventSource reconnects on its own, and subscribe() replays the active run,
+    so recycling the connection is invisible to a client that is still there.
+    """
     q, snapshot = await runner.subscribe()
+    deadline = asyncio.get_running_loop().time() + STREAM_MAX_SECS
     try:
         for ev in snapshot:
             yield f"data: {json.dumps(ev)}\n\n"
@@ -361,6 +372,10 @@ async def sse_stream():
                 ev = await asyncio.wait_for(q.get(), timeout=HEARTBEAT_SECS)
                 yield f"data: {json.dumps(ev)}\n\n"
             except asyncio.TimeoutError:
+                if request is not None and await request.is_disconnected():
+                    return
+                if asyncio.get_running_loop().time() >= deadline:
+                    return
                 yield ": heartbeat\n\n"
     finally:
         runner.unsubscribe(q)
