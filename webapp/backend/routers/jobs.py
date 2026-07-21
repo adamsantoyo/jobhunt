@@ -4,7 +4,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..db import get_db
-from ..models import JOB_JOIN_SQL, JobFull, b64_to_url, job_light_from_row
+from ..models import JOB_JOIN_SQL, JOB_LIGHT_SQL, JobFull, b64_to_url, job_light_from_row
 
 router = APIRouter()
 
@@ -28,7 +28,7 @@ def _load_skills(conn: sqlite3.Connection) -> list[str]:
 
 @router.get("/jobs")
 def list_jobs(conn: sqlite3.Connection = Depends(get_db)):
-    rows = conn.execute(f"{JOB_JOIN_SQL} WHERE j.present=1").fetchall()
+    rows = conn.execute(f"{JOB_LIGHT_SQL} WHERE j.present=1").fetchall()
     jobs = [job_light_from_row(r) for r in rows]
     return {"run_date": _latest_run(conn), "jobs": jobs}
 

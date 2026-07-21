@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS job_state (
   follow_up_date TEXT, applied_date TEXT, starred INTEGER NOT NULL DEFAULT 0,
   hidden INTEGER NOT NULL DEFAULT 0, contact TEXT DEFAULT '', snoozed_until TEXT,
   needs_review INTEGER NOT NULL DEFAULT 0, review_reason TEXT,
+  review_dismissed INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_state_seen_key ON job_state(seen_key);
 
@@ -59,9 +60,18 @@ def connect(db_path=None):
     return conn
 
 
+def _ensure_column(conn, table, column, decl):
+    """Add a column to an existing table if missing (migration for populated DBs;
+    CREATE IF NOT EXISTS alone never alters an existing table)."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db(conn):
-    """Create the schema if it does not exist (idempotent)."""
+    """Create the schema if it does not exist (idempotent), then run migrations."""
     conn.executescript(DDL)
+    _ensure_column(conn, "job_state", "review_dismissed", "INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 

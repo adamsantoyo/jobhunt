@@ -51,4 +51,7 @@ URL="http://127.0.0.1:8000"
 ) >/dev/null 2>&1 &
 
 echo ">>> serving $URL  (Ctrl-C to stop)"
-exec python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+# --timeout-graceful-shutdown: an open SSE progress stream would otherwise make
+# Ctrl-C drain forever, so lifespan teardown (which kills any running pipeline
+# subprocess) would never run.
+exec python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5

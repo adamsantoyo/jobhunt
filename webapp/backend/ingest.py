@@ -72,6 +72,18 @@ def _new_count(rows):
     return sum(1 for r in rows if (r.get("new") or "").strip().upper() == "NEW")
 
 
+def _free_orphan_url(cur, seen_key):
+    """A free job_state PK to park a detached state row on: 'orphaned:<seen_key>',
+    suffixed '#2', '#3', ... if taken (double-recycle, or a prior ingest already
+    parked one there). Never collides with live urls (http(s):/withheld: only)."""
+    base = "orphaned:" + seen_key
+    url, n = base, 1
+    while cur.execute("SELECT 1 FROM job_state WHERE url=?", (url,)).fetchone():
+        n += 1
+        url = f"{base}#{n}"
+    return url
+
+
 def ingest(conn) -> IngestReport:
     init_db(conn)
     results = config.RESULTS
@@ -107,6 +119,7 @@ def ingest(conn) -> IngestReport:
                     "VALUES (?,?,?,?,?,?)",
                     (rdate, len(rows), _new_count(rows), rep_json, sh_json, _now()),
                 )
+                cur.execute("DELETE FROM job_history WHERE run_date=?", (rdate,))
                 for r in rows:
                     sk = compute_seen_key(r.get("company"), r.get("title"), r.get("location"))
                     url = _surrogate_url(r.get("url"), sk)
@@ -133,12 +146,14 @@ def ingest(conn) -> IngestReport:
         # 4. Mark all jobs absent, then upsert the present run (full_desc preserved).
         cur.execute("UPDATE jobs SET present=0")
         present_urls = set()
-        seen_by_key = {}  # seen_key -> list[url]
+        seen_by_key = {}   # seen_key -> list[url]
+        url_seen_key = {}  # url -> seen_key (identity check for still-present urls)
         for r in latest_rows:
             sk = compute_seen_key(r.get("company"), r.get("title"), r.get("location"))
             url = _surrogate_url(r.get("url"), sk)
             present_urls.add(url)
             seen_by_key.setdefault(sk, []).append(url)
+            url_seen_key[url] = sk
             remote = 1 if (r.get("remote") or "").strip().lower() == "true" else 0
             is_new = 1 if (r.get("new") or "").strip().upper() == "NEW" else 0
             cur.execute(
@@ -171,7 +186,9 @@ def ingest(conn) -> IngestReport:
             cur.execute("UPDATE jobs SET full_desc=? WHERE url=?", (desc, url))
         descs_joined = len(descs)
 
-        # 6. job_history for the latest run.
+        # 6. job_history for the latest run: replace the run's snapshot wholesale so a
+        # same-day re-ingest (rewritten CSV) never leaves stale rows marked present.
+        cur.execute("DELETE FROM job_history WHERE run_date=?", (run_date,))
         for r in latest_rows:
             sk = compute_seen_key(r.get("company"), r.get("title"), r.get("location"))
             url = _surrogate_url(r.get("url"), sk)
@@ -181,39 +198,63 @@ def ingest(conn) -> IngestReport:
                 (url, run_date, sk, _int(r.get("tier")) or 0, r.get("odds") or None),
             )
 
-        # 7. Heal job_state (never destructive).
-        cur.execute("SELECT url, seen_key, needs_review FROM job_state")
+        # 7. Heal job_state (never destructive). Two passes:
+        #    A) identity-check rows whose url is still present — a seen_key mismatch
+        #       means the ATS recycled the url for a different role, so the state is
+        #       detached onto a surrogate url (never inherited by the new role);
+        #    B) seen-key heal for every unanchored row (originally absent + detached).
+        # present_with_state is recomputed between the passes so Pass B decisions
+        # never depend on state_rows iteration order.
+        cur.execute("SELECT url, seen_key, needs_review, review_dismissed FROM job_state")
         state_rows = cur.fetchall()
-        # Which present urls already carry a state row?
-        state_urls = {row["url"] for row in state_rows}
-        present_with_state = {u for u in state_urls if u in present_urls}
 
         healed = 0
         needs_review = 0
+        to_heal = []  # (url, seen_key, was_flagged, review_dismissed)
+
+        # Pass A: identity check for still-present urls.
         for srow in state_rows:
             old_url = srow["url"]
-            if old_url in present_urls:
-                # url still present; state is anchored. A stale review flag from an
-                # earlier ambiguous ingest is resolved by the url's reappearance.
-                if srow["needs_review"]:
+            if old_url not in present_urls:
+                to_heal.append((old_url, srow["seen_key"], srow["needs_review"], srow["review_dismissed"]))
+                continue
+            if srow["seen_key"] == url_seen_key.get(old_url):
+                # Anchored to the same role; any lingering review state is resolved.
+                if srow["needs_review"] or srow["review_dismissed"]:
                     cur.execute(
-                        "UPDATE job_state SET needs_review=0, review_reason=NULL, updated_at=? WHERE url=?",
+                        "UPDATE job_state SET needs_review=0, review_reason=NULL, review_dismissed=0, updated_at=? WHERE url=?",
                         (_now(), old_url),
                     )
                 continue
-            sk = srow["seen_key"]
+            # url recycled to a different role: park the state on a surrogate so the
+            # new role shows no inherited status/notes, then heal it in Pass B.
+            surrogate = _free_orphan_url(cur, srow["seen_key"])
+            cur.execute(
+                "UPDATE job_state SET url=?, review_reason=?, updated_at=? WHERE url=?",
+                (surrogate, f"url recycled to a different role (was {old_url})"[:2000], _now(), old_url),
+            )
+            to_heal.append((surrogate, srow["seen_key"], srow["needs_review"], srow["review_dismissed"]))
+
+        # Which present urls carry a state row, post-detach.
+        cur.execute("SELECT url FROM job_state")
+        present_with_state = {row["url"] for row in cur.fetchall() if row["url"] in present_urls}
+
+        # Pass B: seen-key heal for unanchored rows.
+        for old_url, sk, was_flagged, dismissed in to_heal:
             cands = seen_by_key.get(sk, [])
             if len(cands) == 1 and cands[0] not in present_with_state:
                 new_url = cands[0]
                 cur.execute(
-                    "UPDATE job_state SET url=?, seen_key=?, needs_review=0, review_reason=NULL, updated_at=? WHERE url=?",
+                    "UPDATE job_state SET url=?, seen_key=?, needs_review=0, review_reason=NULL, "
+                    "review_dismissed=0, updated_at=? WHERE url=?",
                     (new_url, sk, _now(), old_url),
                 )
                 present_with_state.add(new_url)
                 healed += 1
             elif len(cands) == 0:
                 # Job disappeared entirely; keep state dormant, do NOT flag as review.
-                if srow["needs_review"]:
+                # (A detached row keeps its forensic review_reason from Pass A.)
+                if was_flagged:
                     cur.execute(
                         "UPDATE job_state SET needs_review=0, review_reason=NULL, updated_at=? WHERE url=?",
                         (_now(), old_url),
@@ -221,11 +262,19 @@ def ingest(conn) -> IngestReport:
             else:
                 # Ambiguous (>=2 candidates, or the sole candidate already has state).
                 reason = "ambiguous url rewrite; candidates: " + ", ".join(cands)
-                cur.execute(
-                    "UPDATE job_state SET needs_review=1, review_reason=?, updated_at=? WHERE url=?",
-                    (reason[:2000], _now(), old_url),
-                )
-                needs_review += 1
+                if dismissed:
+                    # User already acknowledged this ambiguity: keep the reason fresh
+                    # but do not re-flag (durable dismiss).
+                    cur.execute(
+                        "UPDATE job_state SET review_reason=? WHERE url=?",
+                        (reason[:2000], old_url),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE job_state SET needs_review=1, review_reason=?, updated_at=? WHERE url=?",
+                        (reason[:2000], _now(), old_url),
+                    )
+                    needs_review += 1
 
         # 8. Picks seeding: only where the url is present and has no state yet.
         cur.execute("SELECT url FROM job_state")

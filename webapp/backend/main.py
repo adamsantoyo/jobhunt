@@ -16,6 +16,7 @@ from . import config
 from .db import connect, init_db
 from .ingest import ingest
 from .routers import analytics, changes, configapi, jobs, sweepapi, state
+from .sweeprunner import runner
 
 
 @asynccontextmanager
@@ -32,6 +33,12 @@ async def lifespan(app: FastAPI):
     finally:
         conn.close()
     yield
+    # Teardown: never orphan a running pipeline subprocess (it lives in its own
+    # session, so nothing else would reap it after the server exits).
+    try:
+        await runner.shutdown()
+    except Exception as e:  # noqa: BLE001 - teardown must not block shutdown
+        print(f"[shutdown] runner cleanup failed: {e}", file=sys.stderr)
 
 
 app = FastAPI(title="JobHunt", lifespan=lifespan)

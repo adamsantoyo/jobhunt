@@ -147,6 +147,18 @@ export interface StatePatch {
   hidden?: boolean;
   contact?: string;
   snoozed_until?: string | null;
+  /** Write-only: durably acknowledge a review item (never echoed back on JobState). */
+  review_dismissed?: boolean;
+}
+
+export interface ReviewItem {
+  job: JobLight;
+  candidates: JobLight[];
+}
+
+export interface ReconcileBody {
+  from_url_b64: string;
+  to_url_b64: string;
 }
 
 export type QuickAction = "applied" | "snooze" | "pass" | "star" | "unstar";

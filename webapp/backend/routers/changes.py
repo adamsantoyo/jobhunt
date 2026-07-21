@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 
 from ..db import get_db
-from ..models import JOB_JOIN_SQL, job_light_from_row, url_to_b64
+from ..models import JOB_LIGHT_SQL, job_light_from_row, url_to_b64
 
 router = APIRouter()
 
@@ -21,7 +21,7 @@ def _history_by_seen(conn: sqlite3.Connection, run_date: str):
 
 
 def _job_light(conn: sqlite3.Connection, url: str):
-    row = conn.execute(f"{JOB_JOIN_SQL} WHERE j.url=?", (url,)).fetchone()
+    row = conn.execute(f"{JOB_LIGHT_SQL} WHERE j.url=?", (url,)).fetchone()
     return job_light_from_row(row) if row is not None else None
 
 
@@ -55,7 +55,7 @@ def changes(since: Optional[str] = None, conn: sqlite3.Connection = Depends(get_
     # Reposted: current jobs whose flags carry "reposted".
     reposted = []
     for r in conn.execute(
-        f"{JOB_JOIN_SQL} WHERE j.present=1 AND j.flags LIKE '%reposted%'").fetchall():
+        f"{JOB_LIGHT_SQL} WHERE j.present=1 AND j.flags LIKE '%reposted%'").fetchall():
         reposted.append(job_light_from_row(r))
 
     # Tier changed: seen_key in both runs with a different tier.

@@ -52,7 +52,11 @@ class Runner:
         self._proc = None
         self._cancel = False
         self._task = None
-        self._own_state_mtime = 0.0                         # sweep_state.json mtime after OUR last write
+        # sweep_state.json mtime after OUR last write. Snapshot at boot so a restart
+        # right after our own sweep doesn't read the still-fresh file as an external
+        # run; a genuinely external sweep re-registers on its next --next write.
+        self._own_state_mtime = 0.0
+        self._mark_own_sweep_write()
 
     # ---------------------------------------------------------------- status
     def status(self) -> dict:
@@ -131,6 +135,20 @@ class Runner:
         self._kill_proc_tree(self._proc)
         self._emit({"type": "log", "kind": self.kind, "line": "cancel requested"})
 
+    async def shutdown(self):
+        """Server teardown: make sure no pipeline subprocess outlives the app.
+        Kill the current proc tree first (unblocks the read loop), then cancel and
+        await the runner task so _run's finally clears the running flag."""
+        self._cancel = True
+        self._kill_proc_tree(self._proc)
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - teardown
+                pass
+
     @staticmethod
     def _kill_proc_tree(proc):
         """Kill the spawned process AND its children (sweep.py runs the actual step as
@@ -187,6 +205,16 @@ class Runner:
             await proc.wait()
             self._proc = None
             return None, lines
+        except asyncio.CancelledError:
+            # Task cancelled (server shutdown / runner.shutdown()): the child is in
+            # its own session, so nothing else will reap it — kill the tree here.
+            self._kill_proc_tree(proc)
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001 - best-effort reap during teardown
+                pass
+            self._proc = None
+            raise
         self._proc = None
         return proc.returncode, lines
 
