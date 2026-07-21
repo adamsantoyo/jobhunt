@@ -3,7 +3,6 @@
 import type {
   JobsResponse,
   JobFull,
-  JobLight,
   JobState,
   CompanyState,
   AnalyticsResponse,
@@ -15,6 +14,8 @@ import type {
   QuickActionBody,
   CompanyPatch,
   ConfigPatch,
+  ReviewItem,
+  ReconcileBody,
 } from "./types";
 
 const APP_HEADER = "X-App";
@@ -78,7 +79,9 @@ export const api = {
     }),
 
   // review / analytics / changes / freshness
-  getReview: () => request<JobLight[]>("/api/review"),
+  getReview: () => request<ReviewItem[]>("/api/review"),
+  reconcile: (body: ReconcileBody) =>
+    request<JobState>("/api/review/reconcile", { method: "POST", ...jsonBody(body) }),
   getAnalytics: () => request<AnalyticsResponse>("/api/analytics"),
   getChanges: (since?: string) =>
     request<ChangesResponse>(`/api/changes${since ? `?since=${encodeURIComponent(since)}` : ""}`),

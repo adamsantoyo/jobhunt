@@ -17,6 +17,7 @@ import type {
   QuickActionBody,
   CompanyPatch,
   ConfigPatch,
+  ReconcileBody,
 } from "../api/types";
 
 export const qk = {
@@ -46,8 +47,12 @@ const EMPTY_STATE: JobState = {
 
 function mergePatch(existing: JobState | null, patch: StatePatch): JobState {
   const base = existing ?? EMPTY_STATE;
+  // review_dismissed is write-only (not a JobState field) — never leak it into
+  // the cached state object.
+  const rest = { ...patch };
+  delete rest.review_dismissed;
   // Any user edit clears needs_review (matches the backend PATCH contract).
-  return { ...base, ...patch, needs_review: false };
+  return { ...base, ...rest, needs_review: false };
 }
 
 function applyQuick(existing: JobState | null, body: QuickActionBody): JobState {
@@ -91,6 +96,20 @@ function invalidateStateDerived(qc: QueryClient) {
   qc.invalidateQueries({ queryKey: qk.jobs });
   qc.invalidateQueries({ queryKey: qk.review });
   qc.invalidateQueries({ queryKey: qk.analytics });
+}
+
+export function useReconcile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ReconcileBody) => api.reconcile(body),
+    onSettled: (_state, _err, body) => {
+      invalidateStateDerived(qc);
+      // State moved between two url-keyed detail caches — refresh both, or the
+      // drawer would show stale state for either job.
+      qc.invalidateQueries({ queryKey: qk.job(body.from_url_b64) });
+      qc.invalidateQueries({ queryKey: qk.job(body.to_url_b64) });
+    },
+  });
 }
 
 // ---- queries ----

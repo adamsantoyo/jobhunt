@@ -83,6 +83,11 @@ class JobFull(JobLight):
     skill_hits: list[str] = []
 
 
+class ReviewItem(BaseModel):
+    job: JobLight
+    candidates: list[JobLight] = []
+
+
 class IngestReport(BaseModel):
     rows: int
     new: int
@@ -117,6 +122,14 @@ class StatePatch(BaseModel):
     hidden: Optional[bool] = None
     contact: Optional[str] = None
     snoozed_until: Optional[str] = None
+    # Write-only: "user acknowledged this review item; don't re-flag until its
+    # situation materially resolves." Never exposed back on the JobState DTO.
+    review_dismissed: Optional[bool] = None
+
+
+class ReconcileBody(BaseModel):
+    from_url_b64: str
+    to_url_b64: str
 
 
 class QuickAction(BaseModel):
@@ -166,6 +179,18 @@ JOB_STATE_JOIN_COLS = (
 )
 JOB_JOIN_SQL = f"SELECT j.*, {JOB_STATE_JOIN_COLS} FROM jobs j LEFT JOIN job_state s ON j.url = s.url"
 
+# Light projection for list endpoints: every jobs column EXCEPT full_desc (up to
+# 100KB/row), with has_desc computed in SQL. Mirrors bool(full_desc) semantics
+# exactly (NULL and '' are both False).
+_JOB_LIGHT_COLS = (
+    "j.url, j.seen_key, j.tier, j.odds, j.odds_score, j.odds_why, j.is_new, j.title, "
+    "j.company, j.location, j.salary, j.salary_min, j.salary_max, j.posted, j.first_seen, "
+    "j.remote, j.source, j.also_seen_on, j.req_id, j.why, j.flags, j.desc_snippet, "
+    "j.latest_run, j.present, "
+    "CASE WHEN j.full_desc IS NOT NULL AND j.full_desc != '' THEN 1 ELSE 0 END AS has_desc"
+)
+JOB_LIGHT_SQL = f"SELECT {_JOB_LIGHT_COLS}, {JOB_STATE_JOIN_COLS} FROM jobs j LEFT JOIN job_state s ON j.url = s.url"
+
 
 def job_light_from_row(row) -> JobLight:
     return JobLight(
@@ -192,6 +217,6 @@ def job_light_from_row(row) -> JobLight:
         why=row["why"],
         flags=row["flags"],
         desc_snippet=row["desc_snippet"],
-        has_desc=bool(row["full_desc"]),
+        has_desc=bool(row["has_desc"]) if "has_desc" in row.keys() else bool(row["full_desc"]),
         state=_state_from_row(row),
     )

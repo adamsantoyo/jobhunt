@@ -31,6 +31,8 @@ def stream_descriptions(wanted, results_dir=None):
                 obj = json.loads(line)
             except Exception:
                 continue  # skip malformed lines
+            if not isinstance(obj, dict):
+                continue  # valid JSON but not an object (null / list / scalar)
             url = obj.get("url")
             if url in remaining:
                 desc = obj.get("desc") or ""
