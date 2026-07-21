@@ -1,7 +1,7 @@
 """Sweep control: quick refresh, full sweep, SSE progress, cancel, manual ingest."""
 import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..db import get_db
@@ -29,9 +29,9 @@ async def sweep_full():
 
 
 @router.get("/sweep/progress")
-async def sweep_progress():
+async def sweep_progress(request: Request):
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    return StreamingResponse(sse_stream(), media_type="text/event-stream", headers=headers)
+    return StreamingResponse(sse_stream(request), media_type="text/event-stream", headers=headers)
 
 
 @router.post("/sweep/cancel")

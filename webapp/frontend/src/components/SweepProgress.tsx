@@ -28,8 +28,15 @@ const INITIAL: SweepUiState = {
 /**
  * Progress strip driven by an EventSource on /api/sweep/progress. Renders only
  * while a sweep is active. On `done`/`error` it invalidates all queries so the
- * freshly ingested data shows up everywhere. A single EventSource is kept open
- * for the lifetime of the app (the SSE endpoint heartbeats when idle).
+ * freshly ingested data shows up everywhere.
+ *
+ * The stream is opened only while the tab is visible and closed as soon as it is
+ * hidden. Browsers cap HTTP/1.1 connections at ~6 per origin, and an SSE stream
+ * holds its socket open indefinitely, so a handful of background tabs parked on
+ * the app used to exhaust the whole pool for that origin -- every later request
+ * (page loads included) then stalled without ever reaching the server. Nothing is
+ * lost by disconnecting: the endpoint replays a snapshot of the active run on
+ * subscribe, so a re-shown tab catches straight back up.
  */
 export function SweepProgress() {
   const qc = useQueryClient();
@@ -38,35 +45,55 @@ export function SweepProgress() {
 
   useEffect(() => {
     let closed = false;
-    const es = new EventSource("/api/sweep/progress");
-    esRef.current = es;
 
-    es.onmessage = (evt) => {
-      if (closed) return;
-      let data: SweepEvent;
-      try {
-        data = JSON.parse(evt.data) as SweepEvent;
-      } catch {
-        return;
-      }
-      setState((prev) => reduce(prev, data));
-      if (data.type === "done" || data.type === "error") {
-        // New data landed (or the run ended); refresh everything.
-        qc.invalidateQueries();
-      }
+    const openStream = () => {
+      if (closed || esRef.current) return;
+      const es = new EventSource("/api/sweep/progress");
+      esRef.current = es;
+
+      es.onmessage = (evt) => {
+        if (closed) return;
+        let data: SweepEvent;
+        try {
+          data = JSON.parse(evt.data) as SweepEvent;
+        } catch {
+          return;
+        }
+        setState((prev) => reduce(prev, data));
+        if (data.type === "done" || data.type === "error") {
+          // New data landed (or the run ended); refresh everything.
+          qc.invalidateQueries();
+        }
+      };
+
+      es.onerror = () => {
+        // Endpoint unavailable (e.g. backend not up yet). EventSource auto-retries;
+        // just stop showing an active strip.
+        if (closed) return;
+        setState((prev) => (prev.active ? { ...prev, active: false } : prev));
+      };
     };
 
-    es.onerror = () => {
-      // Endpoint unavailable (e.g. backend not up yet). EventSource auto-retries;
-      // just stop showing an active strip.
-      if (closed) return;
-      setState((prev) => (prev.active ? { ...prev, active: false } : prev));
+    const closeStream = () => {
+      const es = esRef.current;
+      if (!es) return;
+      esRef.current = null;
+      es.close();
     };
+
+    // Hold a socket only while the tab is actually being looked at.
+    const syncToVisibility = () => {
+      if (document.visibilityState === "visible") openStream();
+      else closeStream();
+    };
+
+    syncToVisibility();
+    document.addEventListener("visibilitychange", syncToVisibility);
 
     return () => {
       closed = true;
-      es.close();
-      esRef.current = null;
+      document.removeEventListener("visibilitychange", syncToVisibility);
+      closeStream();
     };
   }, [qc]);
 
