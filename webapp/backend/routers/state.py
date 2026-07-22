@@ -3,11 +3,12 @@
 job_state is keyed on seen_key (role identity). Routes stay url-addressed for frontend
 compat; each url is resolved to a seen_key before touching state. The review endpoints
 are retired shims (empty list / 410) — see the bottom of this module."""
+import json
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from ..config import STATUSES
+from ..config import DEFAULT_SNOOZE_DAYS, STATUSES
 from ..db import get_db
 from ..events import TRACKED_FIELDS, record_field_events
 from ..models import (
@@ -31,7 +32,7 @@ router = APIRouter()
 # but it is dropped here, so it never reaches the SQL for a column that no longer exists.
 _PATCHABLE = (
     "status", "notes", "follow_up_date", "applied_date", "starred", "hidden",
-    "contact", "snoozed_until",
+    "contact", "snoozed_until", "applied_via",
 )
 
 
@@ -46,10 +47,21 @@ def _state_dto(conn: sqlite3.Connection, seen_key: str) -> JobState:
         hidden=bool(row["hidden"]),
         contact=row["contact"] or "",
         snoozed_until=row["snoozed_until"],
+        applied_via=row["applied_via"],
         needs_review=False,   # retired; constant for frontend compat
         review_reason=None,
         updated_at=row["updated_at"],
     )
+
+
+def _snooze_default_days(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT value FROM app_settings WHERE key='snooze_default_days'").fetchone()
+    if row is not None:
+        try:
+            return int(json.loads(row["value"]))
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_SNOOZE_DAYS
 
 
 def _resolve_seen_key(conn: sqlite3.Connection, url: str):
@@ -64,7 +76,7 @@ def _resolve_seen_key(conn: sqlite3.Connection, url: str):
 
 
 def _apply_state(conn: sqlite3.Connection, url: str, changes: dict,
-                 source: str = "patch") -> JobState:
+                 source: str = "patch", extra_events: list | None = None) -> JobState:
     """Upsert that touches ONLY the supplied fields, as one atomic statement — no
     read-modify-write, so concurrent edits of disjoint fields both survive.
     status->Applied with no applied_date supplied fills today while preserving any
@@ -77,7 +89,10 @@ def _apply_state(conn: sqlite3.Connection, url: str, changes: dict,
 
     Before committing, one state_event is written per field that actually changed
     (diffed against the pre-write row), inside this same transaction so an event and
-    the change it records commit together or not at all."""
+    the change it records commit together or not at all. `extra_events` are
+    unconditional (seen_key, field, new_value) events for things that aren't job_state
+    columns at all (e.g. a quick-pass reason) -- recorded, not diffed, in the same
+    transaction."""
     changes = {k: v for k, v in changes.items() if k in _PATCHABLE}
     for k in ("starred", "hidden"):
         if k in changes:
@@ -118,6 +133,13 @@ def _apply_state(conn: sqlite3.Connection, url: str, changes: dict,
     record_field_events(conn, seen_key=seen_key, url=url, old=old_vals,
                         new=new_vals, source=source, at=params["updated_at"])
 
+    for field, new_value in (extra_events or []):
+        conn.execute(
+            "INSERT INTO state_events (seen_key, url, field, old_value, new_value, at, source) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (seen_key, url, field, None, new_value, params["updated_at"], source),
+        )
+
     conn.commit()
     return _state_dto(conn, seen_key)
 
@@ -152,20 +174,25 @@ def quick_action(url_b64: str, body: QuickAction, conn: sqlite3.Connection = Dep
     if not _known(conn, url):
         raise HTTPException(status_code=404, detail="unknown job")
     action = body.action
+    extra_events = None
     if action == "applied":
         changes = {"status": "Applied"}  # applied_date auto-filled by _apply_state
+        if body.applied_via:
+            changes["applied_via"] = body.applied_via
     elif action == "snooze":
-        days = body.days if body.days is not None else 3
+        days = body.days if body.days is not None else _snooze_default_days(conn)
         changes = {"snoozed_until": date_plus(days)}
     elif action == "pass":
         changes = {"status": "Passed"}
+        if body.reason:
+            extra_events = [("pass_reason", body.reason)]
     elif action == "star":
         changes = {"starred": 1}
     elif action == "unstar":
         changes = {"starred": 0}
     else:
         raise HTTPException(status_code=422, detail=f"unknown action: {action}")
-    return _apply_state(conn, url, changes, source=f"quick:{action}")
+    return _apply_state(conn, url, changes, source=f"quick:{action}", extra_events=extra_events)
 
 
 @router.get("/companies", response_model=list[CompanyState])

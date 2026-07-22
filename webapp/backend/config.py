@@ -39,4 +39,11 @@ DEFAULT_SKILLS = [
     "sql", "api", "networking",
 ]
 
+# Goal settings (D4): also seeded once into app_settings, UI-editable via /api/config.
+# Values here are only the fallback used until a row exists / when one is malformed.
+DEFAULT_DAILY_QUEUE_SIZE = 10
+DEFAULT_WEEKLY_APP_TARGET = 15
+DEFAULT_DEADLINE = "2027-02-01"
+DEFAULT_SNOOZE_DAYS = 3
+
 SKIP_STARTUP_INGEST = os.environ.get("JOBHUNT_SKIP_STARTUP_INGEST") == "1"

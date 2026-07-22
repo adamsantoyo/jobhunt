@@ -231,11 +231,22 @@ def _migration_3_rekey_job_state(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE _job_state_old")
 
 
+def _migration_4_applied_via(conn: sqlite3.Connection) -> None:
+    """Add job_state.applied_via (nullable source picker for how an application was
+    submitted). IF NOT EXISTS-style guard via PRAGMA check: a bare ALTER TABLE ADD
+    COLUMN errors if the column is already there (e.g. a fresh baseline that already
+    includes it, reached via the direct-invocation test path)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_state)")}
+    if "applied_via" not in cols:
+        conn.execute("ALTER TABLE job_state ADD COLUMN applied_via TEXT")
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
     (2, "backfill_state_events", _migration_2_backfill),
     (3, "rekey_job_state_on_seen_key", _migration_3_rekey_job_state),
+    (4, "job_state_applied_via", _migration_4_applied_via),
 ]
 
 

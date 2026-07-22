@@ -13,7 +13,7 @@ import sqlite3
 # and being removed entirely in a later phase).
 TRACKED_FIELDS = (
     "status", "notes", "follow_up_date", "applied_date",
-    "starred", "hidden", "contact", "snoozed_until",
+    "starred", "hidden", "contact", "snoozed_until", "applied_via",
 )
 
 
