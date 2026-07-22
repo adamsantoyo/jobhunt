@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..config import STATUSES
 from ..db import get_db
+from ..events import TRACKED_FIELDS, record_field_events
 from ..models import (
     JOB_LIGHT_SQL,
     CompanyPatch,
@@ -58,24 +59,32 @@ def _resolve_seen_key(conn: sqlite3.Connection, url: str):
     return row["seen_key"] if row else None
 
 
-def _apply_state(conn: sqlite3.Connection, url: str, changes: dict) -> JobState:
+def _apply_state(conn: sqlite3.Connection, url: str, changes: dict,
+                 source: str = "patch") -> JobState:
     """Upsert that touches ONLY the supplied fields, as one atomic statement — no
     read-modify-write, so concurrent edits of disjoint fields both survive.
     Every user edit clears the live needs_review flag; review_dismissed changes
     only when the patch names it. status->Applied with no applied_date supplied
-    fills today while preserving any existing date (COALESCE)."""
+    fills today while preserving any existing date (COALESCE).
+
+    Before committing, one state_event is written per field that actually changed
+    (diffed against the pre-write row), inside this same transaction so an event and
+    the change it records commit together or not at all."""
     changes = {k: v for k, v in changes.items() if k in _PATCHABLE}
     for k in ("starred", "hidden", "review_dismissed"):
         if k in changes:
             changes[k] = 1 if changes[k] else 0
     auto_applied = changes.get("status") == "Applied" and "applied_date" not in changes
 
-    # seen_key is derived data (jobs cache), never user-mutated: this pre-read is
-    # not part of the lost-update race. Unset columns take their DDL defaults on
-    # the INSERT branch (status 'New', notes '', flags 0).
+    # Pre-write row for event diffing (also supplies the preserved applied_date). Read
+    # once, before the upsert. seen_key is derived data (jobs cache), never
+    # user-mutated: this pre-read is not part of the lost-update race. Unset columns
+    # take their DDL defaults on the INSERT branch (status 'New', notes '', flags 0).
+    old_row = conn.execute("SELECT * FROM job_state WHERE url=?", (url,)).fetchone()
+    seen_key = _resolve_seen_key(conn, url) or ""
+
     params = dict(changes)
-    params.update(url=url, seen_key=_resolve_seen_key(conn, url) or "",
-                  updated_at=now_iso(), today=today_iso())
+    params.update(url=url, seen_key=seen_key, updated_at=now_iso(), today=today_iso())
 
     insert_cols = ["url", "seen_key", "updated_at"] + list(changes)
     insert_vals = [f":{c}" for c in insert_cols]
@@ -91,6 +100,17 @@ def _apply_state(conn: sqlite3.Connection, url: str, changes: dict) -> JobState:
         f"ON CONFLICT(url) DO UPDATE SET {', '.join(set_parts)}",
         params,
     )
+
+    # Effective new values for the event diff. auto_applied's applied_date follows the
+    # COALESCE above: an existing date is preserved (no event), else today (NULL->today).
+    new_vals = {k: v for k, v in changes.items() if k in TRACKED_FIELDS}
+    if auto_applied:
+        prior = old_row["applied_date"] if old_row is not None else None
+        new_vals["applied_date"] = prior or params["today"]
+    old_vals = {k: old_row[k] for k in TRACKED_FIELDS} if old_row is not None else {}
+    record_field_events(conn, seen_key=seen_key, url=url, old=old_vals,
+                        new=new_vals, source=source, at=params["updated_at"])
+
     conn.commit()
     return _state_dto(conn, url)
 
@@ -116,7 +136,7 @@ def patch_state(url_b64: str, body: StatePatch, conn: sqlite3.Connection = Depen
     changes = body.model_dump(exclude_unset=True)
     if "status" in changes and changes["status"] not in STATUSES:
         raise HTTPException(status_code=422, detail=f"invalid status: {changes['status']}")
-    return _apply_state(conn, url, changes)
+    return _apply_state(conn, url, changes, source="patch")
 
 
 @router.post("/jobs/{url_b64}/quick", response_model=JobState)
@@ -138,7 +158,7 @@ def quick_action(url_b64: str, body: QuickAction, conn: sqlite3.Connection = Dep
         changes = {"starred": 0}
     else:
         raise HTTPException(status_code=422, detail=f"unknown action: {action}")
-    return _apply_state(conn, url, changes)
+    return _apply_state(conn, url, changes, source=f"quick:{action}")
 
 
 @router.get("/companies", response_model=list[CompanyState])

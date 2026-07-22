@@ -60,19 +60,36 @@ def connect(db_path=None):
     return conn
 
 
-def _ensure_column(conn, table, column, decl):
-    """Add a column to an existing table if missing (migration for populated DBs;
-    CREATE IF NOT EXISTS alone never alters an existing table)."""
-    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+def _table_exists(conn, name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _main_db_file(conn):
+    """On-disk path of this connection's main database, or None for :memory:.
+    Derived from the connection itself so migrations back up exactly the file being
+    operated on -- never a global config path (which could point at the real app.db
+    while a test runs against a copy)."""
+    for row in conn.execute("PRAGMA database_list"):
+        if row["name"] == "main":
+            return row["file"] or None
+    return None
 
 
 def init_db(conn):
-    """Create the schema if it does not exist (idempotent), then run migrations."""
+    """Create the baseline schema if absent (idempotent), then converge via migrations.
+
+    `fresh` is captured *before* the DDL runs: a brand-new DB has the full baseline
+    (which already reflects the latest schema, including state_events) so migrations
+    are stamped, not executed. An existing DB gets migrations run against it."""
+    from .migrations import STATE_EVENTS_DDL, run_migrations
+
+    fresh = not _table_exists(conn, "jobs")
     conn.executescript(DDL)
-    _ensure_column(conn, "job_state", "review_dismissed", "INTEGER NOT NULL DEFAULT 0")
+    conn.executescript(STATE_EVENTS_DDL)  # events log is part of the baseline
     conn.commit()
+    run_migrations(conn, _main_db_file(conn), fresh=fresh)
 
 
 def get_db():

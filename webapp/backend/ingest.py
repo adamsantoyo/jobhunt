@@ -15,6 +15,7 @@ from pathlib import Path
 from . import config
 from .db import init_db
 from .descriptions import stream_descriptions
+from .events import record_field_events
 from .identity import seen_key as compute_seen_key
 from .models import IngestReport
 
@@ -295,10 +296,17 @@ def ingest(conn) -> IngestReport:
                     continue
                 reason = (p.get("reason") or "").strip()
                 notes = ("[pick] " + reason) if reason else "[pick]"
+                seeded_at = _now()
                 cur.execute(
                     "INSERT INTO job_state (url, seen_key, status, notes, starred, updated_at) "
                     "VALUES (?,?,?,?,1,?)",
-                    (purl, jr["seen_key"], "Interested", notes, _now()),
+                    (purl, jr["seen_key"], "Interested", notes, seeded_at),
+                )
+                # Record the seeded fields as events (new row -> old is all-NULL).
+                record_field_events(
+                    cur, seen_key=jr["seen_key"], url=purl, old={},
+                    new={"status": "Interested", "notes": notes, "starred": 1},
+                    source="ingest:picks", at=seeded_at,
                 )
                 have_state.add(purl)
 
