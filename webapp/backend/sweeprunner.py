@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import time
+import uuid
 
 from . import config
 
@@ -34,9 +35,27 @@ SWEEP_STEP_ATTEMPT_CAP = 25       # attempts on the same step before --skip
 EXTERNAL_SWEEP_WINDOW = 180       # seconds: a fresh sweep_state.json => external run
 HEARTBEAT_SECS = 15
 STREAM_MAX_SECS = 300             # recycle an SSE connection rather than pin its socket
+SUB_QUEUE_MAX = 512               # per-subscriber backlog before we recycle its stream
 
 _STEP_RE = re.compile(r"^>>>\s+(.*\S)\s*$")
 _PROGRESS_RE = re.compile(r"\[(\d+)/(\d+) done\]\s*next:\s*(.+?)\s*$")
+
+# Run counters restart with the process, so a client must not compare a count from
+# one process against another's. Every frame carries this nonce to make that check
+# a comparison instead of a guess.
+BOOT = uuid.uuid4().hex[:8]
+
+
+class _Sub:
+    """One SSE subscriber. `overflow` means we stopped feeding it because it could
+    not drain; sse_stream turns that into a recycle so it reattaches and resyncs
+    rather than silently carrying a hole in its event history."""
+
+    __slots__ = ("q", "overflow")
+
+    def __init__(self):
+        self.q: asyncio.Queue = asyncio.Queue(maxsize=SUB_QUEUE_MAX)
+        self.overflow = False
 
 
 class Runner:
@@ -47,9 +66,10 @@ class Runner:
         self.step = None
         self.done = 0
         self.total = 0
-        self.events = []                                    # replay buffer for this run
+        self.finished = 0                                   # runs completed since BOOT
+        self.last_error = None                              # last completed run's failure, if any
         self.log = collections.deque(maxlen=500)            # last 500 raw output lines
-        self.subscribers: set[asyncio.Queue] = set()
+        self.subscribers: set[_Sub] = set()
         self._proc = None
         self._cancel = False
         self._task = None
@@ -70,25 +90,65 @@ class Runner:
         }
 
     # ---------------------------------------------------------------- events
+    def _stamp(self, ev: dict) -> dict:
+        """Tag a frame with the run counters. A client folds these in and compares
+        them, which is how it distinguishes "a run finished while I was away" from
+        "nothing happened" without us ever replaying event history to it."""
+        return {**ev, "boot": BOOT, "finished": self.finished}
+
     def _emit(self, ev: dict):
-        ev = dict(ev)
-        self.events.append(ev)
-        for q in list(self.subscribers):
+        if ev["type"] in ("done", "error"):
+            # Exactly one terminal event per run, so this really is a completed-run
+            # count. Clients invalidate their caches once per increment they observe.
+            self.finished += 1
+            self.last_error = ev.get("message") if ev["type"] == "error" else None
+        ev = self._stamp(ev)
+        for sub in list(self.subscribers):
+            if sub.overflow:
+                continue
             try:
-                q.put_nowait(ev)
-            except Exception:
+                sub.q.put_nowait(ev)
+            except asyncio.QueueFull:
+                # Half-open or blocked client. Don't grow memory one stdout line at a
+                # time for it, and don't drop silently either (an undetectable hole
+                # would leave its strip wrong) -- flag it and let sse_stream recycle
+                # the response so it comes back and resyncs.
+                sub.overflow = True
+            except Exception:  # noqa: BLE001 - a bad subscriber must not kill the run
                 pass
 
-    async def subscribe(self):
-        q: asyncio.Queue = asyncio.Queue()
-        # Replay only while a run is live; a finished run's terminal events must not
-        # resurface as a stale progress/error strip on every later page load.
-        snapshot = list(self.events) if self.running else []
-        self.subscribers.add(q)
-        return q, snapshot
+    def _sync_event(self) -> dict:
+        """The single catch-up frame every stream opens with: live state, not history.
 
-    def unsubscribe(self, q):
-        self.subscribers.discard(q)
+        The client's reduce() folds every past log frame into one lastLine and every
+        past step frame into the latest, so replaying a run verbatim cost O(run
+        length) per reconnect to deliver what this one frame already carries.
+
+        It reports no terminal events while idle -- a finished run must never
+        resurface as a stale progress strip on a fresh page load. A client that WAS
+        watching learns the run ended from the `finished` counter instead.
+        """
+        return self._stamp({
+            "type": "sync",
+            "running": self.running,
+            "kind": self.kind,
+            "step": self.step,
+            "done": self.done,
+            "total": self.total,
+            "line": self.log[-1] if self.log else None,
+            "last_error": None if self.running else self.last_error,
+        })
+
+    def subscribe(self) -> tuple[_Sub, dict]:
+        """Not async on purpose: with no await between building the snapshot and
+        registering, a new subscriber cannot miss an event emitted in between."""
+        sub = _Sub()
+        sync = self._sync_event()
+        self.subscribers.add(sub)
+        return sub, sync
+
+    def unsubscribe(self, sub: _Sub):
+        self.subscribers.discard(sub)
 
     # ------------------------------------------------ external sweep detection
     def _mark_own_sweep_write(self):
@@ -126,7 +186,6 @@ class Runner:
         self.done = 0
         self.total = 0
         self._cancel = False
-        self.events = []
         self.log.clear()
         self._task = asyncio.create_task(self._run(kind))
         return True, kind
@@ -337,6 +396,9 @@ class Runner:
         if self._cancel:
             self._emit({"type": "error", "kind": kind, "message": "cancelled"})
             return
+        # Ingest runs off-thread and emits nothing until it returns; say so, or the
+        # strip sits on a stale line for the whole quiet stretch before `done`.
+        self._emit({"type": "log", "kind": kind, "line": "ingesting…"})
         try:
             counts = await asyncio.to_thread(self._do_ingest)
         except Exception as e:  # noqa: BLE001
@@ -351,31 +413,50 @@ class Runner:
 runner = Runner()
 
 
-async def sse_stream(request=None):
-    """Async generator yielding SSE frames: snapshot replay + live tail + heartbeats.
+async def sse_stream():
+    """Async generator yielding SSE frames: one sync snapshot, then the live tail.
 
-    Ends on client disconnect, or after STREAM_MAX_SECS regardless. Both matter:
-    a stream that outlives its client keeps a socket pinned, and browsers allow
-    only ~6 per origin, so leaked streams eventually starve the whole app. The
-    disconnect check is best-effort (BaseHTTPMiddleware can swallow the signal),
-    so the lifetime cap is the backstop that guarantees the socket is released.
-    EventSource reconnects on its own, and subscribe() replays the active run,
-    so recycling the connection is invisible to a client that is still there.
+    Ends on subscriber overflow or after STREAM_MAX_SECS, both checked at the TOP of
+    every iteration rather than inside the queue-wait timeout: during an active
+    sweep _emit publishes a frame per stdout line, so the timeout branch is rarely
+    taken and a check parked there would never run exactly when the run is long
+    enough for it to matter. A stream that outlives its client keeps a socket
+    pinned and browsers allow only ~6 per origin.
+
+    There is deliberately no request.is_disconnected() poll. Starlette already
+    cancels this generator on disconnect (StreamingResponse races the body against
+    listen_for_disconnect), so it never returns True from in here -- measured at
+    ~0.2s to cancellation under both BaseHTTPMiddleware and pure ASGI, with no poll
+    ever observing anything. Cleanup rides on that cancellation reaching the finally
+    below. The heartbeat is the fallback: on a half-open socket, or on an ASGI
+    server advertising spec_version >= 2.4 (where StreamingResponse detects
+    disconnects from a failing send instead), the next heartbeat write is what
+    surfaces the dead peer. STREAM_MAX_SECS is the hard backstop when neither fires.
+
+    Recycling needs no replay protocol. Every stream opens with a `sync` frame
+    carrying live state plus the `finished` run counter, so a client that missed
+    events while away learns what it missed by comparing counters. Deliberate
+    recycles announce themselves with `bye` so the client reopens immediately
+    instead of waiting out EventSource's retry and blinking its strip out.
     """
-    q, snapshot = await runner.subscribe()
-    deadline = asyncio.get_running_loop().time() + STREAM_MAX_SECS
+    loop = asyncio.get_running_loop()
+    sub, sync = runner.subscribe()
+    deadline = loop.time() + STREAM_MAX_SECS
     try:
-        for ev in snapshot:
-            yield f"data: {json.dumps(ev)}\n\n"
+        yield f"data: {json.dumps(sync)}\n\n"
         while True:
+            now = loop.time()
+            if now >= deadline or sub.overflow:
+                reason = "overflow" if sub.overflow else "deadline"
+                yield f"data: {json.dumps({'type': 'bye', 'reason': reason})}\n\n"
+                return
             try:
-                ev = await asyncio.wait_for(q.get(), timeout=HEARTBEAT_SECS)
-                yield f"data: {json.dumps(ev)}\n\n"
+                # Clamp to the deadline so a quiet stream ends on time instead of up
+                # to HEARTBEAT_SECS late.
+                ev = await asyncio.wait_for(sub.q.get(), timeout=min(HEARTBEAT_SECS, deadline - now))
             except asyncio.TimeoutError:
-                if request is not None and await request.is_disconnected():
-                    return
-                if asyncio.get_running_loop().time() >= deadline:
-                    return
-                yield ": heartbeat\n\n"
+                yield ": heartbeat\n\n"    # comment frame: no event, keeps the socket warm
+                continue
+            yield f"data: {json.dumps(ev)}\n\n"
     finally:
-        runner.unsubscribe(q)
+        runner.unsubscribe(sub)
