@@ -1,4 +1,8 @@
-"""User-owned state: job_state edits, quick actions, company notes, review list."""
+"""User-owned state: job_state edits, quick actions, company notes.
+
+job_state is keyed on seen_key (role identity). Routes stay url-addressed for frontend
+compat; each url is resolved to a seen_key before touching state. The review endpoints
+are retired shims (empty list / 410) — see the bottom of this module."""
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -7,10 +11,8 @@ from ..config import STATUSES
 from ..db import get_db
 from ..events import TRACKED_FIELDS, record_field_events
 from ..models import (
-    JOB_LIGHT_SQL,
     CompanyPatch,
     CompanyState,
-    JobLight,
     JobState,
     QuickAction,
     ReconcileBody,
@@ -18,23 +20,23 @@ from ..models import (
     StatePatch,
     b64_to_url,
     date_plus,
-    job_light_from_row,
     now_iso,
     today_iso,
-    url_to_b64,
 )
 
 router = APIRouter()
 
 # Whitelist of columns a PATCH may touch (also guards the SQL built from it).
+# review_dismissed is deliberately absent: the DTO still accepts it (frontend compat)
+# but it is dropped here, so it never reaches the SQL for a column that no longer exists.
 _PATCHABLE = (
     "status", "notes", "follow_up_date", "applied_date", "starred", "hidden",
-    "contact", "snoozed_until", "review_dismissed",
+    "contact", "snoozed_until",
 )
 
 
-def _state_dto(conn: sqlite3.Connection, url: str) -> JobState:
-    row = conn.execute("SELECT * FROM job_state WHERE url=?", (url,)).fetchone()
+def _state_dto(conn: sqlite3.Connection, seen_key: str) -> JobState:
+    row = conn.execute("SELECT * FROM job_state WHERE seen_key=?", (seen_key,)).fetchone()
     return JobState(
         status=row["status"],
         notes=row["notes"] or "",
@@ -44,18 +46,20 @@ def _state_dto(conn: sqlite3.Connection, url: str) -> JobState:
         hidden=bool(row["hidden"]),
         contact=row["contact"] or "",
         snoozed_until=row["snoozed_until"],
-        needs_review=bool(row["needs_review"]),
-        review_reason=row["review_reason"],
+        needs_review=False,   # retired; constant for frontend compat
+        review_reason=None,
         updated_at=row["updated_at"],
     )
 
 
 def _resolve_seen_key(conn: sqlite3.Connection, url: str):
-    """seen_key for a state row: prefer existing state, then the jobs cache."""
-    row = conn.execute("SELECT seen_key FROM job_state WHERE url=?", (url,)).fetchone()
+    """seen_key (job_state's key) for a url. The jobs cache is authoritative for any
+    present/known url, so it wins; a dormant state row addressed by its own last-known
+    url is the fallback. None when the url maps to neither."""
+    row = conn.execute("SELECT seen_key FROM jobs WHERE url=?", (url,)).fetchone()
     if row:
         return row["seen_key"]
-    row = conn.execute("SELECT seen_key FROM jobs WHERE url=?", (url,)).fetchone()
+    row = conn.execute("SELECT seen_key FROM job_state WHERE url=?", (url,)).fetchone()
     return row["seen_key"] if row else None
 
 
@@ -63,33 +67,36 @@ def _apply_state(conn: sqlite3.Connection, url: str, changes: dict,
                  source: str = "patch") -> JobState:
     """Upsert that touches ONLY the supplied fields, as one atomic statement — no
     read-modify-write, so concurrent edits of disjoint fields both survive.
-    Every user edit clears the live needs_review flag; review_dismissed changes
-    only when the patch names it. status->Applied with no applied_date supplied
-    fills today while preserving any existing date (COALESCE).
+    status->Applied with no applied_date supplied fills today while preserving any
+    existing date (COALESCE).
+
+    job_state is keyed on seen_key: the url is resolved to a seen_key (jobs cache, or a
+    dormant state row) and the upsert conflicts on seen_key, so an edit made through
+    any url that maps to a role lands on that role's single state row. url is refreshed
+    to the address the edit came through (a present-job url), keeping display current.
 
     Before committing, one state_event is written per field that actually changed
     (diffed against the pre-write row), inside this same transaction so an event and
     the change it records commit together or not at all."""
     changes = {k: v for k, v in changes.items() if k in _PATCHABLE}
-    for k in ("starred", "hidden", "review_dismissed"):
+    for k in ("starred", "hidden"):
         if k in changes:
             changes[k] = 1 if changes[k] else 0
     auto_applied = changes.get("status") == "Applied" and "applied_date" not in changes
 
-    # Pre-write row for event diffing (also supplies the preserved applied_date). Read
-    # once, before the upsert. seen_key is derived data (jobs cache), never
-    # user-mutated: this pre-read is not part of the lost-update race. Unset columns
-    # take their DDL defaults on the INSERT branch (status 'New', notes '', flags 0).
-    old_row = conn.execute("SELECT * FROM job_state WHERE url=?", (url,)).fetchone()
     seen_key = _resolve_seen_key(conn, url) or ""
+    # Pre-write row for event diffing (also supplies the preserved applied_date), keyed
+    # on seen_key like the upsert below. Read once, before the write. Unset columns take
+    # their DDL defaults on the INSERT branch (status 'New', notes '', flags 0).
+    old_row = conn.execute("SELECT * FROM job_state WHERE seen_key=?", (seen_key,)).fetchone()
 
     params = dict(changes)
     params.update(url=url, seen_key=seen_key, updated_at=now_iso(), today=today_iso())
 
-    insert_cols = ["url", "seen_key", "updated_at"] + list(changes)
+    insert_cols = ["seen_key", "url", "updated_at"] + list(changes)
     insert_vals = [f":{c}" for c in insert_cols]
     set_parts = [f"{c}=excluded.{c}" for c in changes]
-    set_parts += ["updated_at=excluded.updated_at", "needs_review=0", "review_reason=NULL"]
+    set_parts += ["url=excluded.url", "updated_at=excluded.updated_at"]
     if auto_applied:
         insert_cols.append("applied_date")
         insert_vals.append(":today")
@@ -97,7 +104,7 @@ def _apply_state(conn: sqlite3.Connection, url: str, changes: dict,
 
     conn.execute(
         f"INSERT INTO job_state ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals)}) "
-        f"ON CONFLICT(url) DO UPDATE SET {', '.join(set_parts)}",
+        f"ON CONFLICT(seen_key) DO UPDATE SET {', '.join(set_parts)}",
         params,
     )
 
@@ -112,7 +119,7 @@ def _apply_state(conn: sqlite3.Connection, url: str, changes: dict,
                         new=new_vals, source=source, at=params["updated_at"])
 
     conn.commit()
-    return _state_dto(conn, url)
+    return _state_dto(conn, seen_key)
 
 
 def _decode_or_404(url_b64: str) -> str:
@@ -191,64 +198,16 @@ def patch_company(company: str, body: CompanyPatch, conn: sqlite3.Connection = D
     return CompanyState(company=company, contact=contact, notes=notes, updated_at=now)
 
 
-def _synth_light(s: sqlite3.Row) -> JobLight:
-    """Minimal JobLight for a review-flagged state whose job row is gone."""
-    return JobLight(
-        url=s["url"], url_b64=url_to_b64(s["url"]), seen_key=s["seen_key"], tier=0,
-        is_new=False, remote=False, has_desc=False,
-        state=JobState(
-            status=s["status"], notes=s["notes"] or "", follow_up_date=s["follow_up_date"],
-            applied_date=s["applied_date"], starred=bool(s["starred"]), hidden=bool(s["hidden"]),
-            contact=s["contact"] or "", snoozed_until=s["snoozed_until"],
-            needs_review=bool(s["needs_review"]), review_reason=s["review_reason"],
-            updated_at=s["updated_at"],
-        ),
-    )
-
-
 @router.get("/review", response_model=list[ReviewItem])
 def review_list(conn: sqlite3.Connection = Depends(get_db)):
-    rows = conn.execute("SELECT * FROM job_state WHERE needs_review=1").fetchall()
-    out = []
-    for s in rows:
-        jrow = conn.execute(f"{JOB_LIGHT_SQL} WHERE j.url=?", (s["url"],)).fetchone()
-        job = job_light_from_row(jrow) if jrow is not None else _synth_light(s)
-        # Live candidates: present jobs sharing the flagged row's seen_key. Ones
-        # that already own state come through with state != null (UI disables Attach).
-        cands = [
-            job_light_from_row(r)
-            for r in conn.execute(
-                f"{JOB_LIGHT_SQL} WHERE j.present=1 AND j.seen_key=?", (s["seen_key"],)
-            ).fetchall()
-        ]
-        out.append(ReviewItem(job=job, candidates=cands))
-    return out
+    """Retired: state follows a role by seen_key, so nothing is ever flagged for
+    review. Kept as an always-empty endpoint so the built frontend's fetch is a no-op
+    instead of a 404."""
+    return []
 
 
-@router.post("/review/reconcile", response_model=JobState)
+@router.post("/review/reconcile")
 def reconcile(body: ReconcileBody, conn: sqlite3.Connection = Depends(get_db)):
-    """Attach an orphaned/ambiguous state row to a user-chosen successor job.
-    One guarded UPDATE (no check-then-act): a concurrent reconcile to the same
-    target loses the race with a 409, never a PK-violation 500. seen_key is
-    rewritten to the target's — the point is re-anchoring across identities."""
-    from_url = _decode_or_404(body.from_url_b64)
-    to_url = _decode_or_404(body.to_url_b64)
-    if from_url == to_url:
-        raise HTTPException(status_code=422, detail="source and target are the same job")
-    cur = conn.execute(
-        "UPDATE job_state SET url=:to, "
-        "seen_key=(SELECT seen_key FROM jobs WHERE url=:to), "
-        "needs_review=0, review_reason=NULL, review_dismissed=0, updated_at=:now "
-        "WHERE url=:frm "
-        "AND EXISTS (SELECT 1 FROM jobs WHERE url=:to AND present=1) "
-        "AND NOT EXISTS (SELECT 1 FROM job_state WHERE url=:to)",
-        {"to": to_url, "frm": from_url, "now": now_iso()},
-    )
-    if cur.rowcount == 0:
-        if conn.execute("SELECT 1 FROM job_state WHERE url=?", (from_url,)).fetchone() is None:
-            raise HTTPException(status_code=404, detail="no state at the source job")
-        if conn.execute("SELECT 1 FROM jobs WHERE url=? AND present=1", (to_url,)).fetchone() is None:
-            raise HTTPException(status_code=422, detail="target job is not present in the current run")
-        raise HTTPException(status_code=409, detail="target job already has state")
-    conn.commit()
-    return _state_dto(conn, to_url)
+    """Retired: there are no orphaned state rows to reconcile once state is keyed on
+    seen_key. 410 Gone tells the built frontend the operation no longer exists."""
+    raise HTTPException(status_code=410, detail="reconcile retired: state is keyed on seen_key")

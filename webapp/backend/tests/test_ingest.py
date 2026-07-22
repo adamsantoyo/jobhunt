@@ -1,11 +1,14 @@
 """Ingest unit tests (synthetic fixtures only, never the real results/).
 
-Covers the contract's required list:
+job_state is keyed on seen_key (role identity), so state follows a role across url
+rewrites with no healing/orphan/review machinery. These preserve the original healing
+*scenarios* but assert the new semantics — state is never lost or misattributed:
   * fresh ingest on synthetic fixtures
   * re-ingest preserves an edited status/note
-  * URL-rewrite migration (state follows seen_key when unambiguous)
-  * ambiguous rewrite -> needs_review, no data loss
-  * ingest never clears status (disappeared job keeps its state)
+  * URL rewrite: state follows the role to its new url (no healing counter)
+  * repost / two present rows sharing a seen_key: state stays on the one seen_key row
+  * URL recycled by a different role: state stays with its own role, never leaks
+  * disappeared job: state goes dormant, never cleared
   * backfill creates runs + history for multiple CSVs
   * description streaming join fills only-missing and skips malformed lines
 """
@@ -67,19 +70,26 @@ def open_conn(repo):
 
 
 def set_state(conn, url, **fields):
+    """Seed a job_state row for the role at `url` (job_state is keyed on seen_key; url
+    is the display column). Derives seen_key from the jobs cache."""
     sk = conn.execute("SELECT seen_key FROM jobs WHERE url=?", (url,)).fetchone()["seen_key"]
     base = {"status": "New", "notes": "", "follow_up_date": None, "applied_date": None,
-            "starred": 0, "hidden": 0, "contact": "", "snoozed_until": None,
-            "needs_review": 0, "review_reason": None}
+            "starred": 0, "hidden": 0, "contact": "", "snoozed_until": None}
     base.update(fields)
     conn.execute(
-        "INSERT INTO job_state (url, seen_key, status, notes, follow_up_date, applied_date, starred, hidden, "
-        "contact, snoozed_until, needs_review, review_reason, updated_at) VALUES "
-        "(:url,:seen_key,:status,:notes,:follow_up_date,:applied_date,:starred,:hidden,:contact,"
-        ":snoozed_until,:needs_review,:review_reason,'2026-07-19T00:00:00')",
+        "INSERT INTO job_state (seen_key, url, status, notes, follow_up_date, applied_date, starred, hidden, "
+        "contact, snoozed_until, updated_at) VALUES "
+        "(:seen_key,:url,:status,:notes,:follow_up_date,:applied_date,:starred,:hidden,:contact,"
+        ":snoozed_until,'2026-07-19T00:00:00')",
         {"url": url, "seen_key": sk, **base},
     )
     conn.commit()
+
+
+def state_by_seen_key(conn, company, title, location):
+    """Fetch the single state row for a role by its seen_key."""
+    sk = seen_key(company, title, location)
+    return conn.execute("SELECT * FROM job_state WHERE seen_key=?", (sk,)).fetchone()
 
 
 # --------------------------------------------------------------------------- #
@@ -154,23 +164,28 @@ def test_url_rewrite_migration_unambiguous(repo):
             source="greenhouse", url="https://canonical.example/2"),
     ])
     rep = ingest(conn)
-    assert rep.healed == 1
+    assert rep.healed == 0          # no healing counter; state follows via seen_key
     assert rep.needs_review == 0
 
-    # State migrated to the new url; old url has no state row; status/note intact.
+    # The single seen_key row's display url is refreshed to the new address; the old
+    # url no longer resolves to any row; status/note intact.
     assert conn.execute("SELECT 1 FROM job_state WHERE url='https://old.example/1'").fetchone() is None
     st = conn.execute(
-        "SELECT status, notes, needs_review, seen_key FROM job_state WHERE url='https://canonical.example/2'"
+        "SELECT status, notes, seen_key FROM job_state WHERE url='https://canonical.example/2'"
     ).fetchone()
     assert st is not None
     assert st["status"] == "Applied"
     assert st["notes"] == "my note"
-    assert st["needs_review"] == 0
     assert st["seen_key"] == seen_key("Initech", "Support Engineer", "San Francisco, CA")
+    # Exactly one state row survived (no duplication).
+    assert conn.execute("SELECT COUNT(*) AS c FROM job_state").fetchone()["c"] == 1
     conn.close()
 
 
-def test_ambiguous_rewrite_flags_review_without_loss(repo):
+def test_two_present_rows_same_seen_key_keep_single_state(repo):
+    # Two present rows share a seen_key (the pipeline's dedupe should prevent this, but
+    # ingest must stay non-destructive if it ever happens). State stays on the one
+    # seen_key row; nothing is flagged, nothing is duplicated.
     write_csv(repo.results / "jobs_scored_2026-07-18.csv", [
         row(title="Support Engineer", company="Initech", location="San Francisco, CA",
             source="greenhouse", url="https://old.example/1"),
@@ -179,7 +194,6 @@ def test_ambiguous_rewrite_flags_review_without_loss(repo):
     ingest(conn)
     set_state(conn, "https://old.example/1", status="Applied", notes="precious note")
 
-    # Run 2: TWO present jobs share the same seen_key -> ambiguous.
     write_csv(repo.results / "jobs_scored_2026-07-19.csv", [
         row(title="Support Engineer", company="Initech", location="San Francisco, CA",
             source="greenhouse", url="https://cand.example/A"),
@@ -188,18 +202,16 @@ def test_ambiguous_rewrite_flags_review_without_loss(repo):
     ])
     rep = ingest(conn)
     assert rep.healed == 0
-    assert rep.needs_review == 1
+    assert rep.needs_review == 0
 
-    st = conn.execute(
-        "SELECT status, notes, needs_review, review_reason FROM job_state WHERE url='https://old.example/1'"
-    ).fetchone()
+    st = state_by_seen_key(conn, "Initech", "Support Engineer", "San Francisco, CA")
     assert st is not None                       # never deleted
     assert st["status"] == "Applied"            # never overwritten
     assert st["notes"] == "precious note"
-    assert st["needs_review"] == 1
-    assert "https://cand.example/A" in st["review_reason"]
-    assert "https://cand.example/B" in st["review_reason"]
-    # No state was fabricated on either candidate.
+    # Display url is deterministic (ORDER BY url picks the lexicographically-first
+    # present candidate) and always one of the real present urls, never a surrogate.
+    assert st["url"] == "https://cand.example/A"
+    # Exactly one state row exists; no state fabricated on the other candidate.
     assert conn.execute("SELECT COUNT(*) AS c FROM job_state").fetchone()["c"] == 1
     conn.close()
 
@@ -222,12 +234,12 @@ def test_ingest_never_clears_status_when_job_disappears(repo):
     assert rep.healed == 0
     assert rep.needs_review == 0  # disappearance is NOT a review case
 
-    st = conn.execute(
-        "SELECT status, notes, needs_review FROM job_state WHERE url='https://solo.example/1'"
-    ).fetchone()
+    # State goes dormant on its seen_key row, keeping its last-known url; never cleared.
+    st = state_by_seen_key(conn, "SoloCorp", "Zeta Role", "Nowhere, NV")
+    assert st is not None
     assert st["status"] == "Applied"
     assert st["notes"] == "keep me"
-    assert st["needs_review"] == 0
+    assert st["url"] == "https://solo.example/1"
     conn.close()
 
 
@@ -334,35 +346,37 @@ def _recycle_fixture(repo, run2_rows):
     return conn
 
 
-def test_recycled_url_parks_state_when_role_gone(repo):
+def test_recycled_url_keeps_state_with_its_own_role(repo):
+    # U recycled to a different role, original role fully gone. The new role must show
+    # NO inherited state, and the original state survives (dormant) without leaking.
     conn = _recycle_fixture(repo, [
         row(title="Totally Different Role", company="OtherCo", location="Austin, TX",
             source="greenhouse", url="https://recycled.example/1"),
     ])
     rep = ingest(conn)
     assert rep.healed == 0
-    assert rep.needs_review == 0  # old role fully gone -> dormant, not review
+    assert rep.needs_review == 0
 
-    # The recycled url shows NO inherited state.
-    assert conn.execute(
-        "SELECT 1 FROM job_state WHERE url='https://recycled.example/1'").fetchone() is None
+    # The recycled url now belongs to OtherCo; its own seen_key carries no state.
     jrow = conn.execute(
         "SELECT seen_key FROM jobs WHERE url='https://recycled.example/1'").fetchone()
     assert jrow["seen_key"] == seen_key("OtherCo", "Totally Different Role", "Austin, TX")
+    assert conn.execute(
+        "SELECT 1 FROM job_state WHERE seen_key=?", (jrow["seen_key"],)).fetchone() is None
 
-    # The old state survives, parked on the orphan surrogate, forensically annotated.
-    sk1 = seen_key("Initech", "Original Role", "San Francisco, CA")
-    st = conn.execute(
-        "SELECT status, notes, needs_review, review_reason FROM job_state WHERE url=?",
-        ("orphaned:" + sk1,)).fetchone()
+    # The original state survives on its own seen_key. Its display url is detached to
+    # NULL precisely because the old url is now a *different* present role — the join
+    # must never surface this status on OtherCo's card.
+    st = state_by_seen_key(conn, "Initech", "Original Role", "San Francisco, CA")
     assert st is not None
     assert st["status"] == "Applied" and st["notes"] == "precious"
-    assert st["needs_review"] == 0
-    assert "recycled" in (st["review_reason"] or "")
+    assert st["url"] is None
     conn.close()
 
 
-def test_recycled_url_migrates_state_to_moved_role(repo):
+def test_recycled_url_state_follows_moved_role(repo):
+    # U recycled to a different role, AND the original role reappears at a new url.
+    # State stays with the original role and adopts its new url.
     conn = _recycle_fixture(repo, [
         row(title="Totally Different Role", company="OtherCo", location="Austin, TX",
             source="greenhouse", url="https://recycled.example/1"),
@@ -371,18 +385,22 @@ def test_recycled_url_migrates_state_to_moved_role(repo):
             source="lever", url="https://moved.example/2"),
     ])
     rep = ingest(conn)
-    assert rep.healed == 1
+    assert rep.healed == 0
     assert rep.needs_review == 0
-    assert conn.execute(
-        "SELECT 1 FROM job_state WHERE url='https://recycled.example/1'").fetchone() is None
-    st = conn.execute(
-        "SELECT status, notes, needs_review FROM job_state WHERE url='https://moved.example/2'").fetchone()
+
+    st = state_by_seen_key(conn, "Initech", "Original Role", "San Francisco, CA")
     assert st["status"] == "Applied" and st["notes"] == "precious"
-    assert st["needs_review"] == 0
+    assert st["url"] == "https://moved.example/2"
+    # OtherCo's recycled url still carries no state.
+    other_sk = seen_key("OtherCo", "Totally Different Role", "Austin, TX")
+    assert conn.execute("SELECT 1 FROM job_state WHERE seen_key=?", (other_sk,)).fetchone() is None
     conn.close()
 
 
-def test_recycled_url_ambiguous_flags_review(repo):
+def test_recycled_url_with_reposted_role_state_follows(repo):
+    # U recycled to a different role; the original role is reposted under two new urls
+    # sharing its seen_key. State stays on the one original seen_key row, adopts a real
+    # present url deterministically, and never leaks to the recycled role.
     conn = _recycle_fixture(repo, [
         row(title="Totally Different Role", company="OtherCo", location="Austin, TX",
             source="greenhouse", url="https://recycled.example/1"),
@@ -392,17 +410,13 @@ def test_recycled_url_ambiguous_flags_review(repo):
             source="lever", url="https://cand.example/B"),
     ])
     rep = ingest(conn)
-    assert rep.needs_review == 1
-    assert conn.execute(
-        "SELECT 1 FROM job_state WHERE url='https://recycled.example/1'").fetchone() is None
-    sk1 = seen_key("Initech", "Original Role", "San Francisco, CA")
-    st = conn.execute(
-        "SELECT status, needs_review, review_reason FROM job_state WHERE url=?",
-        ("orphaned:" + sk1,)).fetchone()
-    assert st["status"] == "Applied"
-    assert st["needs_review"] == 1
-    assert "https://cand.example/A" in st["review_reason"]
-    assert "https://cand.example/B" in st["review_reason"]
+    assert rep.needs_review == 0
+
+    st = state_by_seen_key(conn, "Initech", "Original Role", "San Francisco, CA")
+    assert st["status"] == "Applied" and st["notes"] == "precious"
+    assert st["url"] == "https://cand.example/A"   # ORDER BY url, first present candidate
+    # Still exactly one state row; the recycled role has none.
+    assert conn.execute("SELECT COUNT(*) AS c FROM job_state").fetchone()["c"] == 1
     conn.close()
 
 
@@ -424,82 +438,60 @@ def _ambiguous_fixture(repo):
     return conn
 
 
-def test_durable_dismiss_survives_reingest(repo):
-    from backend.routers.state import _apply_state
-
+def test_state_survives_reingest_as_candidates_change(repo):
+    # The ambiguous scenario, then it resolves to a single candidate. State stays on
+    # its one seen_key row throughout and ends up anchored to the surviving url.
     conn = _ambiguous_fixture(repo)
-    rep = ingest(conn)
-    assert rep.needs_review == 1
+    ingest(conn)
+    st = state_by_seen_key(conn, "Initech", "Support Engineer", "San Francisco, CA")
+    assert st["status"] == "Applied" and st["url"] == "https://cand.example/A"
 
-    _apply_state(conn, "https://old.example/1", {"review_dismissed": True})
-    st = conn.execute(
-        "SELECT needs_review, review_dismissed FROM job_state WHERE url='https://old.example/1'").fetchone()
-    assert st["needs_review"] == 0 and st["review_dismissed"] == 1
+    # Re-ingest the same two candidates: still one row, unchanged.
+    ingest(conn)
+    assert conn.execute("SELECT COUNT(*) AS c FROM job_state").fetchone()["c"] == 1
 
-    # Re-ingest the SAME ambiguous situation: stays dismissed, not re-flagged.
-    rep2 = ingest(conn)
-    assert rep2.needs_review == 0
-    st = conn.execute(
-        "SELECT needs_review, review_dismissed FROM job_state WHERE url='https://old.example/1'").fetchone()
-    assert st["needs_review"] == 0 and st["review_dismissed"] == 1
-
-    # The ambiguity later resolves to ONE candidate: migration resets the dismissal.
+    # Now only one candidate remains present.
     write_csv(repo.results / "jobs_scored_2026-07-19.csv", [
         row(title="Support Engineer", company="Initech", location="San Francisco, CA",
             source="greenhouse", url="https://cand.example/A"),
     ])
-    rep3 = ingest(conn)
-    assert rep3.healed == 1
-    st = conn.execute(
-        "SELECT status, needs_review, review_dismissed FROM job_state WHERE url='https://cand.example/A'").fetchone()
-    assert st["status"] == "Applied"
-    assert st["needs_review"] == 0 and st["review_dismissed"] == 0
+    ingest(conn)
+    st = state_by_seen_key(conn, "Initech", "Support Engineer", "San Francisco, CA")
+    assert st["status"] == "Applied" and st["notes"] == "precious note"
+    assert st["url"] == "https://cand.example/A"
     conn.close()
 
 
-def test_reconcile_moves_state_and_rejects_bad_targets(repo):
-    from fastapi import HTTPException
-
-    from backend.models import ReconcileBody, url_to_b64
-    from backend.routers.state import reconcile
+def test_review_dismissed_patch_is_a_noop(repo):
+    from backend.routers.state import _apply_state
 
     conn = _ambiguous_fixture(repo)
     ingest(conn)
-    b64 = url_to_b64
+    # A legacy patch carrying the retired review_dismissed flag is accepted for
+    # request-shape compat but never persisted; co-supplied real fields still apply.
+    _apply_state(conn, "https://cand.example/A", {"review_dismissed": True, "notes": "edited"})
+    st = state_by_seen_key(conn, "Initech", "Support Engineer", "San Francisco, CA")
+    assert st["notes"] == "edited"
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_state)")}
+    assert "review_dismissed" not in cols and "needs_review" not in cols
+    conn.close()
 
-    # from == to
-    with pytest.raises(HTTPException) as e:
-        reconcile(ReconcileBody(from_url_b64=b64("https://old.example/1"),
-                                to_url_b64=b64("https://old.example/1")), conn)
-    assert e.value.status_code == 422
-    # unknown source
-    with pytest.raises(HTTPException) as e:
-        reconcile(ReconcileBody(from_url_b64=b64("https://nostate.example/x"),
-                                to_url_b64=b64("https://cand.example/A")), conn)
-    assert e.value.status_code == 404
-    # target not present
-    with pytest.raises(HTTPException) as e:
-        reconcile(ReconcileBody(from_url_b64=b64("https://old.example/1"),
-                                to_url_b64=b64("https://gone.example/z")), conn)
-    assert e.value.status_code == 422
 
-    # Happy path: state moves onto the chosen candidate, re-anchored and cleared.
-    st = reconcile(ReconcileBody(from_url_b64=b64("https://old.example/1"),
-                                 to_url_b64=b64("https://cand.example/A")), conn)
-    assert st.status == "Applied" and st.needs_review is False
-    assert conn.execute("SELECT 1 FROM job_state WHERE url='https://old.example/1'").fetchone() is None
-    moved = conn.execute(
-        "SELECT notes, seen_key, review_dismissed FROM job_state WHERE url='https://cand.example/A'").fetchone()
-    assert moved["notes"] == "precious note"
-    assert moved["seen_key"] == seen_key("Initech", "Support Engineer", "San Francisco, CA")
-    assert moved["review_dismissed"] == 0
+def test_review_endpoints_are_retired_shims(repo):
+    from fastapi import HTTPException
 
-    # target already has state -> 409
-    set_state(conn, "https://cand.example/B", status="Interested")
+    from backend.models import ReconcileBody, url_to_b64
+    from backend.routers.state import reconcile, review_list
+
+    conn = _ambiguous_fixture(repo)
+    ingest(conn)
+    # /api/review is always empty (nothing is ever flagged for review).
+    assert review_list(conn) == []
+    # /api/review/reconcile is gone -> 410.
     with pytest.raises(HTTPException) as e:
-        reconcile(ReconcileBody(from_url_b64=b64("https://cand.example/A"),
-                                to_url_b64=b64("https://cand.example/B")), conn)
-    assert e.value.status_code == 409
+        reconcile(ReconcileBody(from_url_b64=url_to_b64("https://cand.example/A"),
+                                to_url_b64=url_to_b64("https://cand.example/B")), conn)
+    assert e.value.status_code == 410
     conn.close()
 
 

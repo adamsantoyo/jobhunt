@@ -23,14 +23,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tier_odds ON jobs(tier, odds);
 CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company);
 
 CREATE TABLE IF NOT EXISTS job_state (
-  url TEXT PRIMARY KEY, seen_key TEXT NOT NULL,
+  seen_key TEXT PRIMARY KEY, url TEXT,
   status TEXT NOT NULL DEFAULT 'New', notes TEXT DEFAULT '',
   follow_up_date TEXT, applied_date TEXT, starred INTEGER NOT NULL DEFAULT 0,
   hidden INTEGER NOT NULL DEFAULT 0, contact TEXT DEFAULT '', snoozed_until TEXT,
-  needs_review INTEGER NOT NULL DEFAULT 0, review_reason TEXT,
-  review_dismissed INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_state_seen_key ON job_state(seen_key);
 
 CREATE TABLE IF NOT EXISTS company_state (
   company TEXT PRIMARY KEY, contact TEXT DEFAULT '', notes TEXT DEFAULT '', updated_at TEXT NOT NULL);
@@ -83,11 +80,12 @@ def init_db(conn):
     `fresh` is captured *before* the DDL runs: a brand-new DB has the full baseline
     (which already reflects the latest schema, including state_events) so migrations
     are stamped, not executed. An existing DB gets migrations run against it."""
-    from .migrations import STATE_EVENTS_DDL, run_migrations
+    from .migrations import JOB_STATE_ARCHIVE_DDL, STATE_EVENTS_DDL, run_migrations
 
     fresh = not _table_exists(conn, "jobs")
     conn.executescript(DDL)
-    conn.executescript(STATE_EVENTS_DDL)  # events log is part of the baseline
+    conn.executescript(STATE_EVENTS_DDL)       # events log is part of the baseline
+    conn.executescript(JOB_STATE_ARCHIVE_DDL)  # collision archive (migration 3) too
     conn.commit()
     run_migrations(conn, _main_db_file(conn), fresh=fresh)
 
