@@ -197,7 +197,10 @@ def _migration_3_rekey_job_state(conn: sqlite3.Connection) -> None:
         # Already the new schema (defensive: a re-run via the direct test path). No-op.
         return
 
-    old_rows = conn.execute("SELECT * FROM job_state").fetchall()
+    # rowid travels with each row so collision losers are excluded by identity, not
+    # by url equality — the old PK allowed multiple NULL urls, and NULL != NULL is
+    # false in Python, which would silently skip archiving such a loser.
+    old_rows = conn.execute("SELECT rowid AS _rid, * FROM job_state").fetchall()
     groups: dict = {}
     for r in old_rows:
         groups.setdefault(r["seen_key"], []).append(r)
@@ -225,8 +228,21 @@ def _migration_3_rekey_job_state(conn: sqlite3.Connection) -> None:
              winner["snoozed_until"], winner["updated_at"]),
         )
         for loser in rows:
-            if loser["url"] != winner["url"]:
+            if loser["_rid"] != winner["_rid"]:
                 _archive_loser(conn, loser, "seen_key collision", at)
+
+    # Zero-silent-loss invariant: every old row must be live or archived. Raising
+    # here rolls the migration back and leaves the .bak restorable, turning any
+    # future accounting bug into a loud failure instead of quiet data loss.
+    live = conn.execute("SELECT COUNT(*) FROM job_state").fetchone()[0]
+    archived = conn.execute(
+        "SELECT COUNT(*) FROM job_state_archive WHERE archived_at = ?", (at,)
+    ).fetchone()[0]
+    if live + archived != len(old_rows):
+        raise RuntimeError(
+            f"job_state re-key dropped rows: {len(old_rows)} in, "
+            f"{live} live + {archived} archived out"
+        )
 
     conn.execute("DROP TABLE _job_state_old")
 

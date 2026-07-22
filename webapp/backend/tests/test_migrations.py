@@ -229,6 +229,31 @@ def test_old_schema_migration_preserves_row_count_and_statuses(old_db):
     conn.close()
 
 
+def test_null_url_collision_losers_are_archived_not_dropped(tmp_path):
+    # The old TEXT PRIMARY KEY admits multiple NULL urls (SQLite quirk), so two
+    # colliding rows can both have url=NULL. Losers must be excluded by row
+    # identity, not url equality — NULL != NULL is false and would silently drop
+    # the loser (V1 adversarial finding, Phase 0 verify).
+    path = tmp_path / "nullurl.db"
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(OLD_DDL)
+    sk = compute_seen_key("NullCo", "Support Engineer", "Remote")
+    _insert_old_state(conn, url=None, seen_key=sk, status="Applied",
+                      applied_date="2026-07-01", updated_at="2026-07-01T00:00:00")
+    _insert_old_state(conn, url=None, seen_key=sk, status="Interview",
+                      updated_at="2026-07-10T00:00:00")
+    conn.commit()
+
+    run_migrations(conn, str(path))
+
+    live = conn.execute("SELECT * FROM job_state").fetchall()
+    archived = conn.execute("SELECT * FROM job_state_archive").fetchall()
+    assert len(live) == 1 and live[0]["status"] == "Interview"
+    assert len(archived) == 1 and archived[0]["status"] == "Applied"
+    conn.close()
+
+
 def test_old_schema_migration_review_columns_dropped(old_db):
     path, _keys = old_db
     conn = connect(path)
