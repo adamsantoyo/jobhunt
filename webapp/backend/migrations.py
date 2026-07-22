@@ -45,6 +45,19 @@ CREATE INDEX IF NOT EXISTS idx_events_seen_at ON state_events(seen_key, at);
 CREATE INDEX IF NOT EXISTS idx_events_field_at ON state_events(field, at);
 """
 
+# Archive of job_state rows that lose a seen_key collision during migration 3. A full
+# copy of the old row (retired review columns included, so nothing is silently lost)
+# plus the reason/time it was set aside. Referenced by db.init_db() (baseline for
+# fresh/existing DBs) and migration 3 (for the direct-invocation test path).
+JOB_STATE_ARCHIVE_DDL = """
+CREATE TABLE IF NOT EXISTS job_state_archive (
+  seen_key TEXT, url TEXT, status TEXT, notes TEXT,
+  follow_up_date TEXT, applied_date TEXT, starred INTEGER, hidden INTEGER,
+  contact TEXT, snoozed_until TEXT, needs_review INTEGER, review_reason TEXT,
+  review_dismissed INTEGER, updated_at TEXT,
+  archived_reason TEXT, archived_at TEXT);
+"""
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -115,10 +128,114 @@ def _migration_2_backfill(conn: sqlite3.Connection) -> None:
             )
 
 
+def _collision_winner(rows):
+    """Pick the surviving row for a colliding seen_key: most-advanced status (highest
+    index in STATUSES), tie broken by latest updated_at, then url — fully deterministic
+    so a re-derivation on the same data always keeps the same winner."""
+    def key(r):
+        st = r["status"]
+        idx = STATUSES.index(st) if st in STATUSES else -1
+        return (idx, r["updated_at"] or "", r["url"] or "")
+    return max(rows, key=key)
+
+
+def _winner_display_url(conn: sqlite3.Connection, seen_key: str, old_url):
+    """Winner's display url: the present jobs row for this seen_key if one exists
+    (dedupe guarantees <=1), else the old url — with an 'orphaned:' surrogate (the old
+    orphan-parking PK, never a real address) collapsed to NULL, and any url a *different*
+    present role now owns collapsed to NULL too (so the url-based join in read queries
+    never misattributes this dormant state to that other role)."""
+    row = conn.execute(
+        "SELECT url FROM jobs WHERE seen_key=? AND present=1 LIMIT 1", (seen_key,)
+    ).fetchone()
+    if row is not None:
+        return row["url"]
+    if old_url and old_url.startswith("orphaned:"):
+        return None
+    if old_url and conn.execute(
+        "SELECT 1 FROM jobs WHERE url=? AND present=1", (old_url,)
+    ).fetchone() is not None:
+        return None
+    return old_url
+
+
+def _archive_loser(conn: sqlite3.Connection, row, reason: str, at: str) -> None:
+    """Preserve a collision loser verbatim (review columns included) and record a
+    migration-source tombstone. The tombstone uses field 'archived' — out of band from
+    the status timeline, so the funnel never mistakes it for a real transition."""
+    conn.execute(
+        "INSERT INTO job_state_archive (seen_key, url, status, notes, follow_up_date, "
+        "applied_date, starred, hidden, contact, snoozed_until, needs_review, review_reason, "
+        "review_dismissed, updated_at, archived_reason, archived_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (row["seen_key"], row["url"], row["status"], row["notes"], row["follow_up_date"],
+         row["applied_date"], row["starred"], row["hidden"], row["contact"], row["snoozed_until"],
+         row["needs_review"], row["review_reason"], row["review_dismissed"], row["updated_at"],
+         reason, at),
+    )
+    conn.execute(
+        "INSERT INTO state_events (seen_key, url, field, old_value, new_value, at, source) "
+        "VALUES (?,?,?,?,?,?, 'migration')",
+        (row["seen_key"], row["url"], "archived", row["status"], reason, at),
+    )
+
+
+def _migration_3_rekey_job_state(conn: sqlite3.Connection) -> None:
+    """Re-key job_state on seen_key (was url) and drop the retired review columns.
+
+    Rows are grouped by their seen_key COLUMN, which the old orphan-parking never
+    rewrote (it only moved url onto an 'orphaned:<seen_key>' surrogate), so parked rows
+    rejoin their real identity with no url parsing. Each group keeps one winner (see
+    _collision_winner); the rest are copied to job_state_archive and each gets a
+    'migration' tombstone event. The winner's url becomes its present-job address (or
+    the old value, orphaned surrogate -> NULL). No status, note, or date is dropped:
+    every old row is either the winner or archived intact."""
+    conn.executescript(JOB_STATE_ARCHIVE_DDL)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_state)")}
+    if "needs_review" not in cols:
+        # Already the new schema (defensive: a re-run via the direct test path). No-op.
+        return
+
+    old_rows = conn.execute("SELECT * FROM job_state").fetchall()
+    groups: dict = {}
+    for r in old_rows:
+        groups.setdefault(r["seen_key"], []).append(r)
+
+    conn.execute("ALTER TABLE job_state RENAME TO _job_state_old")
+    conn.execute(
+        "CREATE TABLE job_state ("
+        "seen_key TEXT PRIMARY KEY, url TEXT, "
+        "status TEXT NOT NULL DEFAULT 'New', notes TEXT DEFAULT '', "
+        "follow_up_date TEXT, applied_date TEXT, starred INTEGER NOT NULL DEFAULT 0, "
+        "hidden INTEGER NOT NULL DEFAULT 0, contact TEXT DEFAULT '', snoozed_until TEXT, "
+        "updated_at TEXT NOT NULL)"
+    )
+
+    at = _utc_now_iso()
+    for seen_key, rows in groups.items():
+        winner = _collision_winner(rows)
+        url = _winner_display_url(conn, seen_key, winner["url"])
+        conn.execute(
+            "INSERT INTO job_state (seen_key, url, status, notes, follow_up_date, "
+            "applied_date, starred, hidden, contact, snoozed_until, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (seen_key, url, winner["status"], winner["notes"], winner["follow_up_date"],
+             winner["applied_date"], winner["starred"], winner["hidden"], winner["contact"],
+             winner["snoozed_until"], winner["updated_at"]),
+        )
+        for loser in rows:
+            if loser["url"] != winner["url"]:
+                _archive_loser(conn, loser, "seen_key collision", at)
+
+    conn.execute("DROP TABLE _job_state_old")
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
     (2, "backfill_state_events", _migration_2_backfill),
+    (3, "rekey_job_state_on_seen_key", _migration_3_rekey_job_state),
 ]
 
 
