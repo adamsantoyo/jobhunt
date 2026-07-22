@@ -179,12 +179,27 @@ export interface ConfigPatch {
 }
 
 // SSE event shape emitted by GET /api/sweep/progress
+// SSE event shape emitted by GET /api/sweep/progress.
+// `sync` and `bye` are transport-level: `sync` is the per-subscriber catch-up frame
+// every stream opens with, `bye` announces a deliberate recycle. kind/step/line are
+// nullable because `sync` reports live runner state, which is None before the first
+// step resolves.
 export interface SweepEvent {
-  type: "start" | "step" | "log" | "skipped" | "ingested" | "done" | "error";
-  kind?: string;
-  step?: string;
+  type: "start" | "step" | "log" | "skipped" | "ingested" | "done" | "error" | "sync" | "bye";
+  kind?: string | null;
+  step?: string | null;
   done?: number;
   total?: number;
-  line?: string;
+  line?: string | null;
   message?: string;
+  /** Per-process nonce: run counters from different processes are not comparable. */
+  boot?: string;
+  /** Runs completed since `boot`. An increase means a run ended while we were away. */
+  finished?: number;
+  /** sync only. */
+  running?: boolean;
+  /** sync only: how the last completed run failed, when it failed. */
+  last_error?: string | null;
+  /** bye only: why the server is recycling this stream. */
+  reason?: string;
 }

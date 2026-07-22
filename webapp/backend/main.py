@@ -9,8 +9,10 @@ returns a helpful message instead of crashing.
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import config
 from .db import connect, init_db
@@ -44,12 +46,38 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="JobHunt", lifespan=lifespan)
 
 
-@app.middleware("http")
-async def csrf_guard(request: Request, call_next):
-    if request.method not in ("GET", "HEAD"):
-        if request.headers.get(config.CSRF_HEADER) != config.CSRF_VALUE:
-            return JSONResponse({"detail": "missing or invalid app header"}, status_code=403)
-    return await call_next(request)
+class CsrfGuard:
+    """Non-GET requests must carry the X-App header (lightweight local CSRF guard).
+
+    Pure ASGI rather than @app.middleware("http") on purpose. That decorator is
+    sugar for BaseHTTPMiddleware, which per request builds an anyio task group and
+    a pair of memory object streams, then proxies the response through them -- so
+    every chunk of /api/sweep/progress takes an extra queue hop for the whole life
+    of a 45-minute sweep. This guard reads one scope key and one header and needs
+    none of that.
+
+    It does NOT change disconnect behaviour, despite the folklore: measured on
+    starlette 1.3.1 + uvicorn 0.51.0, a client disconnect cancels the streaming
+    generator in ~0.2s under both styles, and Request.is_disconnected() never
+    observes it under either (StreamingResponse's listen_for_disconnect consumes
+    the http.disconnect first). sse_stream relies on that cancellation, not on a
+    poll; see its docstring.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # lifespan/websocket scopes carry no "method"; only HTTP is guarded.
+        if scope["type"] == "http" and scope["method"] not in ("GET", "HEAD"):
+            if Headers(scope=scope).get(config.CSRF_HEADER) != config.CSRF_VALUE:
+                res = JSONResponse({"detail": "missing or invalid app header"}, status_code=403)
+                await res(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(CsrfGuard)
 
 
 # --- /api routers FIRST -----------------------------------------------------
