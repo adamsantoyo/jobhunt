@@ -40,6 +40,7 @@ const EMPTY_STATE: JobState = {
   hidden: false,
   contact: "",
   snoozed_until: null,
+  applied_via: null,
   needs_review: false,
   review_reason: null,
   updated_at: "",

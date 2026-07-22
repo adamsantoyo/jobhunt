@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS job_state (
   status TEXT NOT NULL DEFAULT 'New', notes TEXT DEFAULT '',
   follow_up_date TEXT, applied_date TEXT, starred INTEGER NOT NULL DEFAULT 0,
   hidden INTEGER NOT NULL DEFAULT 0, contact TEXT DEFAULT '', snoozed_until TEXT,
+  applied_via TEXT,
   updated_at TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS company_state (

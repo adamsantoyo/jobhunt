@@ -45,6 +45,7 @@ class JobState(BaseModel):
     hidden: bool
     contact: str
     snoozed_until: Optional[str] = None
+    applied_via: Optional[str] = None
     # Retired in Phase 0 (state is keyed on seen_key, no more review flow). Kept as
     # constants so the already-built frontend keeps deserializing without a rebuild.
     needs_review: bool = False
@@ -110,6 +111,10 @@ class ConfigOut(BaseModel):
     skills: list[str]
     comp_band: list[int]
     statuses: list[str]
+    daily_queue_size: int
+    weekly_app_target: int
+    deadline: str
+    snooze_default_days: int
 
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +129,7 @@ class StatePatch(BaseModel):
     hidden: Optional[bool] = None
     contact: Optional[str] = None
     snoozed_until: Optional[str] = None
+    applied_via: Optional[str] = None
     # Retired: the review flow is gone. Accepted for request-shape compat with the
     # built frontend, but ignored (never persisted, never echoed).
     review_dismissed: Optional[bool] = None
@@ -137,6 +143,11 @@ class ReconcileBody(BaseModel):
 class QuickAction(BaseModel):
     action: str
     days: Optional[int] = None
+    # 'applied' only: how the application was submitted (persisted to job_state).
+    applied_via: Optional[str] = None
+    # 'pass' only: one-tap pass reason. Not a column -- recorded as a standalone
+    # state_event (field='pass_reason'), never persisted on job_state itself.
+    reason: Optional[str] = None
 
 
 class CompanyPatch(BaseModel):
@@ -147,6 +158,10 @@ class CompanyPatch(BaseModel):
 class ConfigPatch(BaseModel):
     skills: Optional[list[str]] = None
     comp_band: Optional[list[int]] = None
+    daily_queue_size: Optional[int] = None
+    weekly_app_target: Optional[int] = None
+    deadline: Optional[str] = None
+    snooze_default_days: Optional[int] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -166,6 +181,7 @@ def _state_from_row(row) -> Optional[JobState]:
         hidden=bool(row["hidden"]),
         contact=row["contact"] or "",
         snoozed_until=row["snoozed_until"],
+        applied_via=row["applied_via"] if "applied_via" in row.keys() else None,
         needs_review=False,   # retired; constant for frontend compat
         review_reason=None,
         updated_at=row["state_updated_at"] if "state_updated_at" in row.keys() else (row["updated_at"] or ""),
@@ -177,7 +193,7 @@ def _state_from_row(row) -> Optional[JobState]:
 # never collides). A NULL status distinguishes "no state row" from a real row.
 JOB_STATE_JOIN_COLS = (
     "s.status, s.notes, s.follow_up_date, s.applied_date, s.starred, s.hidden, "
-    "s.contact, s.snoozed_until, s.updated_at AS state_updated_at"
+    "s.contact, s.snoozed_until, s.applied_via, s.updated_at AS state_updated_at"
 )
 JOB_JOIN_SQL = f"SELECT j.*, {JOB_STATE_JOIN_COLS} FROM jobs j LEFT JOIN job_state s ON j.url = s.url"
 

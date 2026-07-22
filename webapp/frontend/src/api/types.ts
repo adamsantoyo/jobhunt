@@ -9,6 +9,7 @@ export interface JobState {
   hidden: boolean;
   contact: string;
   snoozed_until: string | null;
+  applied_via: string | null;
   needs_review: boolean;
   review_reason: string | null;
   updated_at: string;
@@ -70,6 +71,48 @@ export interface AnalyticsResponse {
   followups: { overdue: number; upcoming: number };
 }
 
+export interface FunnelTotals {
+  applied: number;
+  responded: number;
+  phone_screen: number;
+  interview: number;
+  offer: number;
+  rejected: number;
+}
+
+export interface StageConversion {
+  from: string;
+  to: string;
+  entered: number;
+  advanced: number;
+  rate: number | null;
+}
+
+export interface TimeInStage {
+  status: string;
+  median_days: number | null;
+  n: number;
+}
+
+export interface AppsPerWeek {
+  week_start: string;
+  count: number;
+}
+
+export interface FunnelResponse {
+  totals: FunnelTotals;
+  response_rate: number | null;
+  stage_conversion: StageConversion[];
+  time_in_stage: TimeInStage[];
+  apps_per_week: AppsPerWeek[];
+  ghosted: { applied_no_response_14d: number };
+}
+
+export interface FollowupsResponse {
+  overdue: JobLight[];
+  upcoming: JobLight[];
+}
+
 export interface TierChange {
   job: JobLight;
   from: number;
@@ -125,6 +168,10 @@ export interface AppConfig {
   skills: string[];
   comp_band: [number, number];
   statuses: string[];
+  daily_queue_size: number;
+  weekly_app_target: number;
+  deadline: string;
+  snooze_default_days: number;
 }
 
 export interface IngestReport {
@@ -147,6 +194,7 @@ export interface StatePatch {
   hidden?: boolean;
   contact?: string;
   snoozed_until?: string | null;
+  applied_via?: string | null;
   /** Write-only: durably acknowledge a review item (never echoed back on JobState). */
   review_dismissed?: boolean;
 }
@@ -166,6 +214,10 @@ export type QuickAction = "applied" | "snooze" | "pass" | "star" | "unstar";
 export interface QuickActionBody {
   action: QuickAction;
   days?: number;
+  /** 'applied' only: how the application was submitted. */
+  applied_via?: string;
+  /** 'pass' only: one-tap pass reason (comp/location/seniority/stack/...). */
+  reason?: string;
 }
 
 export interface CompanyPatch {
@@ -176,6 +228,10 @@ export interface CompanyPatch {
 export interface ConfigPatch {
   skills?: string[];
   comp_band?: [number, number];
+  daily_queue_size?: number;
+  weekly_app_target?: number;
+  deadline?: string;
+  snooze_default_days?: number;
 }
 
 // SSE event shape emitted by GET /api/sweep/progress

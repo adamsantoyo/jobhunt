@@ -17,7 +17,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import config
 from .db import connect, init_db
 from .ingest import ingest
-from .routers import analytics, changes, configapi, jobs, sweepapi, state
+from .routers import analytics, changes, configapi, funnel, jobs, sweepapi, state
 from .sweeprunner import runner
 
 
@@ -81,7 +81,7 @@ app.add_middleware(CsrfGuard)
 
 
 # --- /api routers FIRST -----------------------------------------------------
-for module in (jobs, state, analytics, changes, sweepapi, configapi):
+for module in (jobs, state, analytics, changes, sweepapi, configapi, funnel):
     app.include_router(module.router, prefix="/api")
 
 
