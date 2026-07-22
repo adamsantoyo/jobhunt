@@ -273,6 +273,31 @@ def _backup(conn: sqlite3.Connection, db_path, version: int):
     return dest
 
 
+def _dry_run_pending(conn: sqlite3.Connection):
+    """Trial-run every pending migration against a private in-memory copy of `conn`'s
+    current state, then discard the copy.
+
+    This does NOT run migrations against `conn` and roll back: SQLite auto-commits
+    DDL (CREATE TABLE / ALTER TABLE) immediately, ahead of any enclosing transaction,
+    regardless of the connection's isolation level -- migrations 1, 3, and 4 are all
+    DDL, so a rollback() after running them on the real connection would silently fail
+    to undo them, permanently mutating `conn` under a call named dry_run. Backing up
+    onto a throwaway :memory: connection and mutating only that copy is the only way
+    to make this truly inert."""
+    tmp = sqlite3.connect(":memory:")
+    tmp.row_factory = sqlite3.Row
+    try:
+        conn.backup(tmp)
+        _ensure_schema_version(tmp)
+        applied = _applied_versions(tmp)
+        pending = [(v, n, fn) for (v, n, fn) in MIGRATIONS if v not in applied]
+        for version, name, fn in pending:
+            fn(tmp)
+        return [(v, n) for (v, n, _fn) in pending]
+    finally:
+        tmp.close()
+
+
 def run_migrations(conn: sqlite3.Connection, db_path, *, dry_run=False, fresh=None):
     """Converge `conn` to the latest schema. Returns the list of (version, name)
     that were (or, for dry_run, would be) applied.
@@ -286,15 +311,18 @@ def run_migrations(conn: sqlite3.Connection, db_path, *, dry_run=False, fresh=No
     one, run its fn, record the schema_version row, and commit per migration. Any
     exception rolls that migration back and re-raises. A fully up-to-date DB is a no-op.
 
-    dry_run=True: run every pending migration against the connection, then roll the
-    whole thing back (no backup, no commit) and return what would have applied.
+    dry_run=True: never touches `conn` (see _dry_run_pending) -- returns what would
+    apply without any backup, commit, or persisted side effect on the real connection.
     """
+    if dry_run:
+        return _dry_run_pending(conn)
+
     _ensure_schema_version(conn)
     if fresh is None:
         fresh = not _table_exists(conn, "jobs")
     applied = _applied_versions(conn)
 
-    if fresh and not dry_run:
+    if fresh:
         stamped = []
         for version, name, _fn in MIGRATIONS:
             if version not in applied:
@@ -307,19 +335,6 @@ def run_migrations(conn: sqlite3.Connection, db_path, *, dry_run=False, fresh=No
         return stamped
 
     pending = [(v, n, fn) for (v, n, fn) in MIGRATIONS if v not in applied]
-
-    if dry_run:
-        # Trial-run everything, then discard so nothing is persisted.
-        try:
-            for version, name, fn in pending:
-                fn(conn)
-                conn.execute(
-                    "INSERT INTO schema_version (version, name, applied_at) VALUES (?,?,?)",
-                    (version, name, _utc_now_iso()),
-                )
-        finally:
-            conn.rollback()
-        return [(v, n) for (v, n, _fn) in pending]
 
     done = []
     backed_up = False
