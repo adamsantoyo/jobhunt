@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AppShell } from "./components/AppShell";
 import Today from "./pages/Today";
 import Kanban from "./pages/Kanban";
-import Analytics from "./pages/Analytics";
+import Progress from "./pages/Progress";
 import Review from "./pages/Review";
 import Explore from "./pages/Explore";
 
@@ -58,7 +58,8 @@ export default function App() {
               path="changes"
               element={<RedirectPreservingParams to="/explore" merge={{ diff: "new" }} />}
             />
-            <Route path="analytics" element={<Analytics />} />
+            <Route path="progress" element={<Progress />} />
+            <Route path="analytics" element={<RedirectPreservingParams to="/progress" />} />
             <Route path="review" element={<Review />} />
             <Route path="*" element={<Navigate to="/today" replace />} />
           </Route>

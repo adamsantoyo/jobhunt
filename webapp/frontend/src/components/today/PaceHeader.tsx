@@ -1,4 +1,3 @@
-import type { CSSProperties } from "react";
 import { useActivity, useConfig, useJobs } from "../../store/queries";
 import { isQueueEligible } from "../../lib/compare";
 import { todayISO } from "../../lib/format";
@@ -7,27 +6,12 @@ import { todayISO } from "../../lib/format";
 // deadline, and the two queue-composition stats (actionable / snoozed), both
 // tier>=3-scoped per the plan.
 
-const rowStyle: CSSProperties = {
-  display: "flex",
-  gap: 22,
-  alignItems: "baseline",
-  flexWrap: "wrap",
-  padding: "10px 14px",
-  background: "var(--bg-1)",
-  border: "1px solid var(--border)",
-  borderRadius: "var(--radius)",
-};
-
 function Stat({ label, value, tone }: { label: string; value: string | number; tone?: string }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column" }}>
+    <div className="td-stat-col">
       <span
-        style={{
-          fontSize: 18,
-          fontWeight: 700,
-          color: tone ?? "var(--fg)",
-          fontVariantNumeric: "tabular-nums",
-        }}
+        className="td-stat-value"
+        style={{ color: tone ?? "var(--fg)" }}
       >
         {value}
       </span>
@@ -67,7 +51,7 @@ export function PaceHeader() {
   const weeks = weeksToDeadline(config?.deadline);
 
   return (
-    <div style={rowStyle}>
+    <div className="td-pace-row">
       <Stat label="apps this week" value={`${appsWeek}/${target}`} tone="var(--accent)" />
       <Stat label="streak" value={`${streak}d`} tone="var(--amber)" />
       <Stat label="done today" value={done} tone="var(--green)" />

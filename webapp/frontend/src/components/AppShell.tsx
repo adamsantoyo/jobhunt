@@ -4,6 +4,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
 import { qk, useFreshness, useReview } from "../store/queries";
 import { fmtDate } from "../lib/format";
+import { SOURCE_CHIP_CAP } from "../lib/ui";
 import { JobDetailDrawer } from "./JobDetailDrawer";
 import { SweepProgress } from "./SweepProgress";
 import { SettingsDialog } from "./SettingsDialog";
@@ -12,7 +13,7 @@ const NAV: Array<{ to: string; label: string }> = [
   { to: "/today", label: "Today" },
   { to: "/kanban", label: "Pipeline" },
   { to: "/explore", label: "Explore" },
-  { to: "/analytics", label: "Analytics" },
+  { to: "/progress", label: "Progress" },
 ];
 
 export function AppShell() {
@@ -221,28 +222,53 @@ function SourceChips({
   zero: string[];
   stale: string[];
 }) {
+  const [expandedAll, setExpandedAll] = useState(false);
   const zeroSet = new Set(zero);
   const staleSet = new Set(stale);
   if (sources.length === 0 && zero.length === 0 && stale.length === 0) return null;
 
+  // Classify each chip by kind and sort: problem chips first (stable sort)
+  const classified = sources.map((s) => {
+    let kind = "ok";
+    if (zeroSet.has(s.name) || s.rows === 0) kind = "zero";
+    else if (staleSet.has(s.name)) kind = "stale";
+    else if (s.refreshed === false) kind = "stale";
+    return { ...s, kind };
+  });
+
+  // Stable sort: problem chips (kind !== "ok") before ok chips
+  const sorted = classified.sort((a, b) => {
+    const aIsProblem = a.kind !== "ok" ? 0 : 1;
+    const bIsProblem = b.kind !== "ok" ? 0 : 1;
+    return aIsProblem - bIsProblem;
+  });
+
+  const visible = expandedAll ? sorted : sorted.slice(0, SOURCE_CHIP_CAP);
+  const hiddenCount = sorted.length - visible.length;
+
   return (
-    <div className="source-chips">
-      {sources.slice(0, 14).map((s) => {
-        let kind = "ok";
-        if (zeroSet.has(s.name) || s.rows === 0) kind = "zero";
-        else if (staleSet.has(s.name)) kind = "stale";
-        else if (s.refreshed === false) kind = "stale";
-        return (
-          <span
-            key={s.name}
-            className="src-chip"
-            data-kind={kind}
-            title={`${s.name}: ${s.rows} rows${s.refreshed === false ? " (not refreshed)" : ""}`}
-          >
-            {s.name} {s.rows}
-          </span>
-        );
-      })}
+    <div className="source-chips" data-expanded={expandedAll || undefined}>
+      {visible.map((s) => (
+        <span
+          key={s.name}
+          className="src-chip"
+          data-kind={s.kind}
+          title={`${s.name}: ${s.rows} rows${s.refreshed === false ? " (not refreshed)" : ""}`}
+        >
+          {s.name} {s.rows}
+        </span>
+      ))}
+      {sorted.length > SOURCE_CHIP_CAP && (
+        <button
+          type="button"
+          className="src-chip"
+          data-kind="toggle"
+          onClick={() => setExpandedAll(!expandedAll)}
+          title={`${hiddenCount} more sources`}
+        >
+          {expandedAll ? "show less" : `+${hiddenCount} more`}
+        </button>
+      )}
     </div>
   );
 }

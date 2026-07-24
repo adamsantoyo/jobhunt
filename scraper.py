@@ -575,20 +575,42 @@ def dedupe(rows):
 # ---------------- Main ----------------
 RAW = os.path.join(HERE, "results", "raw.jsonl")
 HEALTH = os.path.join(HERE, "results", "source_health.json")
+STALE_HEALTH_DAYS = 45
 
 def _record_health(group, n, refreshed=True):
     """Per-group harvest counts so zero-row sources (markup change, block, outage)
     surface in the run report instead of failing silently (RUBRIC standard #5).
-    refreshed=False means an empty refresh was rejected and prior data was kept."""
+    refreshed=False means an empty refresh was rejected and prior data was kept.
+    Prunes entries older than STALE_HEALTH_DAYS, except the group being recorded."""
     h = {}
     if os.path.exists(HEALTH):
         try:
             with open(HEALTH) as f: h = json.load(f)
         except Exception: h = {}
-    h[group] = {"rows": n, "refreshed": refreshed,
-                "at": datetime.datetime.now().isoformat(timespec="seconds")}
+
+    # Prune stale entries (older than STALE_HEALTH_DAYS), except the group being recorded
+    now = datetime.datetime.now()
+    cutoff = now - datetime.timedelta(days=STALE_HEALTH_DAYS)
+    pruned = {}
+    for key, entry in h.items():
+        if key == group:
+            # Never drop the group being recorded; will be overwritten below
+            continue
+        # Try to parse 'at'; if missing or unparseable, treat as stale and skip
+        try:
+            at_time = datetime.datetime.fromisoformat(entry.get("at", ""))
+            if at_time >= cutoff:
+                pruned[key] = entry
+        except (ValueError, TypeError):
+            # Missing or unparseable 'at' is treated as stale; drop it
+            pass
+
+    # Add/update the current group
+    pruned[group] = {"rows": n, "refreshed": refreshed,
+                     "at": now.isoformat(timespec="seconds")}
+
     with open(HEALTH, "w") as f:
-        json.dump(h, f, indent=1)
+        json.dump(pruned, f, indent=1)
     if n == 0 and refreshed:
         print(f"[{group}] WARNING: 0 rows harvested — source may be broken or blocking", file=sys.stderr)
 

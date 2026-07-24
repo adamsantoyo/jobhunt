@@ -30,17 +30,7 @@ export function CompanyEditor({
   };
 
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-        background: "var(--bg-1)",
-        border: "1px solid var(--border-soft)",
-        borderRadius: "var(--radius)",
-        padding: 10,
-      }}
-    >
+    <div className="ce-wrap">
       <div className="field">
         <label className="field-label">Contact / referral</label>
         <input
@@ -60,7 +50,7 @@ export function CompanyEditor({
           onChange={(e) => setNotes(e.target.value)}
         />
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <div className="ce-footer">
         <button
           type="button"
           className="btn btn-sm btn-primary"
@@ -73,7 +63,7 @@ export function CompanyEditor({
           <span className="muted-sm">updated {fmtDate(state.updated_at)}</span>
         )}
         {patchCompany.isError && (
-          <span className="muted-sm" style={{ color: "var(--red)" }}>
+          <span className="muted-sm ce-error">
             save failed
           </span>
         )}

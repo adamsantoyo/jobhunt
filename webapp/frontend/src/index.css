@@ -191,6 +191,28 @@ textarea.input {
   align-items: center;
   flex-wrap: wrap;
 }
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.settings-section + .settings-section {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+.settings-section h3 {
+  font-size: 12px;
+  margin: 0;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.settings-caption {
+  font-size: 11px;
+  color: var(--fg-mute);
+  margin: 0;
+}
 
 /* ============================================================================
    App shell
@@ -265,8 +287,10 @@ textarea.input {
 
 /* ---- topbar ----------------------------------------------------------- */
 .topbar {
-  height: var(--topbar-h);
-  flex: 0 0 var(--topbar-h);
+  min-height: var(--topbar-h);
+  flex: 0 0 auto;
+  padding-top: 6px;
+  padding-bottom: 6px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-1);
   display: flex;
@@ -316,6 +340,11 @@ textarea.input {
   gap: 4px;
   overflow: hidden;
   flex-wrap: nowrap;
+}
+/* Expanded: all chips visible, wrapping onto extra rows (topbar grows). */
+.source-chips[data-expanded="true"] {
+  flex-wrap: wrap;
+  overflow: visible;
 }
 .src-chip {
   font-size: 10px;
@@ -1043,6 +1072,180 @@ mark.hl {
   padding: 8px 12px;
 }
 
+/* ============================================================================
+   Progress (My funnel + Market tabs)
+   ========================================================================== */
+.an-page { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+.an-tabs { display: flex; gap: 8px; margin-bottom: 4px; }
+.an-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.an-stat {
+  background: var(--bg-1); border: 1px solid var(--border-soft);
+  border-radius: var(--radius); padding: 12px 14px; min-width: 0;
+}
+.an-stat-value { font-size: 26px; font-weight: 600; line-height: 1.1; }
+.an-stat-label {
+  font-size: 11px; color: var(--fg-mute); text-transform: uppercase;
+  letter-spacing: 0.04em; margin-top: 5px;
+}
+.an-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; }
+.an-card {
+  background: var(--bg-1); border: 1px solid var(--border-soft);
+  border-radius: var(--radius); display: flex; flex-direction: column; min-width: 0;
+}
+.an-card-head {
+  padding: 10px 14px 2px; display: flex; justify-content: space-between;
+  align-items: baseline; gap: 10px;
+}
+.an-card-title { font-size: 13px; margin: 0; }
+.an-card-sub { font-size: 11px; color: var(--fg-mute); white-space: nowrap; }
+.an-card-body { padding: 6px 8px 10px; min-width: 0; }
+.an-card-body.an-scroll { overflow-y: auto; }
+.an-tip {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px 9px; font-size: 11px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45); pointer-events: none;
+}
+.an-tip-title { color: var(--fg); font-weight: 600; margin-bottom: 3px; }
+.an-tip-row { color: var(--fg-dim); display: flex; gap: 14px; justify-content: space-between; }
+.an-tip-row + .an-tip-row { margin-top: 1px; }
+.an-tip-key { display: inline-flex; align-items: center; gap: 5px; }
+.an-tip-val { color: var(--fg); font-variant-numeric: tabular-nums; }
+.an-swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; flex: 0 0 auto; }
+.an-empty { color: var(--fg-mute); padding: 26px; text-align: center; font-size: 12px; }
+.an-heat { display: flex; flex-direction: column; gap: 2px; padding: 4px 6px 2px; }
+.an-heat-row { display: grid; grid-template-columns: 40px repeat(3, 1fr); gap: 2px; }
+.an-heat-head { margin-bottom: 2px; }
+.an-heat-corner { }
+.an-heat-colh, .an-heat-rowh {
+  font-size: 11px; color: var(--fg-mute); display: flex; align-items: center;
+}
+.an-heat-colh { justify-content: center; }
+.an-heat-rowh { justify-content: flex-end; padding-right: 6px; font-weight: 600; }
+.an-heat-cell {
+  display: flex; align-items: center; justify-content: center;
+  height: 34px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* My funnel tab: stage conversion bars, time-in-stage rows, pace model panel. */
+.an-stagelist { display: flex; flex-direction: column; gap: 9px; padding: 4px 4px 2px; }
+.an-stage-row {
+  display: grid; grid-template-columns: 168px 1fr auto; align-items: center; gap: 10px;
+}
+.an-stage-label {
+  font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis;
+}
+.an-stage-mouth .an-stage-label { color: var(--fg); font-weight: 600; }
+.an-stage-bar {
+  position: relative; height: 8px; background: var(--bg-2); border-radius: 4px;
+  overflow: hidden;
+}
+.an-stage-fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 4px; }
+.an-stage-mouth .an-stage-fill { background: var(--fg-mute); }
+.an-stage-count {
+  font-size: 11px; color: var(--fg-dim); white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.an-timelist { display: flex; flex-direction: column; gap: 2px; padding: 4px 4px 2px; }
+.an-time-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 5px 6px; border-bottom: 1px solid var(--border-soft); font-size: 12px;
+}
+.an-time-row:last-child { border-bottom: none; }
+.an-time-label { color: var(--fg-dim); }
+.an-time-value { color: var(--fg); font-variant-numeric: tabular-nums; }
+.an-pace { display: flex; flex-direction: column; gap: 10px; padding: 6px 4px 2px; }
+.an-pace-metric { font-size: 22px; font-weight: 600; color: var(--fg); line-height: 1.15; }
+.an-pace-line { font-size: 12px; color: var(--fg-dim); }
+.an-pace-note { font-size: 11px; color: var(--fg-mute); }
+
+/* ============================================================================
+   Today (unified styles)
+   ========================================================================== */
+.td-page { padding: 16px 18px; display: flex; flex-direction: column; gap: 14px; }
+.td-subtitle { margin: 0; }
+.td-queue-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.td-progress-wrap { flex: 0 1 220px; height: 5px; background: var(--bg-3); border-radius: 3px; overflow: hidden; }
+.td-progress-fill { display: block; height: 100%; background: var(--accent); transition: width 0.3s; }
+.td-empty { padding: 24px 12px; text-align: center; color: var(--fg-mute); border: 1px dashed var(--border); border-radius: var(--radius); }
+.td-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+
+.td-pace-row { display: flex; gap: 22px; align-items: baseline; flex-wrap: wrap; padding: 10px 14px; background: var(--bg-1); border: 1px solid var(--border); border-radius: var(--radius); }
+.td-stat-col { display: flex; flex-direction: column; }
+.td-stat-value { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.td-followups-wrap { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--bg-1); }
+.td-followups-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  width: 100%;
+}
+.td-followups-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-dim); }
+.td-followups-group-head { padding: 4px 10px 2px; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--fg-mute); background: var(--bg-2); }
+.td-followups-more { margin: 6px; align-self: flex-start; }
+
+.td-card { display: flex; flex-direction: column; background: var(--bg-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; gap: 4px; }
+.td-card-row { display: flex; align-items: center; gap: 8px; }
+.td-card-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+}
+.td-card-badges { display: flex; gap: 3px; flex: 0 0 auto; }
+.td-card-textcol { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.td-card-line1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.td-card-line2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-mute); font-size: 11px; }
+.td-title-dim { color: var(--fg-dim); }
+.td-card-expand { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; padding-top: 8px; border-top: 1px solid var(--border-soft); }
+.td-card-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.td-menu-wrap { position: relative; display: inline-flex; }
+.td-pass-group { display: flex; gap: 1px; }
+.td-card-confirm { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; padding: 8px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.td-seg-row { display: flex; gap: 4px; flex-wrap: wrap; }
+.td-skeleton { display: flex; flex-direction: column; gap: 6px; }
+.td-skeleton-bar { height: 10px; background: var(--bg-3); border-radius: 3px; }
+.td-jd-body { max-height: 360px; overflow: auto; }
+
+.td-strong { font-weight: 600; }
+.td-sep { color: var(--fg-faint); }
+
+.td-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 130px;
+}
+.btn.td-menu-item { justify-content: flex-start; border: none; background: transparent; width: 100%; }
+.btn.td-menu-item:hover { background: transparent; }
+
 /* thin scrollbars */
 ::-webkit-scrollbar {
   width: 10px;
@@ -1056,3 +1259,59 @@ mark.hl {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border);
 }
+
+/* ============================================================================
+   Explore (additional unified styles)
+   ========================================================================== */
+.ex-loading-note { padding: 16px; }
+.ex-grid-cols { grid-template-columns: 32px 30px 46px 74px 1.3fr 2fr 1.2fr 100px 110px 92px 92px 96px 1.6fr; }
+.ex-tier-arrow { margin-left: 6px; display: inline-flex; align-items: center; gap: 4px; font-weight: 600; font-variant-numeric: tabular-nums; font-size: 11px; }
+
+/* flex-shrink 0: overflow:hidden zeroes the auto min-height, so without it a
+   height-constrained .explore-groups crushes every card to its border. */
+.ex-group-card { flex-shrink: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-1); overflow: hidden; }
+.ex-group-toggle { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: transparent; border: none; color: var(--fg); cursor: pointer; padding: 9px 12px; font: inherit; }
+.ex-group-caret { width: 12px; flex: 0 0 auto; font-size: 10px; }
+.ex-group-badges { display: flex; gap: 4px; flex: 0 0 auto; }
+.ex-group-name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ex-group-meta { margin-left: auto; flex: 0 0 auto; }
+.ex-group-body { display: flex; flex-direction: column; gap: 12px; padding: 4px 12px 12px; border-top: 1px solid var(--border-soft); }
+.ex-role-list { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; }
+.ex-role-row { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: var(--bg-2); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); color: var(--fg); cursor: pointer; padding: 5px 8px; font: inherit; font-size: 12px; }
+.ex-role-badges { display: flex; gap: 3px; flex: 0 0 auto; }
+.ex-role-star { color: var(--amber); flex: 0 0 auto; }
+.ex-role-title { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ex-role-location { flex: 0 0 auto; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ex-role-salary { flex: 0 0 auto; min-width: 70px; text-align: right; }
+
+.ex-flex-none { flex: 0 0 auto; }
+.ex-empty-note { padding: 12px; }
+
+.ex-gone-row { display: flex; align-items: center; gap: 8px; width: 100%; background: var(--bg-2); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 5px 8px; font-size: 12px; opacity: 0.75; }
+.ex-gone-company { font-weight: 600; flex: 0 0 auto; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ex-gone-title { min-width: 0; flex: 1; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ex-gone-location { flex: 0 0 auto; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ============================================================================
+   Review (unified styles)
+   ========================================================================== */
+.rv-header { margin-bottom: 16px; }
+.rv-title { margin: 0; }
+.rv-subtitle { margin-top: 4px; max-width: 760px; }
+.rv-list { display: flex; flex-direction: column; gap: 14px; }
+.rv-card { padding: 12px 14px; background: var(--bg-1); border: 1px solid var(--border); border-radius: 8px; }
+.rv-card-head { display: flex; align-items: center; gap: 12px; }
+.rv-card-main { flex: 1; min-width: 0; }
+.rv-strong { font-weight: 600; }
+.rv-reason { font-size: 12px; white-space: normal; }
+.rv-candidates { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.rv-candidates-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.rv-candidate-row { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: var(--bg-0); border: 1px solid var(--border); border-radius: 6px; }
+.rv-candidate-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ============================================================================
+   CompanyEditor (unified styles)
+   ========================================================================== */
+.ce-wrap { display: flex; flex-direction: column; gap: 8px; background: var(--bg-1); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 10px; }
+.ce-footer { display: flex; align-items: center; gap: 10px; }
+.ce-error { color: var(--red); }

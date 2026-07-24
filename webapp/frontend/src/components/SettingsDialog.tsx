@@ -1,12 +1,21 @@
 import { useEffect, useState } from "react";
 import { useConfig, usePatchConfig } from "../store/queries";
+import type { ConfigPatch } from "../api/types";
 
-// Settings modal: edit the skills list (used for JD highlighting + skill_hits)
-// and the comp band [lo, hi] (overlaid on the analytics comp histogram).
+// Settings modal: edit the skills list (used for JD highlighting + skill_hits),
+// the comp band [lo, hi] (overlaid on the analytics comp histogram), and goal
+// configuration knobs (daily queue size, weekly app target, deadline, snooze days).
 export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { data: config } = useConfig();
   const patch = usePatchConfig();
 
+  // Goals section
+  const [dailyQueueSize, setDailyQueueSize] = useState("");
+  const [weeklyAppTarget, setWeeklyAppTarget] = useState("");
+  const [deadline, setDeadline] = useState("");
+  const [snoozeDefaultDays, setSnoozeDefaultDays] = useState("");
+
+  // Display section
   const [skillsText, setSkillsText] = useState("");
   const [lo, setLo] = useState("");
   const [hi, setHi] = useState("");
@@ -14,6 +23,12 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   // Reload local editor state whenever the dialog opens or config changes.
   useEffect(() => {
     if (!open || !config) return;
+    // Goals
+    setDailyQueueSize(String(config.daily_queue_size));
+    setWeeklyAppTarget(String(config.weekly_app_target));
+    setDeadline(config.deadline);
+    setSnoozeDefaultDays(String(config.snooze_default_days));
+    // Display
     setSkillsText(config.skills.join("\n"));
     setLo(String(config.comp_band[0]));
     setHi(String(config.comp_band[1]));
@@ -22,18 +37,43 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   if (!open) return null;
 
   const save = () => {
-    const skills = skillsText
+    const patchPayload: ConfigPatch = {};
+
+    // Goals section: only include valid finite integers
+    const dailyQueueN = parseInt(dailyQueueSize, 10);
+    if (Number.isFinite(dailyQueueN)) {
+      patchPayload.daily_queue_size = dailyQueueN;
+    }
+
+    const weeklyAppN = parseInt(weeklyAppTarget, 10);
+    if (Number.isFinite(weeklyAppN)) {
+      patchPayload.weekly_app_target = weeklyAppN;
+    }
+
+    // Deadline: only include if not empty
+    if (deadline.trim()) {
+      patchPayload.deadline = deadline;
+    }
+
+    const snoozeN = parseInt(snoozeDefaultDays, 10);
+    if (Number.isFinite(snoozeN)) {
+      patchPayload.snooze_default_days = snoozeN;
+    }
+
+    // Display section
+    // Always sent: an empty list is a valid edit (clearing all skills).
+    patchPayload.skills = skillsText
       .split(/[\n,]/)
       .map((s) => s.trim())
       .filter(Boolean);
+
     const loN = parseInt(lo, 10);
     const hiN = parseInt(hi, 10);
-    const band: [number, number] | undefined =
-      Number.isFinite(loN) && Number.isFinite(hiN) ? [loN, hiN] : undefined;
-    patch.mutate(
-      { skills, ...(band ? { comp_band: band } : {}) },
-      { onSuccess: () => onClose() },
-    );
+    if (Number.isFinite(loN) && Number.isFinite(hiN)) {
+      patchPayload.comp_band = [loN, hiN];
+    }
+
+    patch.mutate(patchPayload, { onSuccess: () => onClose() });
   };
 
   return (
@@ -53,36 +93,92 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
         </div>
 
         <div className="modal-body">
-          <label className="field">
-            <span className="field-label">Skills (one per line — highlighted in job descriptions)</span>
-            <textarea
-              className="input"
-              rows={10}
-              value={skillsText}
-              onChange={(e) => setSkillsText(e.target.value)}
-              placeholder="support engineer&#10;linux&#10;networking"
-            />
-          </label>
+          {/* Goals section */}
+          <div className="settings-section">
+            <h3>Goals</h3>
+            <div className="field-row">
+              <label className="field">
+                <span className="field-label">Daily queue size</span>
+                <input
+                  className="input"
+                  type="number"
+                  min="1"
+                  max="50"
+                  value={dailyQueueSize}
+                  onChange={(e) => setDailyQueueSize(e.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Weekly application target</span>
+                <input
+                  className="input"
+                  type="number"
+                  min="1"
+                  value={weeklyAppTarget}
+                  onChange={(e) => setWeeklyAppTarget(e.target.value)}
+                />
+              </label>
+            </div>
 
-          <div className="field-row">
+            <div className="field-row">
+              <label className="field">
+                <span className="field-label">Deadline</span>
+                <input
+                  className="input"
+                  type="date"
+                  value={deadline}
+                  onChange={(e) => setDeadline(e.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Default snooze (days)</span>
+                <input
+                  className="input"
+                  type="number"
+                  min="1"
+                  value={snoozeDefaultDays}
+                  onChange={(e) => setSnoozeDefaultDays(e.target.value)}
+                />
+              </label>
+            </div>
+          </div>
+
+          {/* Display section */}
+          <div className="settings-section">
+            <h3>Display</h3>
+            <p className="settings-caption">These affect highlighting and charts only. They do not change scoring or the pipeline.</p>
+
             <label className="field">
-              <span className="field-label">Comp band low ($)</span>
-              <input
+              <span className="field-label">Skills (one per line, highlighted in job descriptions)</span>
+              <textarea
                 className="input"
-                type="number"
-                value={lo}
-                onChange={(e) => setLo(e.target.value)}
+                rows={10}
+                value={skillsText}
+                onChange={(e) => setSkillsText(e.target.value)}
+                placeholder="support engineer&#10;linux&#10;networking"
               />
             </label>
-            <label className="field">
-              <span className="field-label">Comp band high ($)</span>
-              <input
-                className="input"
-                type="number"
-                value={hi}
-                onChange={(e) => setHi(e.target.value)}
-              />
-            </label>
+
+            <div className="field-row">
+              <label className="field">
+                <span className="field-label">Comp band low ($)</span>
+                <input
+                  className="input"
+                  type="number"
+                  value={lo}
+                  onChange={(e) => setLo(e.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Comp band high ($)</span>
+                <input
+                  className="input"
+                  type="number"
+                  value={hi}
+                  onChange={(e) => setHi(e.target.value)}
+                />
+              </label>
+            </div>
           </div>
         </div>
 

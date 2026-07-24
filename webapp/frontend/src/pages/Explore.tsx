@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useChanges, useCompanies, useConfig, useJobs, usePatchState } from "../store/queries";
@@ -19,9 +19,6 @@ import type { JobLight } from "../api/types";
 
 type SortKey = "tier" | "odds" | "company" | "salary_min" | "posted" | "first_seen";
 type SortDir = "asc" | "desc";
-
-// grid-template-columns shared by header + rows (see .tbl-grid in index.css).
-const GRID = "32px 30px 46px 74px 1.3fr 2fr 1.2fr 100px 110px 92px 92px 96px 1.6fr";
 
 function cmp(a: JobLight, b: JobLight, key: SortKey): number {
   switch (key) {
@@ -69,20 +66,10 @@ function matches(job: JobLight, f: TableFilters): boolean {
   return true;
 }
 
-const tierArrowStyle = (up: boolean): CSSProperties => ({
-  marginLeft: 6,
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 4,
-  color: up ? "var(--green)" : "var(--red)",
-  fontWeight: 600,
-  fontVariantNumeric: "tabular-nums",
-  fontSize: 11,
-});
-
 function TierArrow({ from, to }: { from: number; to: number }) {
+  const up = to > from;
   return (
-    <span style={tierArrowStyle(to > from)}>
+    <span className="ex-tier-arrow" style={{ color: up ? "var(--green)" : "var(--red)" }}>
       T{from} <span aria-hidden>→</span> T{to}
     </span>
   );
@@ -260,24 +247,20 @@ export default function Explore() {
   let body: ReactNode;
   if (diff === "gone") {
     body = changesPending ? (
-      <p className="muted" style={{ padding: 16 }}>
-        Loading…
-      </p>
+      <p className="muted ex-loading-note">Loading…</p>
     ) : (
       <DisappearedList jobs={disappeared} />
     );
   } else if (diffPending) {
     body = (
-      <p className="muted" style={{ padding: 16 }}>
-        Loading…
-      </p>
+      <p className="muted ex-loading-note">Loading…</p>
     );
   } else if (group) {
     body = <CompanyGroups jobs={filteredRows} companyStates={companyStates} onOpen={openJob} />;
   } else {
     body = (
       <div className="tbl">
-        <div className="tbl-head tbl-grid" style={{ gridTemplateColumns: GRID }}>
+        <div className="tbl-head tbl-grid ex-grid-cols">
           <div className="th th-check">
             <input
               type="checkbox"
@@ -321,13 +304,10 @@ export default function Explore() {
               return (
                 <div
                   key={job.url_b64}
-                  className="tbl-row tbl-grid"
+                  className="tbl-row tbl-grid ex-grid-cols"
                   data-selected={isSel ? "1" : "0"}
                   data-hidden={job.state?.hidden ? "1" : "0"}
-                  style={{
-                    gridTemplateColumns: GRID,
-                    transform: `translateY(${vi.start}px)`,
-                  }}
+                  style={{ transform: `translateY(${vi.start}px)` }}
                   onClick={() => openJob(job)}
                 >
                   <div className="td td-check" onClick={(e) => e.stopPropagation()}>

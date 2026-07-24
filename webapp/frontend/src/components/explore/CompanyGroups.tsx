@@ -91,125 +91,62 @@ export function CompanyGroups({
       {groups.map((g) => {
         const isOpen = expanded.has(g.company);
         return (
-          <div
-            key={g.company}
-            style={{
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius)",
-              background: "var(--bg-1)",
-              overflow: "hidden",
-            }}
-          >
+          <div key={g.company} className="ex-group-card">
             <button
               type="button"
               onClick={() => toggle(g.company)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                width: "100%",
-                textAlign: "left",
-                background: "transparent",
-                border: "none",
-                color: "var(--fg)",
-                cursor: "pointer",
-                padding: "9px 12px",
-                font: "inherit",
-              }}
+              className="ex-group-toggle"
             >
-              <span className="muted" style={{ width: 12, flex: "0 0 auto", fontSize: 10 }}>
+              <span className="muted ex-group-caret">
                 {isOpen ? "▼" : "▶"}
               </span>
-              <span style={{ display: "flex", gap: 4, flex: "0 0 auto" }}>
+              <span className="ex-group-badges">
                 <TierBadge tier={g.maxTier} />
                 <OddsBadge odds={g.bestOdds} />
               </span>
-              <span
-                style={{
-                  fontWeight: 600,
-                  minWidth: 0,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
+              <span className="ex-group-name">
                 {g.company}
               </span>
-              <span className="muted-sm" style={{ marginLeft: "auto", flex: "0 0 auto" }}>
+              <span className="muted-sm ex-group-meta">
                 {g.openCount} open · {g.jobs.length} role{g.jobs.length === 1 ? "" : "s"}
               </span>
             </button>
 
             {isOpen && (
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 12,
-                  padding: "4px 12px 12px",
-                  borderTop: "1px solid var(--border-soft)",
-                }}
-              >
-                <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 8 }}>
+              <div className="ex-group-body">
+                <div className="ex-role-list">
                   {g.jobs.map((job) => (
                     <button
                       key={job.url_b64}
                       type="button"
                       onClick={() => onOpen(job)}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        width: "100%",
-                        textAlign: "left",
-                        background: "var(--bg-2)",
-                        border: "1px solid var(--border-soft)",
-                        borderRadius: "var(--radius-sm)",
-                        color: "var(--fg)",
-                        cursor: "pointer",
-                        padding: "5px 8px",
-                        font: "inherit",
-                        fontSize: 12,
-                      }}
+                      className="ex-role-row"
                     >
-                      <span style={{ display: "flex", gap: 3, flex: "0 0 auto" }}>
+                      <span className="ex-role-badges">
                         <TierBadge tier={job.tier} />
                         <OddsBadge odds={job.odds} />
                       </span>
                       {job.state?.starred && (
-                        <span style={{ color: "var(--amber)", flex: "0 0 auto" }}>★</span>
+                        <span className="ex-role-star">★</span>
                       )}
                       <span
-                        style={{
-                          minWidth: 0,
-                          flex: 1,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
+                        className="ex-role-title"
                         title={job.title ?? ""}
                       >
                         {job.is_new && <span className="dot-new" title="new this run" />}
                         {job.title ?? "—"}
                       </span>
                       <span
-                        className="muted"
-                        style={{
-                          flex: "0 0 auto",
-                          maxWidth: 180,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
+                        className="muted ex-role-location"
                         title={job.location ?? ""}
                       >
                         {job.remote && <span className="tag-remote">R</span>}
                         {job.location ?? ""}
                       </span>
-                      <span className="muted-sm" style={{ flex: "0 0 auto", minWidth: 70, textAlign: "right" }}>
+                      <span className="muted-sm ex-role-salary">
                         {fmtSalary(job)}
                       </span>
-                      <span style={{ flex: "0 0 auto" }}>
+                      <span className="ex-flex-none">
                         <StatusBadge status={statusOf(job)} />
                       </span>
                     </button>
@@ -223,7 +160,7 @@ export function CompanyGroups({
         );
       })}
       {groups.length === 0 && (
-        <p className="muted" style={{ padding: 12 }}>
+        <p className="muted ex-empty-note">
           No companies match.
         </p>
       )}

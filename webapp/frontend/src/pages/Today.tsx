@@ -11,31 +11,8 @@ import type { JobLight } from "../api/types";
 // need a nudge, then a finishable do-today queue. Done-today comes ONLY from
 // /api/activity (no more client-side actedToday guessing from state fields).
 
-const pageStyle: CSSProperties = { padding: "16px 18px", display: "flex", flexDirection: "column", gap: 14 };
-const queueHeadStyle: CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: 12,
-  flexWrap: "wrap",
-};
-const progressWrapStyle: CSSProperties = {
-  flex: "0 1 220px",
-  height: 5,
-  background: "var(--bg-3)",
-  borderRadius: 3,
-  overflow: "hidden",
-};
-const emptyStyle: CSSProperties = {
-  padding: "24px 12px",
-  textAlign: "center",
-  color: "var(--fg-mute)",
-  border: "1px dashed var(--border)",
-  borderRadius: "var(--radius)",
-};
-const listStyle: CSSProperties = { display: "flex", flexDirection: "column", gap: 8, marginTop: 8 };
-
 function progressFillStyle(pct: number): CSSProperties {
-  return { display: "block", height: "100%", width: `${pct}%`, background: "var(--accent)", transition: "width 0.3s" };
+  return { width: `${pct}%` };
 }
 
 export default function Today() {
@@ -74,10 +51,10 @@ export default function Today() {
     );
 
   return (
-    <div style={pageStyle}>
+    <div className="td-page">
       <div>
         <h1>Today</h1>
-        <p className="muted-sm" style={{ margin: 0 }}>
+        <p className="muted-sm td-subtitle">
           What to act on right now — one honest bridge from interested to submitted.
         </p>
       </div>
@@ -90,10 +67,10 @@ export default function Today() {
 
       {!isLoading && !isError && (
         <section>
-          <div style={queueHeadStyle}>
+          <div className="td-queue-head">
             <h2>Today's queue</h2>
-            <div style={progressWrapStyle}>
-              <span style={progressFillStyle(pct)} />
+            <div className="td-progress-wrap">
+              <span className="td-progress-fill" style={progressFillStyle(pct)} />
             </div>
             <span className="muted-sm">
               {cappedDone}/{cap}
@@ -101,7 +78,7 @@ export default function Today() {
           </div>
 
           {queue.length === 0 ? (
-            <div style={emptyStyle}>
+            <div className="td-empty">
               {done > 0
                 ? `Queue clear — ${done} submitted today ✓`
                 : sawQueueRef.current
@@ -109,7 +86,7 @@ export default function Today() {
                   : "Nothing eligible — lower the bar in Explore or run a sweep."}
             </div>
           ) : (
-            <div style={listStyle}>
+            <div className="td-list">
               {queue.map((job) => (
                 <TodayCard key={job.url_b64} job={job} onOpen={openJob} />
               ))}

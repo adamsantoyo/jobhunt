@@ -2,6 +2,7 @@ import { useSearchParams } from "react-router-dom";
 import { useReview, usePatchState, useReconcile } from "../store/queries";
 import { StatusBadge, TierBadge, OddsBadge } from "../components/StatusBadge";
 import { fmtDate, fmtSalary } from "../lib/format";
+import { NOTES_PREVIEW_CHARS } from "../lib/ui";
 import type { ReviewItem, JobLight } from "../api/types";
 
 /**
@@ -21,9 +22,9 @@ export default function Review() {
 
   return (
     <div>
-      <div style={{ marginBottom: 16 }}>
-        <h1 style={{ margin: 0 }}>Needs review</h1>
-        <p className="muted" style={{ marginTop: 4, maxWidth: 760 }}>
+      <div className="rv-header">
+        <h1 className="rv-title">Needs review</h1>
+        <p className="muted rv-subtitle">
           These saved statuses lost their job URL in a sweep and matched several possible
           successors, so nothing was migrated automatically. Attach the state to the right
           role below, or dismiss to keep it parked; both stick across future refreshes.
@@ -32,7 +33,7 @@ export default function Review() {
       {list.length === 0 ? (
         <div className="muted">Nothing needs review. Ambiguous URL rewrites will land here.</div>
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <div className="rv-list">
           {list.map((item) => (
             <ReviewCard key={item.job.url_b64} item={item} />
           ))}
@@ -51,24 +52,17 @@ function ReviewCard({ item }: { item: ReviewItem }) {
   };
 
   return (
-    <div
-      style={{
-        padding: "12px 14px",
-        background: "var(--bg-1)",
-        border: "1px solid var(--border)",
-        borderRadius: 8,
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+    <div className="rv-card">
+      <div className="rv-card-head">
         <StatusBadge status={st?.status} />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 600 }}>
+        <div className="rv-card-main">
+          <div className="rv-strong">
             {item.job.company || "(unknown)"} · {item.job.title || item.job.seen_key}
           </div>
-          <div className="muted" style={{ fontSize: 12, whiteSpace: "normal" }}>
+          <div className="muted rv-reason">
             {st?.review_reason || "ambiguous url rewrite"}
             {st?.updated_at ? ` — flagged ${fmtDate(st.updated_at)}` : ""}
-            {st?.notes ? ` — notes: ${st.notes.slice(0, 120)}` : ""}
+            {st?.notes ? ` — notes: ${st.notes.slice(0, NOTES_PREVIEW_CHARS)}` : ""}
           </div>
         </div>
         <button type="button" className="btn btn-sm" disabled={patch.isPending} onClick={dismiss}>
@@ -77,8 +71,8 @@ function ReviewCard({ item }: { item: ReviewItem }) {
       </div>
 
       {item.candidates.length > 0 && (
-        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
-          <div className="muted" style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>
+        <div className="rv-candidates">
+          <div className="muted rv-candidates-label">
             Possible successors — attach the saved state to the right one
           </div>
           {item.candidates.map((cand) => (
@@ -96,20 +90,10 @@ function CandidateRow({ fromB64, cand }: { fromB64: string; cand: JobLight }) {
   const taken = cand.state != null;
 
   return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "6px 10px",
-        background: "var(--bg-0)",
-        border: "1px solid var(--border)",
-        borderRadius: 6,
-      }}
-    >
+    <div className="rv-candidate-row">
       <TierBadge tier={cand.tier} />
       <OddsBadge odds={cand.odds} />
-      <div style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <div className="rv-candidate-title">
         {cand.title} <span className="muted">· {cand.location || "location n/a"}</span>
         {fmtSalary(cand) && <span className="muted"> · {fmtSalary(cand)}</span>}
         {taken && <span className="muted"> · already has its own state</span>}

@@ -51,69 +51,7 @@ function agoLabel(dateStr: string | null | undefined): string {
   return d <= 0 ? "today" : `${d}d ago`;
 }
 
-const cardStyle: CSSProperties = {
-  display: "flex",
-  flexDirection: "column",
-  background: "var(--bg-1)",
-  border: "1px solid var(--border)",
-  borderRadius: "var(--radius)",
-  padding: "8px 10px",
-  gap: 4,
-};
-const rowStyle: CSSProperties = { display: "flex", alignItems: "center", gap: 8 };
-const rowMainStyle: CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: 8,
-  flex: 1,
-  minWidth: 0,
-  background: "transparent",
-  border: "none",
-  color: "var(--fg)",
-  font: "inherit",
-  textAlign: "left",
-  cursor: "pointer",
-  padding: 0,
-};
-const badgesStyle: CSSProperties = { display: "flex", gap: 3, flex: "0 0 auto" };
-const textCol: CSSProperties = { display: "flex", flexDirection: "column", minWidth: 0, gap: 1 };
-const line1: CSSProperties = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
-const line2: CSSProperties = {
-  overflow: "hidden",
-  textOverflow: "ellipsis",
-  whiteSpace: "nowrap",
-  color: "var(--fg-mute)",
-  fontSize: 11,
-};
-const expandStyle: CSSProperties = {
-  display: "flex",
-  flexDirection: "column",
-  gap: 8,
-  marginTop: 4,
-  paddingTop: 8,
-  borderTop: "1px solid var(--border-soft)",
-};
-const actionsStyle: CSSProperties = { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 4 };
-const menuWrapStyle: CSSProperties = { position: "relative", display: "inline-flex" };
-const passGroupStyle: CSSProperties = { display: "flex", gap: 1 };
-const confirmStyle: CSSProperties = {
-  display: "flex",
-  flexDirection: "column",
-  gap: 6,
-  marginTop: 4,
-  padding: 8,
-  background: "var(--bg-2)",
-  border: "1px solid var(--border)",
-  borderRadius: "var(--radius-sm)",
-};
-const segRowStyle: CSSProperties = { display: "flex", gap: 4, flexWrap: "wrap" };
-const skeletonStyle: CSSProperties = { display: "flex", flexDirection: "column", gap: 6 };
-const skeletonBarStyle = (w: string): CSSProperties => ({
-  height: 10,
-  width: w,
-  background: "var(--bg-3)",
-  borderRadius: 3,
-});
+const skeletonBarStyle = (w: string): CSSProperties => ({ width: w });
 
 export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLight) => void }) {
   const [expanded, setExpanded] = useState(false);
@@ -171,25 +109,25 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
   };
 
   return (
-    <div style={cardStyle}>
-      <div style={rowStyle}>
+    <div className="td-card">
+      <div className="td-card-row">
         <button
           type="button"
-          style={rowMainStyle}
+          className="td-card-row-main"
           onClick={toggleExpand}
           title={expanded ? "Collapse" : "Expand"}
         >
-          <span style={badgesStyle}>
+          <span className="td-card-badges">
             <TierBadge tier={job.tier} />
             <OddsBadge odds={job.odds} />
           </span>
-          <span style={textCol}>
-            <span style={line1}>
-              <span style={{ fontWeight: 600 }}>{job.company ?? "—"}</span>
-              <span style={{ color: "var(--fg-faint)" }}> · </span>
-              <span style={{ color: "var(--fg-dim)" }}>{job.title ?? "—"}</span>
+          <span className="td-card-textcol">
+            <span className="td-card-line1">
+              <span className="td-strong">{job.company ?? "—"}</span>
+              <span className="td-sep"> · </span>
+              <span className="td-title-dim">{job.title ?? "—"}</span>
             </span>
-            <span style={line2}>
+            <span className="td-card-line2">
               {job.remote && <span className="tag-remote">R</span>}
               {job.location || "location n/a"}
               {salary ? ` · ${salary}` : ""}
@@ -210,7 +148,7 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
       </div>
 
       {expanded && (
-        <div style={expandStyle}>
+        <div className="td-card-expand">
           {(job.why || job.odds_why) && (
             <div className="drawer-why">
               {job.why && (
@@ -237,9 +175,9 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
       )}
 
       {confirming ? (
-        <div style={confirmStyle} onKeyDown={onConfirmKeyDown}>
+        <div className="td-card-confirm" onKeyDown={onConfirmKeyDown}>
           <span className="muted-sm">Did you submit?</span>
-          <div style={segRowStyle}>
+          <div className="td-seg-row">
             {APPLIED_VIA_OPTIONS.map((o) => (
               <button
                 key={o.value}
@@ -252,7 +190,7 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
               </button>
             ))}
           </div>
-          <div style={actionsStyle}>
+          <div className="td-card-actions">
             <button
               type="button"
               className="btn btn-sm btn-primary"
@@ -268,14 +206,14 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
           </div>
         </div>
       ) : (
-        <div style={actionsStyle}>
+        <div className="td-card-actions">
           <button type="button" className="btn btn-sm btn-primary" disabled={pending} onClick={startApply}>
             Apply →
           </button>
           <button type="button" className="btn btn-sm" disabled={pending} onClick={doShortlist}>
             Shortlist
           </button>
-          <div style={menuWrapStyle}>
+          <div className="td-menu-wrap">
             <button
               type="button"
               className="btn btn-sm"
@@ -295,8 +233,8 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
               </Menu>
             )}
           </div>
-          <div style={menuWrapStyle}>
-            <div style={passGroupStyle}>
+          <div className="td-menu-wrap">
+            <div className="td-pass-group">
               <button type="button" className="btn btn-sm" disabled={pending} onClick={() => doPass()}>
                 Pass
               </button>
@@ -330,10 +268,10 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
 function JdBody({ detail }: { detail: ReturnType<typeof useJobDetail> }) {
   if (detail.isLoading) {
     return (
-      <div style={skeletonStyle}>
-        <div style={skeletonBarStyle("92%")} />
-        <div style={skeletonBarStyle("78%")} />
-        <div style={skeletonBarStyle("85%")} />
+      <div className="td-skeleton">
+        <div className="td-skeleton-bar" style={skeletonBarStyle("92%")} />
+        <div className="td-skeleton-bar" style={skeletonBarStyle("78%")} />
+        <div className="td-skeleton-bar" style={skeletonBarStyle("85%")} />
       </div>
     );
   }
@@ -343,7 +281,7 @@ function JdBody({ detail }: { detail: ReturnType<typeof useJobDetail> }) {
   const full: JobFull = detail.data;
   const bodyText = (full.full_desc && full.full_desc.trim()) || full.desc_snippet || "";
   return (
-    <div className="jd-text" style={{ maxHeight: 360, overflow: "auto" }}>
+    <div className="jd-text td-jd-body">
       {highlightText(bodyText, full.skill_hits ?? [])}
     </div>
   );
