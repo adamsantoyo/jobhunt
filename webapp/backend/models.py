@@ -51,6 +51,9 @@ class JobState(BaseModel):
     needs_review: bool = False
     review_reason: Optional[str] = None
     updated_at: str
+    # Latest field='status' state_event.at for this seen_key; null when no status
+    # event exists. Powers days-in-stage on the frontend.
+    status_since: Optional[str] = None
 
 
 class JobLight(BaseModel):
@@ -185,15 +188,20 @@ def _state_from_row(row) -> Optional[JobState]:
         needs_review=False,   # retired; constant for frontend compat
         review_reason=None,
         updated_at=row["state_updated_at"] if "state_updated_at" in row.keys() else (row["updated_at"] or ""),
+        status_since=row["status_since"] if "status_since" in row.keys() else None,
     )
 
 
 # Shared SQL for "jobs LEFT JOIN job_state" used by every read endpoint. Selects
 # all job columns plus the specific state columns (state.updated_at aliased so it
 # never collides). A NULL status distinguishes "no state row" from a real row.
+# status_since is a scalar subquery over state_events (idx_events_seen_at covers
+# seen_key+at, so this is an indexed lookup, not a scan) rather than a JOIN, since
+# it needs the MAX(at) for one field only and a join would fan out rows.
 JOB_STATE_JOIN_COLS = (
     "s.status, s.notes, s.follow_up_date, s.applied_date, s.starred, s.hidden, "
-    "s.contact, s.snoozed_until, s.applied_via, s.updated_at AS state_updated_at"
+    "s.contact, s.snoozed_until, s.applied_via, s.updated_at AS state_updated_at, "
+    "(SELECT MAX(e.at) FROM state_events e WHERE e.seen_key = s.seen_key AND e.field='status') AS status_since"
 )
 JOB_JOIN_SQL = f"SELECT j.*, {JOB_STATE_JOIN_COLS} FROM jobs j LEFT JOIN job_state s ON j.url = s.url"
 

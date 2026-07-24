@@ -37,7 +37,11 @@ _PATCHABLE = (
 
 
 def _state_dto(conn: sqlite3.Connection, seen_key: str) -> JobState:
-    row = conn.execute("SELECT * FROM job_state WHERE seen_key=?", (seen_key,)).fetchone()
+    row = conn.execute(
+        "SELECT *, (SELECT MAX(e.at) FROM state_events e WHERE e.seen_key = job_state.seen_key "
+        "AND e.field='status') AS status_since FROM job_state WHERE seen_key=?",
+        (seen_key,),
+    ).fetchone()
     return JobState(
         status=row["status"],
         notes=row["notes"] or "",
@@ -51,6 +55,7 @@ def _state_dto(conn: sqlite3.Connection, seen_key: str) -> JobState:
         needs_review=False,   # retired; constant for frontend compat
         review_reason=None,
         updated_at=row["updated_at"],
+        status_since=row["status_since"],
     )
 
 

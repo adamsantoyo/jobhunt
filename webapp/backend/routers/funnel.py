@@ -144,3 +144,74 @@ def get_funnel(conn: sqlite3.Connection = Depends(get_db)):
         "apps_per_week": apps_per_week,
         "ghosted": {"applied_no_response_14d": ghosted},
     }
+
+
+@router.get("/activity")
+def get_activity(conn: sqlite3.Connection = Depends(get_db)):
+    """Today's pace: what got done today, this week's application count, and the
+    daily-applied streak. Read events once, aggregate in Python (mirrors get_funnel).
+
+    'done' is deliberately applied-or-passed only. Snoozing a role isn't a completed
+    action -- it's deferring the decision -- so counting it toward "done today" made
+    the old dashboard's done-count lie about how much real progress happened; this is
+    the fix.
+    """
+    today = date.today()
+    today_iso = today.isoformat()
+    this_week_start = _week_start(datetime.combine(today, datetime.min.time()))
+
+    rows = conn.execute(
+        "SELECT seen_key, field, new_value, at FROM state_events "
+        "WHERE field IN ('status', 'snoozed_until')"
+    ).fetchall()
+
+    applied_today: set = set()
+    passed_today: set = set()
+    snoozed_today: set = set()
+    applied_dates: set = set()  # every local date with >=1 status->Applied event
+    apps_this_week = 0
+
+    for r in rows:
+        at = _parse(r["at"])
+        day = at.date().isoformat()
+        field, nv = r["field"], r["new_value"]
+        if field == "status" and nv == "Applied":
+            applied_dates.add(day)
+            if day == today_iso:
+                applied_today.add(r["seen_key"])
+            if _week_start(at) == this_week_start:
+                apps_this_week += 1
+        elif field == "status" and nv == "Passed" and day == today_iso:
+            passed_today.add(r["seen_key"])
+        elif field == "snoozed_until" and day == today_iso:
+            # Only counts if snoozed INTO the future -- a snooze date in the past (or
+            # today) isn't deferring anything.
+            if nv and nv > today_iso:
+                snoozed_today.add(r["seen_key"])
+
+    done_today = applied_today | passed_today
+
+    # Streak: consecutive local dates ending today with >=1 Applied event. If today
+    # has none yet, fall back to yesterday's run (the day isn't over -- don't zero a
+    # live streak mid-day); anything older than that is a broken streak (0).
+    streak_days = 0
+    if today_iso in applied_dates:
+        cursor = today
+    elif (today - timedelta(days=1)).isoformat() in applied_dates:
+        cursor = today - timedelta(days=1)
+    else:
+        cursor = None
+    while cursor is not None and cursor.isoformat() in applied_dates:
+        streak_days += 1
+        cursor -= timedelta(days=1)
+
+    return {
+        "today": {
+            "applied": len(applied_today),
+            "passed": len(passed_today),
+            "snoozed": len(snoozed_today),
+            "done": len(done_today),
+        },
+        "apps_this_week": apps_this_week,
+        "streak_days": streak_days,
+    }
