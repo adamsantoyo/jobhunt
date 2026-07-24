@@ -54,6 +54,11 @@ export function fmtDate(d: string | null | undefined): string {
   return `${m[1]}-${m[2]}-${m[3]}`;
 }
 
+/** Only http(s) URLs are safe to open or link — scraped data can carry any scheme. */
+export function isHttpUrl(url: string | null | undefined): boolean {
+  return !!url && (url.startsWith("http://") || url.startsWith("https://"));
+}
+
 /** Split the comma+space-joined flags string into a clean list. */
 export function flagsList(flags: string | null | undefined): string[] {
   if (!flags) return [];

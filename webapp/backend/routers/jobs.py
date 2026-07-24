@@ -60,7 +60,8 @@ def followups(conn: sqlite3.Connection = Depends(get_db)):
     ph = ",".join("?" for _ in ACTIVE_STATUSES)
     rows = conn.execute(
         f"{JOB_LIGHT_SQL} WHERE j.present=1 AND s.follow_up_date IS NOT NULL "
-        f"AND s.status IN ({ph}) ORDER BY s.follow_up_date ASC",
+        f"AND s.status IN ({ph}) AND COALESCE(s.hidden, 0)=0 "
+        f"ORDER BY s.follow_up_date ASC",
         tuple(ACTIVE_STATUSES),
     ).fetchall()
     overdue, upcoming = [], []

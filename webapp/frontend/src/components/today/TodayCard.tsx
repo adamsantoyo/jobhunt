@@ -1,6 +1,6 @@
 import { useState, type CSSProperties, type KeyboardEvent } from "react";
 import { useConfig, useJobDetail, usePatchState, useQuickAction } from "../../store/queries";
-import { fmtSalary, flagsList } from "../../lib/format";
+import { fmtSalary, flagsList, isHttpUrl } from "../../lib/format";
 import { highlightText } from "../../lib/highlight";
 import { FlagBadge, OddsBadge, TierBadge } from "../StatusBadge";
 import { Menu, MenuItem } from "./Menu";
@@ -139,7 +139,9 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
   };
 
   const startApply = () => {
-    window.open(job.url, "_blank", "noopener");
+    // Scraped URLs can carry any scheme; only open real web links. The confirm
+    // state still shows either way so an application made elsewhere can be logged.
+    if (isHttpUrl(job.url)) window.open(job.url, "_blank", "noopener");
     setAppliedVia("site");
     setConfirming(true);
   };
@@ -148,11 +150,11 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
     setConfirming(false);
   };
   const cancelConfirm = () => setConfirming(false);
+  // Escape only: Enter is left to the natively-focused button (Submitted ✓ holds
+  // autoFocus), so Enter on "Not yet" or a via-chip activates THAT control instead
+  // of submitting from anywhere in the container.
   const onConfirmKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      submitApplied();
-    } else if (e.key === "Escape") {
+    if (e.key === "Escape") {
       e.preventDefault();
       cancelConfirm();
     }

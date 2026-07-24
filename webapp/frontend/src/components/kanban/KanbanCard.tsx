@@ -1,7 +1,7 @@
 import { useDraggable } from "@dnd-kit/core";
 import type { JobLight } from "../../api/types";
 import { OddsBadge, TierBadge } from "../StatusBadge";
-import { fmtDate, isoPlusDays, todayISO } from "../../lib/format";
+import { fmtDate, todayISO } from "../../lib/format";
 import { isAppliedPlus } from "../../lib/statuses";
 
 // Statuses on which a past-due follow-up should shout at you.
@@ -29,11 +29,12 @@ function daysInStage(statusSince: string | null | undefined): number | null {
   return Math.max(0, Math.floor((Date.now() - then) / 86_400_000));
 }
 
-/** Applied and no movement/response in 14+ days — likely ghosted. */
-function isGhosted(job: JobLight, status: string): boolean {
-  if (status !== "Applied") return false;
-  const applied = job.state?.applied_date;
-  return !!applied && applied <= isoPlusDays(-STALE_DAYS);
+/** In the Applied stage, unmoved, for 14+ days — likely ghosted. Anchored on the
+ * current stint (status_since), not applied_date: the backend preserves the
+ * original applied_date, so a role bounced back to Applied today would otherwise
+ * read as both "0d in stage" and "ghosted?". */
+function isGhosted(status: string, stageDays: number | null): boolean {
+  return status === "Applied" && stageDays !== null && stageDays >= STALE_DAYS;
 }
 
 /** Inner content of a card — shared by the column list and the drag overlay. */
@@ -53,7 +54,7 @@ function CardInner({
   const followUp = job.state?.follow_up_date;
   const overdue = isOverdue(job, status);
   const stageDays = daysInStage(job.state?.status_since);
-  const ghosted = isGhosted(job, status);
+  const ghosted = isGhosted(status, stageDays);
 
   return (
     <>

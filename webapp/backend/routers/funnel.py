@@ -169,7 +169,9 @@ def get_activity(conn: sqlite3.Connection = Depends(get_db)):
     passed_today: set = set()
     snoozed_today: set = set()
     applied_dates: set = set()  # every local date with >=1 status->Applied event
-    apps_this_week = 0
+    # Distinct roles, not transitions: a role bounced out of Applied and back in
+    # the same week is still one application, matching today's distinct-key counts.
+    apps_week_keys: set = set()
 
     for r in rows:
         at = _parse(r["at"])
@@ -180,7 +182,7 @@ def get_activity(conn: sqlite3.Connection = Depends(get_db)):
             if day == today_iso:
                 applied_today.add(r["seen_key"])
             if _week_start(at) == this_week_start:
-                apps_this_week += 1
+                apps_week_keys.add(r["seen_key"])
         elif field == "status" and nv == "Passed" and day == today_iso:
             passed_today.add(r["seen_key"])
         elif field == "snoozed_until" and day == today_iso:
@@ -212,6 +214,6 @@ def get_activity(conn: sqlite3.Connection = Depends(get_db)):
             "snoozed": len(snoozed_today),
             "done": len(done_today),
         },
-        "apps_this_week": apps_this_week,
+        "apps_this_week": len(apps_week_keys),
         "streak_days": streak_days,
     }

@@ -46,8 +46,14 @@ export default function Today() {
 
   const jobs = useMemo(() => jobsResp?.jobs ?? [], [jobsResp]);
   const cap = config?.daily_queue_size ?? 10;
-  const queue = useMemo(() => composeQueue(jobs, cap), [jobs, cap]);
   const done = activity?.today.done ?? 0;
+  // The queue is the REMAINING daily contract: work already done today shrinks it,
+  // so with more eligible jobs than the cap it still finishes at `cap` actions
+  // instead of refilling forever.
+  const queue = useMemo(
+    () => composeQueue(jobs, Math.max(0, cap - done)),
+    [jobs, cap, done],
+  );
   // Acting on the last card empties the queue via the optimistic jobs cache
   // before /api/activity refetches, so `done` can lag at 0 for a beat. Remember
   // that this session had a queue, so that beat reads as "queue clear", not as

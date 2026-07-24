@@ -156,6 +156,23 @@ def test_apps_this_week_counts_monday_not_prior_sunday(repo):
     conn.close()
 
 
+def test_apps_this_week_counts_roles_not_transitions(repo):
+    """A role that bounced out of Applied and back in the same week is ONE
+    application -- distinct seen_keys, matching today's distinct-key counting."""
+    conn = open_conn(repo)
+    seed_job(repo, conn, title="A", company="BounceCo", location="L", url="https://e/6")
+    sk = compute_seen_key("BounceCo", "A", "L")
+
+    monday = datetime.combine(MONDAY_THIS_WEEK, time(9, 0))
+    add_event(conn, sk, "status", "New", "Applied", monday.isoformat())
+    add_event(conn, sk, "status", "Applied", "Interested", (monday + timedelta(hours=1)).isoformat())
+    add_event(conn, sk, "status", "Interested", "Applied", (monday + timedelta(hours=2)).isoformat())
+
+    result = get_activity(conn)
+    assert result["apps_this_week"] == 1
+    conn.close()
+
+
 # --------------------------------------------------------------------------- #
 # streak_days
 # --------------------------------------------------------------------------- #
