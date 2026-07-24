@@ -5,21 +5,11 @@ import { useConfig, useJobs, usePatchState } from "../store/queries";
 import { fmtDate, fmtSalary, oddsRank } from "../lib/format";
 import { OddsBadge, StatusBadge, TierBadge } from "../components/StatusBadge";
 import { EMPTY_FILTERS, FilterBar, type TableFilters } from "../components/FilterBar";
+import { DEFAULT_STATUSES } from "../lib/statuses";
 import type { JobLight } from "../api/types";
 
 type SortKey = "tier" | "odds" | "company" | "salary_min" | "posted" | "first_seen";
 type SortDir = "asc" | "desc";
-
-const DEFAULT_STATUSES = [
-  "New",
-  "Interested",
-  "Applied",
-  "Phone screen",
-  "Interview",
-  "Offer",
-  "Rejected",
-  "Passed",
-];
 
 // grid-template-columns shared by header + rows (see .tbl-grid in index.css).
 const GRID = "32px 30px 46px 74px 1.3fr 2fr 1.2fr 100px 110px 92px 92px 96px 1.6fr";

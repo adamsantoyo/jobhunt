@@ -35,6 +35,94 @@
   align-items: stretch;
 }
 
+.kb-columns {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+
+/* Empty-pipeline hint overlays the (still-droppable) columns. */
+.kb-columns-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-mute);
+  font-size: 13px;
+  text-align: center;
+  padding: 40px;
+  pointer-events: none;
+}
+
+/* ---- terminal rails (Rejected/Passed) ---------------------------------- */
+.kb-rails {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.kb-rail {
+  flex: 0 0 34px;
+  width: 34px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 4px;
+  background: var(--bg-1);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  cursor: pointer;
+  color: var(--fg-dim);
+  font: inherit;
+}
+.kb-rail:hover {
+  background: var(--bg-3);
+  border-color: var(--fg-faint);
+}
+.kb-rail[data-over="1"] {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+.kb-rail-count {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-mute);
+  background: var(--bg-3);
+  border-radius: 9px;
+  padding: 1px 6px;
+  flex: 0 0 auto;
+}
+.kb-rail-label {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+
+.kb-col-collapse {
+  background: none;
+  border: none;
+  color: var(--fg-mute);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px 0 0;
+  flex: 0 0 auto;
+}
+.kb-col-collapse:hover {
+  color: var(--fg);
+}
+
 .kb-col {
   flex: 0 0 246px;
   width: 246px;
@@ -182,4 +270,23 @@
   background: var(--red-soft);
   color: var(--red);
   border: 1px solid var(--red);
+}
+.badge.stage {
+  color: var(--fg-mute);
+  border: 1px solid var(--border-soft);
+  font-variant-numeric: tabular-nums;
+}
+.badge.stage[data-stale="1"] {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border: 1px solid var(--amber);
+}
+.badge.ghosted {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border: 1px solid var(--amber);
+  cursor: pointer;
+}
+.badge.ghosted:hover {
+  filter: brightness(1.1);
 }

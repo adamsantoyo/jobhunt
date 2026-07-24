@@ -11,7 +11,7 @@ import { SettingsDialog } from "./SettingsDialog";
 const NAV: Array<{ to: string; label: string }> = [
   { to: "/today", label: "Today" },
   { to: "/matrix", label: "Matrix" },
-  { to: "/kanban", label: "Kanban" },
+  { to: "/kanban", label: "Pipeline" },
   { to: "/table", label: "Table" },
   { to: "/companies", label: "Companies" },
   { to: "/changes", label: "Changes" },

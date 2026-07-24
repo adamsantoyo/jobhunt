@@ -3,19 +3,9 @@ import { useSearchParams } from "react-router-dom";
 import { useConfig, useJobDetail, usePatchState, useQuickAction } from "../store/queries";
 import { fmtDate, fmtSalary, flagsList } from "../lib/format";
 import { highlightText } from "../lib/highlight";
+import { DEFAULT_STATUSES } from "../lib/statuses";
 import type { JobFull, JobState, StatePatch } from "../api/types";
 import { FlagBadge, OddsBadge, TierBadge } from "./StatusBadge";
-
-const DEFAULT_STATUSES = [
-  "New",
-  "Interested",
-  "Applied",
-  "Phone screen",
-  "Interview",
-  "Offer",
-  "Rejected",
-  "Passed",
-];
 
 function isHttpUrl(url: string | null | undefined): boolean {
   return !!url && (url.startsWith("http://") || url.startsWith("https://"));
