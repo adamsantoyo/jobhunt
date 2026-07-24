@@ -1,22 +1,27 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useConfig, useJobs, usePatchState } from "../store/queries";
+import { useChanges, useCompanies, useConfig, useJobs, usePatchState } from "../store/queries";
 import { fmtDate, fmtSalary, oddsRank } from "../lib/format";
 import { OddsBadge, StatusBadge, TierBadge } from "../components/StatusBadge";
 import { EMPTY_FILTERS, FilterBar, type TableFilters } from "../components/FilterBar";
-import { DEFAULT_STATUSES } from "../lib/statuses";
+import { DEFAULT_STATUSES, statusOf } from "../lib/statuses";
+import { MatrixFilter } from "../components/explore/MatrixFilter";
+import { DiffBar, type DiffKind } from "../components/explore/DiffBar";
+import { CompanyGroups } from "../components/explore/CompanyGroups";
+import { DisappearedList } from "../components/explore/DisappearedList";
 import type { JobLight } from "../api/types";
+
+// Matrix + Table + Companies + Changes, collapsed into one view built on the
+// Table engine (see plans/phase2-spec.md "Design contract for /explore").
+// Flat-mode sort/filter/row anatomy below is ported as-is from the retired
+// TableView.tsx.
 
 type SortKey = "tier" | "odds" | "company" | "salary_min" | "posted" | "first_seen";
 type SortDir = "asc" | "desc";
 
 // grid-template-columns shared by header + rows (see .tbl-grid in index.css).
 const GRID = "32px 30px 46px 74px 1.3fr 2fr 1.2fr 100px 110px 92px 92px 96px 1.6fr";
-
-function statusOf(job: JobLight): string {
-  return job.state?.status ?? "New";
-}
 
 function cmp(a: JobLight, b: JobLight, key: SortKey): number {
   switch (key) {
@@ -64,16 +69,42 @@ function matches(job: JobLight, f: TableFilters): boolean {
   return true;
 }
 
-export default function TableView() {
+const tierArrowStyle = (up: boolean): CSSProperties => ({
+  marginLeft: 6,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 4,
+  color: up ? "var(--green)" : "var(--red)",
+  fontWeight: 600,
+  fontVariantNumeric: "tabular-nums",
+  fontSize: 11,
+});
+
+function TierArrow({ from, to }: { from: number; to: number }) {
+  return (
+    <span style={tierArrowStyle(to > from)}>
+      T{from} <span aria-hidden>→</span> T{to}
+    </span>
+  );
+}
+
+export default function Explore() {
   const { data, isLoading, isError } = useJobs();
   const { data: config } = useConfig();
+  const { data: companyStates } = useCompanies();
   const patchState = usePatchState();
-  const [, setParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [filters, setFilters] = useState<TableFilters>(EMPTY_FILTERS);
   const [sortKey, setSortKey] = useState<SortKey>("tier");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  const group = searchParams.get("group") === "company";
+  const diff = (searchParams.get("diff") as DiffKind | null) ?? null;
+  const since = searchParams.get("since") ?? undefined;
+
+  const { data: changes, isLoading: changesLoading } = useChanges(since);
 
   const jobs = data?.jobs ?? [];
 
@@ -85,10 +116,41 @@ export default function TableView() {
 
   const statusOptions = config?.statuses ?? DEFAULT_STATUSES;
 
+  // Diff sets: url_b64 membership for new/reposted, and a from->to map for
+  // tier changes. `gone` is not a row-level filter over /api/jobs -- those
+  // jobs aren't in the jobs list at all, so it swaps the whole body instead.
+  const diffSets = useMemo(() => {
+    const newSet = new Set((changes?.new ?? []).map((j) => j.url_b64));
+    const repostedSet = new Set((changes?.reposted ?? []).map((j) => j.url_b64));
+    const tierMap = new Map((changes?.tier_changed ?? []).map((tc) => [tc.job.url_b64, tc]));
+    return { newSet, repostedSet, tierMap };
+  }, [changes]);
+
+  const diffMatches = (job: JobLight): boolean => {
+    if (!diff || diff === "gone") return true;
+    if (diff === "new") return diffSets.newSet.has(job.url_b64);
+    if (diff === "reposted") return diffSets.repostedSet.has(job.url_b64);
+    return diffSets.tierMap.has(job.url_b64);
+  };
+
+  // Facet base for MatrixFilter: every current filter EXCEPT tiers/odds,
+  // still intersected with the active diff chip (a diff chip is just another
+  // filter, per the design contract's diff-filtering semantics).
+  const facetJobs = useMemo(() => {
+    const f: TableFilters = { ...filters, tiers: [], odds: [] };
+    return jobs.filter((j) => matches(j, f) && diffMatches(j));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, filters, diff, diffSets]);
+
+  const filteredRows = useMemo(() => {
+    return jobs.filter((j) => matches(j, filters) && diffMatches(j));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, filters, diff, diffSets]);
+
   const rows = useMemo(() => {
-    const filtered = jobs.filter((j) => matches(j, filters));
+    const sorted = [...filteredRows];
     const dir = sortDir === "asc" ? 1 : -1;
-    filtered.sort((a, b) => {
+    sorted.sort((a, b) => {
       const primary = cmp(a, b, sortKey) * dir;
       if (primary !== 0) return primary;
       // stable secondary: tier desc then company asc
@@ -96,8 +158,13 @@ export default function TableView() {
       if (t !== 0) return t;
       return (a.company ?? "").localeCompare(b.company ?? "");
     });
-    return filtered;
-  }, [jobs, filters, sortKey, sortDir]);
+    return sorted;
+  }, [filteredRows, sortKey, sortDir]);
+
+  // Bulk selection only exists in flat mode; entering group mode clears it.
+  useEffect(() => {
+    if (group) setSelected(new Set());
+  }, [group]);
 
   const parentRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
@@ -108,7 +175,7 @@ export default function TableView() {
   });
 
   const openJob = (job: JobLight) =>
-    setParams(
+    setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
         next.set("job", job.url_b64);
@@ -152,6 +219,30 @@ export default function TableView() {
     setSelected(new Set());
   };
 
+  const setGroup = (on: boolean) =>
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (on) next.set("group", "company");
+      else next.delete("group");
+      return next;
+    });
+
+  const setDiff = (d: DiffKind | null) =>
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (d) next.set("diff", d);
+      else next.delete("diff");
+      return next;
+    });
+
+  const setSince = (v: string) =>
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (v) next.set("since", v);
+      else next.delete("since");
+      return next;
+    });
+
   const SortHead = ({ label, k }: { label: string; k: SortKey }) => (
     <button type="button" className="th-sort" onClick={() => onSort(k)}>
       {label}
@@ -159,44 +250,32 @@ export default function TableView() {
     </button>
   );
 
-  return (
-    <div className="table-view">
-      <FilterBar
-        filters={filters}
-        onChange={setFilters}
-        sourceOptions={sourceOptions}
-        statusOptions={statusOptions}
-      />
+  const disappeared = changes?.disappeared ?? [];
+  // A diff chip other than "gone" filters /api/jobs rows by a changes.* set;
+  // while that set hasn't loaded yet, show a loading state instead of an
+  // (incorrectly) empty table.
+  const changesPending = changesLoading && !changes;
+  const diffPending = !!diff && diff !== "gone" && changesPending;
 
-      <div className="table-toolbar">
-        <span className="muted">
-          {rows.length} of {jobs.length} jobs
-          {isLoading ? " (loading…)" : ""}
-        </span>
-        {selected.size > 0 && (
-          <div className="bulk-bar">
-            <span>{selected.size} selected</span>
-            <button type="button" className="btn btn-sm" onClick={() => bulk({ starred: true })}>
-              Star
-            </button>
-            <button type="button" className="btn btn-sm" onClick={() => bulk({ starred: false })}>
-              Unstar
-            </button>
-            <button type="button" className="btn btn-sm" onClick={() => bulk({ hidden: true })}>
-              Hide
-            </button>
-            <button type="button" className="btn btn-sm" onClick={() => bulk({ hidden: false })}>
-              Unhide
-            </button>
-            <button type="button" className="btn btn-sm" onClick={() => setSelected(new Set())}>
-              Clear
-            </button>
-          </div>
-        )}
-      </div>
-
-      {isError && <div className="page-error">Failed to load jobs.</div>}
-
+  let body: ReactNode;
+  if (diff === "gone") {
+    body = changesPending ? (
+      <p className="muted" style={{ padding: 16 }}>
+        Loading…
+      </p>
+    ) : (
+      <DisappearedList jobs={disappeared} />
+    );
+  } else if (diffPending) {
+    body = (
+      <p className="muted" style={{ padding: 16 }}>
+        Loading…
+      </p>
+    );
+  } else if (group) {
+    body = <CompanyGroups jobs={filteredRows} companyStates={companyStates} onOpen={openJob} />;
+  } else {
+    body = (
       <div className="tbl">
         <div className="tbl-head tbl-grid" style={{ gridTemplateColumns: GRID }}>
           <div className="th th-check">
@@ -238,6 +317,7 @@ export default function TableView() {
             {virtualizer.getVirtualItems().map((vi) => {
               const job = rows[vi.index];
               const isSel = selected.has(job.url_b64);
+              const tierChange = diff === "tier" ? diffSets.tierMap.get(job.url_b64) : undefined;
               return (
                 <div
                   key={job.url_b64}
@@ -283,6 +363,7 @@ export default function TableView() {
                   <div className="td td-ellipsis" title={job.title ?? ""}>
                     {job.is_new && <span className="dot-new" title="new this run" />}
                     {job.title ?? "—"}
+                    {tierChange && <TierArrow from={tierChange.from} to={tierChange.to} />}
                   </div>
                   <div className="td td-ellipsis" title={job.location ?? ""}>
                     {job.remote && <span className="tag-remote">R</span>}
@@ -308,6 +389,80 @@ export default function TableView() {
           </div>
         </div>
       </div>
+    );
+  }
+
+  return (
+    <div className="explore-page">
+      <MatrixFilter facetJobs={facetJobs} filters={filters} onChange={setFilters} />
+
+      <DiffBar
+        diff={diff}
+        since={since}
+        changes={changes}
+        changesLoading={changesLoading}
+        onSelectDiff={setDiff}
+        onSelectSince={setSince}
+      />
+
+      <FilterBar
+        filters={filters}
+        onChange={setFilters}
+        sourceOptions={sourceOptions}
+        statusOptions={statusOptions}
+      />
+
+      <div className="table-toolbar">
+        <span className="muted">
+          {diff === "gone" ? `${disappeared.length} disappeared` : `${rows.length} of ${jobs.length} jobs`}
+          {isLoading || diffPending || (diff === "gone" && changesPending) ? " (loading…)" : ""}
+        </span>
+
+        <div className="explore-toolbar-group">
+          <span className="filter-label">Group</span>
+          <button
+            type="button"
+            className="chip-toggle"
+            data-on={!group ? "1" : "0"}
+            onClick={() => setGroup(false)}
+          >
+            none
+          </button>
+          <button
+            type="button"
+            className="chip-toggle"
+            data-on={group ? "1" : "0"}
+            onClick={() => setGroup(true)}
+          >
+            company
+          </button>
+        </div>
+
+        {!group && diff !== "gone" && selected.size > 0 && (
+          <div className="bulk-bar">
+            <span>{selected.size} selected</span>
+            <button type="button" className="btn btn-sm" onClick={() => bulk({ starred: true })}>
+              Star
+            </button>
+            <button type="button" className="btn btn-sm" onClick={() => bulk({ starred: false })}>
+              Unstar
+            </button>
+            <button type="button" className="btn btn-sm" onClick={() => bulk({ hidden: true })}>
+              Hide
+            </button>
+            <button type="button" className="btn btn-sm" onClick={() => bulk({ hidden: false })}>
+              Unhide
+            </button>
+            <button type="button" className="btn btn-sm" onClick={() => setSelected(new Set())}>
+              Clear
+            </button>
+          </div>
+        )}
+      </div>
+
+      {isError && <div className="page-error">Failed to load jobs.</div>}
+
+      {body}
     </div>
   );
 }

@@ -512,52 +512,6 @@ textarea.input {
 }
 
 /* ============================================================================
-   Job chip
-   ========================================================================== */
-.job-chip {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  text-align: left;
-  background: var(--bg-2);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  padding: 4px 7px;
-  color: var(--fg);
-  cursor: pointer;
-  font-size: 12px;
-}
-.job-chip:hover {
-  background: var(--bg-3);
-  border-color: var(--fg-faint);
-}
-.job-chip-badges {
-  display: flex;
-  gap: 3px;
-  flex: 0 0 auto;
-}
-.job-chip-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.job-chip-company {
-  font-weight: 600;
-}
-.job-chip-sep {
-  color: var(--fg-faint);
-}
-.job-chip-title {
-  color: var(--fg-dim);
-}
-.job-chip-star {
-  margin-left: auto;
-  color: var(--amber);
-}
-
-/* ============================================================================
    Drawer
    ========================================================================== */
 .drawer-overlay {
@@ -792,12 +746,6 @@ mark.hl {
 /* ============================================================================
    Table view (virtualized)
    ========================================================================== */
-.table-view {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
 .table-toolbar {
   display: flex;
   align-items: center;
@@ -935,6 +883,123 @@ mark.hl {
   border-radius: 3px;
   padding: 0 3px;
   margin-right: 5px;
+}
+
+/* ============================================================================
+   Explore (Matrix + Table + Companies + Changes, collapsed)
+   ========================================================================== */
+.explore-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.explore-matrix {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+}
+.explore-matrix-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.explore-matrix-grid {
+  display: grid;
+  grid-template-columns: 46px repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  max-width: 520px;
+}
+.explore-matrix-colhead,
+.explore-matrix-rowhead {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.explore-matrix-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 40px;
+  padding: 6px 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.explore-matrix-cell[data-active="1"],
+.explore-matrix-rowhead[data-active="1"],
+.explore-matrix-colhead[data-active="1"] {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.explore-matrix-cell-count {
+  font-weight: 600;
+  color: var(--fg);
+}
+.explore-matrix-cell-corner {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--fg-mute);
+}
+
+.explore-diffbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-1);
+}
+.explore-diffbar-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.explore-diffbar-baseline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.explore-toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.explore-groups {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+}
+
+.explore-disappeared {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 12px;
 }
 
 /* thin scrollbars */
