@@ -16,6 +16,9 @@ import type {
   ConfigPatch,
   ReviewItem,
   ReconcileBody,
+  FunnelResponse,
+  FollowupsResponse,
+  ActivityResponse,
 } from "./types";
 
 const APP_HEADER = "X-App";
@@ -86,6 +89,9 @@ export const api = {
   getChanges: (since?: string) =>
     request<ChangesResponse>(`/api/changes${since ? `?since=${encodeURIComponent(since)}` : ""}`),
   getFreshness: () => request<FreshnessResponse>("/api/freshness"),
+  getFunnel: () => request<FunnelResponse>("/api/funnel"),
+  getFollowups: () => request<FollowupsResponse>("/api/followups"),
+  getActivity: () => request<ActivityResponse>("/api/activity"),
 
   // config
   getConfig: () => request<AppConfig>("/api/config"),

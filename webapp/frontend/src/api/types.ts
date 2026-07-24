@@ -13,6 +13,8 @@ export interface JobState {
   needs_review: boolean;
   review_reason: string | null;
   updated_at: string;
+  /** ISO timestamp of the latest field='status' state_event; null if none. */
+  status_since: string | null;
 }
 
 export interface JobLight {
@@ -111,6 +113,12 @@ export interface FunnelResponse {
 export interface FollowupsResponse {
   overdue: JobLight[];
   upcoming: JobLight[];
+}
+
+export interface ActivityResponse {
+  today: { applied: number; passed: number; snoozed: number; done: number };
+  apps_this_week: number;
+  streak_days: number;
 }
 
 export interface TierChange {

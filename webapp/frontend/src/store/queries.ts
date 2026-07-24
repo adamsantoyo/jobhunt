@@ -8,7 +8,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { isoPlusDays, todayISO } from "../lib/format";
+import { dateToISO, isoPlusDays, todayISO } from "../lib/format";
 import type {
   JobsResponse,
   JobFull,
@@ -29,7 +29,17 @@ export const qk = {
   freshness: ["freshness"] as const,
   config: ["config"] as const,
   review: ["review"] as const,
+  funnel: ["funnel"] as const,
+  followups: ["followups"] as const,
+  activity: ["activity"] as const,
 };
+
+// Local-naive ISO timestamp matching backend models.now_iso() (datetime.now().isoformat()).
+function nowIso(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${dateToISO(d)}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
 const EMPTY_STATE: JobState = {
   status: "New",
@@ -44,6 +54,7 @@ const EMPTY_STATE: JobState = {
   needs_review: false,
   review_reason: null,
   updated_at: "",
+  status_since: null,
 };
 
 function mergePatch(existing: JobState | null, patch: StatePatch): JobState {
@@ -53,18 +64,25 @@ function mergePatch(existing: JobState | null, patch: StatePatch): JobState {
   const rest = { ...patch };
   delete rest.review_dismissed;
   // Any user edit clears needs_review (matches the backend PATCH contract).
-  return { ...base, ...rest, needs_review: false };
+  // Optimistic status_since: server truth replaces this onSuccess.
+  const statusSince = patch.status !== undefined ? nowIso() : base.status_since;
+  return { ...base, ...rest, needs_review: false, status_since: statusSince };
 }
 
 function applyQuick(existing: JobState | null, body: QuickActionBody): JobState {
   const base = existing ?? EMPTY_STATE;
   switch (body.action) {
     case "applied":
-      return { ...base, status: "Applied", applied_date: base.applied_date ?? todayISO() };
+      return {
+        ...base,
+        status: "Applied",
+        applied_date: base.applied_date ?? todayISO(),
+        status_since: nowIso(),
+      };
     case "snooze":
       return { ...base, snoozed_until: isoPlusDays(body.days ?? 3) };
     case "pass":
-      return { ...base, status: "Passed" };
+      return { ...base, status: "Passed", status_since: nowIso() };
     case "star":
       return { ...base, starred: true };
     case "unstar":
@@ -97,6 +115,9 @@ function invalidateStateDerived(qc: QueryClient) {
   qc.invalidateQueries({ queryKey: qk.jobs });
   qc.invalidateQueries({ queryKey: qk.review });
   qc.invalidateQueries({ queryKey: qk.analytics });
+  qc.invalidateQueries({ queryKey: qk.followups });
+  qc.invalidateQueries({ queryKey: qk.activity });
+  qc.invalidateQueries({ queryKey: qk.funnel });
 }
 
 export function useReconcile() {
@@ -158,6 +179,18 @@ export function useConfig() {
 
 export function useReview() {
   return useQuery({ queryKey: qk.review, queryFn: api.getReview, staleTime: 60_000 });
+}
+
+export function useFunnel() {
+  return useQuery({ queryKey: qk.funnel, queryFn: api.getFunnel, staleTime: 60_000 });
+}
+
+export function useFollowups() {
+  return useQuery({ queryKey: qk.followups, queryFn: api.getFollowups, staleTime: 60_000 });
+}
+
+export function useActivity() {
+  return useQuery({ queryKey: qk.activity, queryFn: api.getActivity, staleTime: 30_000 });
 }
 
 // ---- mutations ----
