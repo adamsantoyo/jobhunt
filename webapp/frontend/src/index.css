@@ -357,6 +357,29 @@ textarea.input {
 }
 
 /* ============================================================================
+   App banner (sweep-control outcomes: started / already running / failed)
+   ========================================================================== */
+.app-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--border);
+}
+.app-banner-text {
+  flex: 1;
+}
+.app-banner[data-tone="error"] {
+  background: var(--red-soft);
+  color: var(--red);
+}
+.app-banner[data-tone="ok"] {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+/* ============================================================================
    Sweep progress strip
    ========================================================================== */
 .sweep-strip {
@@ -372,7 +395,20 @@ textarea.input {
   background: var(--red-soft);
 }
 .sweep-kind {
-  font-weight: 600;
+  font-weight: 700;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+}
+.sweep-kind[data-kind="full"] {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-color: var(--accent-dim);
 }
 .sweep-step {
   color: var(--fg-dim);
@@ -693,6 +729,11 @@ mark.hl {
   gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--border);
+}
+.confirm-text {
+  margin: 0;
+  color: var(--fg-dim);
+  line-height: 1.5;
 }
 
 /* ============================================================================

@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import { qk, useFreshness, useReview } from "../store/queries";
 import { fmtDate } from "../lib/format";
 import { JobDetailDrawer } from "./JobDetailDrawer";
@@ -24,28 +24,47 @@ export function AppShell() {
   const reviewCount = review?.length ?? 0;
   const running = freshness?.sweep.running ?? false;
 
-  const [actionError, setActionError] = useState<string | null>(null);
-  const surfaceError = (e: unknown) =>
-    setActionError(e instanceof Error ? e.message : String(e));
+  // Sweep-control outcomes render as a full-width banner under the topbar, never
+  // as a native dialog: Chrome can suppress window.confirm/alert for the page,
+  // which once made "Full sweep" a silent no-op.
+  const [banner, setBanner] = useState<{ tone: "error" | "ok"; text: string } | null>(null);
+  const [confirmFullOpen, setConfirmFullOpen] = useState(false);
+
+  const surfaceError = (e: unknown) => {
+    if (e instanceof ApiError && e.status === 409) {
+      setBanner({
+        tone: "error",
+        text: "A sweep is already running — see the progress strip below, or cancel it there first.",
+      });
+    } else {
+      setBanner({ tone: "error", text: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  // Success notices clear themselves; errors stay until dismissed.
+  useEffect(() => {
+    if (banner?.tone !== "ok") return;
+    const t = window.setTimeout(() => setBanner(null), 10_000);
+    return () => window.clearTimeout(t);
+  }, [banner]);
 
   const quick = useMutation({
     mutationFn: api.refreshQuick,
-    onMutate: () => setActionError(null),
+    onMutate: () => setBanner(null),
     onError: surfaceError,
     onSettled: () => qc.invalidateQueries({ queryKey: qk.freshness }),
   });
   const full = useMutation({
     mutationFn: api.sweepFull,
-    onMutate: () => setActionError(null),
+    onMutate: () => setBanner(null),
+    onSuccess: () =>
+      setBanner({
+        tone: "ok",
+        text: "Full sweep started (36 steps, 20-45 min). Progress appears in the strip below.",
+      }),
     onError: surfaceError,
     onSettled: () => qc.invalidateQueries({ queryKey: qk.freshness }),
   });
-
-  const startFull = () => {
-    if (window.confirm("Run a FULL sweep? This re-scrapes everything and can take 20-45 minutes.")) {
-      full.mutate();
-    }
-  };
 
   return (
     <div className="app-shell">
@@ -94,17 +113,6 @@ export function AppShell() {
           </div>
 
           <div className="topbar-right">
-            {actionError && (
-              <span
-                className="sweep-error"
-                role="alert"
-                style={{ cursor: "pointer", fontSize: 12 }}
-                title="Click to dismiss"
-                onClick={() => setActionError(null)}
-              >
-                {actionError}
-              </span>
-            )}
             <button
               type="button"
               className="btn"
@@ -117,7 +125,7 @@ export function AppShell() {
               type="button"
               className="btn"
               disabled={running || full.isPending}
-              onClick={startFull}
+              onClick={() => setConfirmFullOpen(true)}
             >
               Full sweep
             </button>
@@ -132,12 +140,70 @@ export function AppShell() {
           </div>
         </header>
 
+        {banner && (
+          <div
+            className="app-banner"
+            data-tone={banner.tone}
+            role={banner.tone === "error" ? "alert" : "status"}
+          >
+            <span className="app-banner-text">{banner.text}</span>
+            <button type="button" className="btn btn-sm" onClick={() => setBanner(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
+
         <SweepProgress />
 
         <main className="content">
           <Outlet />
         </main>
       </div>
+
+      {confirmFullOpen && (
+        <div className="modal-overlay" onClick={() => setConfirmFullOpen(false)}>
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirm full sweep"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h2>Run a full sweep?</h2>
+              <button
+                type="button"
+                className="btn btn-icon"
+                onClick={() => setConfirmFullOpen(false)}
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p className="confirm-text">
+                This re-scrapes every source (36 steps) and can take 20-45 minutes. Quick
+                refresh only re-checks known jobs and is usually what you want during the day.
+              </p>
+            </div>
+            <div className="modal-foot">
+              <button type="button" className="btn" onClick={() => setConfirmFullOpen(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => {
+                  setConfirmFullOpen(false);
+                  full.mutate();
+                }}
+              >
+                Start full sweep
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Drawer is mounted ONCE for the whole app, driven by ?job=<url_b64>. */}
       <JobDetailDrawer />

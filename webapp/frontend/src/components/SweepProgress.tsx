@@ -161,7 +161,9 @@ export function SweepProgress() {
 
   return (
     <div className="sweep-strip" data-error={state.error ? "1" : "0"}>
-      <span className="sweep-kind">{state.kind === "full" ? "Full sweep" : "Quick refresh"}</span>
+      <span className="sweep-kind" data-kind={state.kind === "full" ? "full" : "quick"}>
+        {state.kind === "full" ? "Full sweep" : "Quick refresh"}
+      </span>
       {state.error ? (
         <span className="sweep-step sweep-error">{state.error}</span>
       ) : (
