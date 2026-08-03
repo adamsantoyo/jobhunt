@@ -377,6 +377,27 @@ def test_old_schema_migration_creates_backup_file(old_db):
     conn.close()
 
 
+def test_online_backup_includes_committed_wal_rows(old_db):
+    path, _keys = old_db
+    conn = connect(path)
+    conn.execute("INSERT INTO app_settings (key, value) VALUES ('wal-proof', 'present')")
+    conn.commit()
+
+    run_migrations(conn, str(path))
+
+    backup_path = glob.glob(str(path) + ".bak.v1-*")[0]
+    restored = sqlite3.connect(backup_path)
+    assert restored.execute(
+        "SELECT value FROM app_settings WHERE key='wal-proof'"
+    ).fetchone()[0] == "present"
+    tables = {r[0] for r in restored.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    assert "schema_version" not in tables, "backup must precede migration bookkeeping"
+    restored.close()
+    conn.close()
+
+
 def test_old_schema_migration_no_backup_on_already_migrated_rerun(old_db):
     path, _keys = old_db
     conn = connect(path)
@@ -428,6 +449,41 @@ def test_dry_run_on_fresh_db_does_not_mutate_it(tmp_path):
 
     after = conn.execute("SELECT COUNT(*) AS c FROM schema_version").fetchone()["c"]
     assert before == after == len(MIGRATIONS)  # already-stamped rows untouched
+    conn.close()
+
+
+def test_dry_run_validates_up_to_date_database_with_no_pending_migrations(tmp_path):
+    path = tmp_path / "up_to_date_invalid_fk.db"
+    conn = connect(path)
+    init_db(conn)
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id))")
+    conn.commit()
+    conn.close()
+
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA foreign_keys=OFF")
+    raw.execute("INSERT INTO child (parent_id) VALUES (99)")
+    raw.commit()
+    raw.close()
+
+    conn = connect(path)
+    with pytest.raises(RuntimeError, match="foreign-key check failed"):
+        run_migrations(conn, str(path), dry_run=True)
+    assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == len(MIGRATIONS)
+    conn.close()
+
+
+def test_migration_refuses_connection_with_active_transaction(old_db):
+    path, _keys = old_db
+    conn = connect(path)
+    conn.execute("INSERT INTO app_settings (key, value) VALUES ('pending', 'write')")
+
+    with pytest.raises(RuntimeError, match="no active transaction"):
+        run_migrations(conn, str(path))
+
+    assert glob.glob(str(path) + ".bak.*") == []
+    conn.rollback()
     conn.close()
 
 
@@ -485,3 +541,69 @@ def test_kill_mid_migration_leaves_a_restorable_backup(old_db):
     count = restored.execute("SELECT COUNT(*) AS c FROM job_state").fetchone()["c"]
     assert count == 7
     restored.close()
+
+
+def test_ddl_from_failed_migration_rolls_back(old_db):
+    path, _keys = old_db
+    conn = connect(path)
+
+    import backend.migrations as migrations_mod
+
+    def create_then_boom(conn):
+        conn.execute("CREATE TABLE must_rollback (id INTEGER PRIMARY KEY)")
+        raise RuntimeError("after ddl")
+
+    orig = list(migrations_mod.MIGRATIONS)
+    migrations_mod.MIGRATIONS.append((5, "transactional_ddl_probe", create_then_boom))
+    try:
+        with pytest.raises(RuntimeError, match="after ddl"):
+            run_migrations(conn, str(path))
+    finally:
+        migrations_mod.MIGRATIONS[:] = orig
+
+    assert not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
+    ).fetchone()
+    versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
+    assert versions == {1, 2, 3, 4}
+    conn.close()
+
+
+def test_backup_validation_rejects_foreign_key_violation_before_migration(tmp_path):
+    path = tmp_path / "invalid_fk.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(OLD_DDL)
+    raw.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    raw.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id))")
+    raw.execute("INSERT INTO child (parent_id) VALUES (99)")
+    raw.commit()
+    raw.close()
+
+    conn = connect(path)
+    with pytest.raises(RuntimeError, match="foreign-key check failed"):
+        run_migrations(conn, str(path))
+
+    assert not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    assert glob.glob(str(path) + ".bak.*") == []
+    conn.close()
+
+
+def test_backup_failure_aborts_before_schema_mutation(old_db, monkeypatch):
+    path, _keys = old_db
+    conn = connect(path)
+
+    import backend.migrations as migrations_mod
+
+    def backup_boom(*_args, **_kwargs):
+        raise OSError("backup unavailable")
+
+    monkeypatch.setattr(migrations_mod, "_backup", backup_boom)
+    with pytest.raises(OSError, match="backup unavailable"):
+        run_migrations(conn, str(path))
+
+    assert not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    conn.close()

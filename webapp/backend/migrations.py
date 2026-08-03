@@ -21,7 +21,6 @@ Design notes:
   audit metadata, unrelated to the user-facing timeline.
 """
 import os
-import shutil
 import sqlite3
 from datetime import datetime, timezone
 
@@ -80,12 +79,38 @@ def _applied_versions(conn: sqlite3.Connection) -> set:
     return {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
 
 
+def _execute_ddl(conn: sqlite3.Connection, ddl: str) -> None:
+    """Execute a DDL script without executescript's implicit transaction commit."""
+    statement = ""
+    for line in ddl.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            sql = statement.strip()
+            if sql:
+                conn.execute(sql)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.OperationalError("incomplete DDL statement")
+
+
+def _validate_database(conn: sqlite3.Connection) -> None:
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    if integrity != "ok":
+        raise RuntimeError(f"database integrity check failed: {integrity}")
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        first = tuple(violations[0])
+        raise RuntimeError(
+            f"database foreign-key check failed: {len(violations)} violation(s), first={first}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Migrations
 # --------------------------------------------------------------------------- #
 def _migration_1_state_events(conn: sqlite3.Connection) -> None:
     """Create the append-only state_events log (idempotent)."""
-    conn.executescript(STATE_EVENTS_DDL)
+    _execute_ddl(conn, STATE_EVENTS_DDL)
 
 
 def _migration_2_backfill(conn: sqlite3.Connection) -> None:
@@ -190,7 +215,7 @@ def _migration_3_rekey_job_state(conn: sqlite3.Connection) -> None:
     'migration' tombstone event. The winner's url becomes its present-job address (or
     the old value, orphaned surrogate -> NULL). No status, note, or date is dropped:
     every old row is either the winner or archived intact."""
-    conn.executescript(JOB_STATE_ARCHIVE_DDL)
+    _execute_ddl(conn, JOB_STATE_ARCHIVE_DDL)
 
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_state)")}
     if "needs_review" not in cols:
@@ -270,22 +295,27 @@ MIGRATIONS = [
 # Runner
 # --------------------------------------------------------------------------- #
 def _backup(conn: sqlite3.Connection, db_path, version: int):
-    """Copy the live DB file to <db_path>.bak.v<version>-<UTCstamp> before the first
-    migration touches it. Checkpoints the WAL first so the copied .db file is a
-    complete, self-restorable snapshot (recent commits otherwise live only in -wal).
-    No-op when db_path is missing/:memory: (nothing on disk to preserve)."""
+    """Create a consistent SQLite backup before the first pending migration."""
     if not db_path:
         return None
     path = str(db_path)
     if not os.path.isfile(path):
         return None
-    try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except sqlite3.Error:
-        pass
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     dest = f"{path}.bak.v{version}-{stamp}"
-    shutil.copy2(path, dest)
+    backup = sqlite3.connect(dest)
+    try:
+        backup.execute("PRAGMA foreign_keys=ON")
+        conn.backup(backup)
+        _validate_database(backup)
+    except Exception:
+        backup.close()
+        try:
+            os.unlink(dest)
+        except FileNotFoundError:
+            pass
+        raise
+    backup.close()
     return dest
 
 
@@ -293,22 +323,31 @@ def _dry_run_pending(conn: sqlite3.Connection):
     """Trial-run every pending migration against a private in-memory copy of `conn`'s
     current state, then discard the copy.
 
-    This does NOT run migrations against `conn` and roll back: SQLite auto-commits
-    DDL (CREATE TABLE / ALTER TABLE) immediately, ahead of any enclosing transaction,
-    regardless of the connection's isolation level -- migrations 1, 3, and 4 are all
-    DDL, so a rollback() after running them on the real connection would silently fail
-    to undo them, permanently mutating `conn` under a call named dry_run. Backing up
-    onto a throwaway :memory: connection and mutating only that copy is the only way
-    to make this truly inert."""
+    The private copy keeps dry-run inert even if a migration contains transaction-
+    hostile behavior now or in the future. Each migration still runs in the same
+    explicit transaction and validation path as a real migration."""
     tmp = sqlite3.connect(":memory:")
     tmp.row_factory = sqlite3.Row
     try:
         conn.backup(tmp)
+        tmp.execute("PRAGMA foreign_keys=ON")
         _ensure_schema_version(tmp)
         applied = _applied_versions(tmp)
         pending = [(v, n, fn) for (v, n, fn) in MIGRATIONS if v not in applied]
         for version, name, fn in pending:
-            fn(tmp)
+            tmp.execute("BEGIN IMMEDIATE")
+            try:
+                fn(tmp)
+                tmp.execute(
+                    "INSERT INTO schema_version (version, name, applied_at) VALUES (?,?,?)",
+                    (version, name, _utc_now_iso()),
+                )
+                _validate_database(tmp)
+                tmp.commit()
+            except Exception:
+                tmp.rollback()
+                raise
+        _validate_database(tmp)
         return [(v, n) for (v, n, _fn) in pending]
     finally:
         tmp.close()
@@ -330,40 +369,52 @@ def run_migrations(conn: sqlite3.Connection, db_path, *, dry_run=False, fresh=No
     dry_run=True: never touches `conn` (see _dry_run_pending) -- returns what would
     apply without any backup, commit, or persisted side effect on the real connection.
     """
+    if conn.in_transaction:
+        raise RuntimeError("migrations require a connection with no active transaction")
+
     if dry_run:
         return _dry_run_pending(conn)
 
-    _ensure_schema_version(conn)
     if fresh is None:
         fresh = not _table_exists(conn, "jobs")
-    applied = _applied_versions(conn)
 
     if fresh:
-        stamped = []
-        for version, name, _fn in MIGRATIONS:
-            if version not in applied:
-                conn.execute(
-                    "INSERT INTO schema_version (version, name, applied_at) VALUES (?,?,?)",
-                    (version, f"{name} (stamped)", _utc_now_iso()),
-                )
-                stamped.append((version, name))
-        conn.commit()
-        return stamped
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _ensure_schema_version(conn)
+            applied = _applied_versions(conn)
+            stamped = []
+            for version, name, _fn in MIGRATIONS:
+                if version not in applied:
+                    conn.execute(
+                        "INSERT INTO schema_version (version, name, applied_at) VALUES (?,?,?)",
+                        (version, f"{name} (stamped)", _utc_now_iso()),
+                    )
+                    stamped.append((version, name))
+            _validate_database(conn)
+            conn.commit()
+            return stamped
+        except Exception:
+            conn.rollback()
+            raise
+
+    applied = _applied_versions(conn) if _table_exists(conn, "schema_version") else set()
 
     pending = [(v, n, fn) for (v, n, fn) in MIGRATIONS if v not in applied]
+    if pending:
+        _backup(conn, db_path, pending[0][0])
 
     done = []
-    backed_up = False
     for version, name, fn in pending:
-        if not backed_up:
-            _backup(conn, db_path, version)
-            backed_up = True
+        conn.execute("BEGIN IMMEDIATE")
         try:
+            _ensure_schema_version(conn)
             fn(conn)
             conn.execute(
                 "INSERT INTO schema_version (version, name, applied_at) VALUES (?,?,?)",
                 (version, name, _utc_now_iso()),
             )
+            _validate_database(conn)
             conn.commit()
         except Exception:
             conn.rollback()
