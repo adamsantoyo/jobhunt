@@ -12,6 +12,7 @@ Covers the properties the stream's design depends on:
   * the pure-ASGI CSRF guard behaves exactly like the decorator it replaced
 """
 import asyncio
+import json
 import socket
 import threading
 import time
@@ -84,6 +85,200 @@ def test_running_sync_carries_live_state_and_hides_stale_error():
     assert (ev["running"], ev["kind"], ev["step"]) == (True, "full", "scrape:ats")
     assert (ev["done"], ev["total"], ev["line"]) == (2, 9, "scraping greenhouse")
     assert ev["last_error"] is None, "a live run must not surface the previous run's error"
+
+
+# ------------------------------------------------------- contained runners
+def run_with_script(monkeypatch, r, responses):
+    calls = []
+    scripted = iter(responses)
+
+    async def spawn(cmd, timeout, step_label):
+        calls.append((cmd, timeout, step_label))
+        return next(scripted)
+
+    events = []
+    ingests = []
+
+    async def ingest(kind):
+        ingests.append(kind)
+
+    monkeypatch.setattr(r, "_spawn", spawn)
+    monkeypatch.setattr(r, "_emit", events.append)
+    monkeypatch.setattr(r, "_ingest_and_done", ingest)
+    monkeypatch.setattr(r, "_persisted_attempt_count", lambda _step: None)
+    monkeypatch.setattr(r, "_persisted_capped_step", lambda: None)
+    return calls, events, ingests
+
+
+def test_full_sweep_executes_failing_step_twice_then_skips_and_ingests(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (0, [">>> scrape:bad", "[0/3 done] next: scrape:bad"]),
+        (0, [">>> scrape:bad", "[0/3 done] next: scrape:bad"]),
+        (0, ["skipped scrape:bad"]),
+        (0, [">>> score", "[3/3 done] next: DONE"]),
+    ])
+
+    asyncio.run(r._run_full())
+
+    skip_index = next(i for i, call in enumerate(calls) if call[0] == ["sweep.py", "--skip", "scrape:bad"])
+    assert sum(call[0] == ["sweep.py", "--next"] for call in calls[:skip_index]) == 2
+    assert [event["type"] for event in events].count("skipped") == 1
+    assert ingests == ["full"], "a degraded full sweep must still ingest"
+
+
+def test_full_sweep_bounds_timed_out_step_at_two_executions(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (None, [">>> scrape:slow"]),
+        (None, [">>> scrape:slow"]),
+        (0, ["skipped scrape:slow"]),
+        (0, [">>> score", "[2/2 done] next: DONE"]),
+    ])
+
+    asyncio.run(r._run_full())
+
+    skip_index = next(i for i, call in enumerate(calls) if call[0] == ["sweep.py", "--skip", "scrape:slow"])
+    assert sum(call[0] == ["sweep.py", "--next"] for call in calls[:skip_index]) == 2
+    assert any(event["type"] == "skipped" and event["step"] == "scrape:slow" for event in events)
+    assert ingests == ["full"]
+
+
+def test_full_sweep_honors_persisted_attempt_after_runner_restart(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (0, ["skipped scrape:bad"]),
+        (0, [">>> score", "[2/2 done] next: DONE"]),
+    ])
+    capped = iter(["scrape:bad", None])
+    monkeypatch.setattr(r, "_persisted_capped_step", lambda: next(capped))
+
+    asyncio.run(r._run_full())
+
+    skip_index = next(i for i, call in enumerate(calls) if call[0] == ["sweep.py", "--skip", "scrape:bad"])
+    assert sum(call[0] == ["sweep.py", "--next"] for call in calls[:skip_index]) == 0
+    assert any(event["type"] == "skipped" and event["step"] == "scrape:bad" for event in events)
+    assert ingests == ["full"]
+
+
+def test_full_sweep_allows_only_second_execution_after_one_persisted_attempt(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (0, [">>> scrape:bad", "[0/2 done] next: scrape:bad"]),
+        (0, ["skipped scrape:bad"]),
+        (0, [">>> score", "[2/2 done] next: DONE"]),
+    ])
+    monkeypatch.setattr(
+        r, "_persisted_attempt_count", lambda step: 2 if step == "scrape:bad" else 1
+    )
+
+    asyncio.run(r._run_full())
+
+    skip_index = next(i for i, call in enumerate(calls) if call[0] == ["sweep.py", "--skip", "scrape:bad"])
+    assert sum(call[0] == ["sweep.py", "--next"] for call in calls[:skip_index]) == 1
+    assert any(event["type"] == "skipped" and event["step"] == "scrape:bad" for event in events)
+    assert ingests == ["full"]
+
+
+def test_persisted_cap_never_skips_fixture_gate(monkeypatch, tmp_path):
+    state_path = tmp_path / "sweep_state.json"
+    state_path.write_text(json.dumps({
+        "tests": {"status": "failed", "attempts": [{}, {}]},
+        "scrape:bad": {"status": "failed", "attempts": [{}, {}]},
+    }))
+    monkeypatch.setattr(sweeprunner.config, "RESULTS", tmp_path)
+
+    assert Runner._persisted_capped_step() == "scrape:bad"
+
+
+def test_fixture_failure_aborts_immediately_without_skip_or_ingest(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (2, [">>> tests", "FIXTURES FAILED — sweep aborted per rubric gate."]),
+    ])
+
+    asyncio.run(r._run_full())
+
+    assert len(calls) == 1
+    assert [event["type"] for event in events] == ["error"]
+    assert ingests == []
+
+
+def test_full_sweep_rejects_output_without_a_step_marker(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (0, ["unexpected output"]),
+    ])
+
+    asyncio.run(r._run_full())
+
+    assert len(calls) == 1
+    assert events[-1]["type"] == "error"
+    assert "no step marker" in events[-1]["message"]
+    assert ingests == []
+
+
+def test_full_sweep_requires_successful_skip_command(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (0, [">>> scrape:bad", "[0/2 done] next: scrape:bad"]),
+        (0, [">>> scrape:bad", "[0/2 done] next: scrape:bad"]),
+        (1, ["unknown step: scrape:bad"]),
+    ])
+
+    asyncio.run(r._run_full())
+
+    assert len(calls) == 3
+    assert events[-1]["type"] == "error"
+    assert "failed to skip" in events[-1]["message"]
+    assert not any(event["type"] == "skipped" for event in events)
+    assert ingests == []
+
+
+def test_full_sweep_requires_confirmed_reset(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (0, ["DONE — all steps complete."]),
+        (0, ["reset output missing confirmation"]),
+    ])
+
+    asyncio.run(r._run_full())
+
+    assert calls[1][0] == ["sweep.py", "--reset"]
+    assert events[-1]["type"] == "error"
+    assert "failed to reset" in events[-1]["message"]
+    assert ingests == []
+
+
+def test_quick_refresh_uses_short_stage_deadlines_and_fails_fast(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (0, ["scrape complete"]),
+        (None, ["description fetch stalled"]),
+    ])
+
+    asyncio.run(r._run_quick())
+
+    assert [(call[2], call[1]) for call in calls] == [("scrape:ats", 60), ("desc:ats", 60)]
+    assert events[-1]["type"] == "error"
+    assert events[-1]["step"] == "desc:ats"
+    assert ingests == []
+    assert all("build_tracker.py" not in call[0] for call in calls)
+
+
+def test_successful_quick_refresh_runs_only_three_pipeline_stages(monkeypatch):
+    r = fresh()
+    calls, events, ingests = run_with_script(monkeypatch, r, [
+        (0, ["scrape complete"]),
+        (0, ["descriptions complete"]),
+        (0, ["score complete"]),
+    ])
+
+    asyncio.run(r._run_quick())
+
+    assert [call[2] for call in calls] == ["scrape:ats", "desc:ats", "score"]
+    assert [call[1] for call in calls] == [60, 60, 60]
+    assert ingests == ["quick"]
 
 
 # ------------------------------------------------------------------ overflow

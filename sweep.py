@@ -6,10 +6,11 @@ Designed for ~45s execution windows: one chunk per call, state persisted between
   --reset       clear state for a fresh weekly run (keeps seen.jsonl ledger)
   --skip NAME   mark a persistently-stuck step done so --next moves past it
 """
-import json, os, subprocess, sys, time
+import json, os, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "results", "sweep_state.json")
+STEP_TIMEOUT = 25
 
 def _py(*a):
     return [sys.executable, *a]
@@ -71,11 +72,29 @@ STEPS = [
 ]
 
 def load():
-    return json.load(open(STATE)) if os.path.exists(STATE) else {}
+    if not os.path.exists(STATE):
+        return {}
+    with open(STATE) as f:
+        return json.load(f)
 
 def save(st):
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    json.dump(st, open(STATE, "w"), indent=1)
+    state_dir = os.path.dirname(STATE)
+    os.makedirs(state_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".sweep_state.", suffix=".tmp", dir=state_dir)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(st, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATE)
+        dir_fd = os.open(state_dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else "--next"
@@ -90,25 +109,44 @@ def main():
         name = sys.argv[2] if len(sys.argv) > 2 else ""
         if name not in {n for n, _ in STEPS}:
             print(f"unknown step: {name}"); sys.exit(1)
-        st[name] = {"status": "done", "skipped": True, "rc": None}
+        st[name] = {**st.get(name, {}), "status": "done", "skipped": True, "rc": None}
         save(st); print(f"skipped {name}"); return
     # --next
     for name, cmd in STEPS:
         if st.get(name, {}).get("status") == "done":
             continue
-        t0 = time.time()
+        started_at = time.time()
         print(f">>> {name}")
+        timed_out = False
         try:
-            p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=40)
+            p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=STEP_TIMEOUT)
             out = (p.stdout + p.stderr).strip()
             rc = p.returncode
         except subprocess.TimeoutExpired as e:
+            timed_out = True
             partial = "".join(s for s in (e.stdout, e.stderr) if isinstance(s, str))
-            out = (partial.strip() + "\n[timeout] step exceeded the 40s window; marked failed, retried next call").strip()
+            out = (partial.strip() + f"\n[timeout] step exceeded the {STEP_TIMEOUT}s window; marked failed, retried next call").strip()
             rc = -9
         print(out[-1200:])
         ok = rc == 0
-        st[name] = {"status": "done" if ok else "failed", "secs": round(time.time() - t0), "rc": rc}
+        finished_at = time.time()
+        previous = st.get(name, {})
+        attempts = list(previous.get("attempts") or [])
+        attempts.append({
+            "attempt": len(attempts) + 1,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "secs": round(finished_at - started_at, 3),
+            "rc": rc,
+            "timed_out": timed_out,
+        })
+        st[name] = {
+            **previous,
+            "status": "done" if ok else "failed",
+            "secs": round(finished_at - started_at),
+            "rc": rc,
+            "attempts": attempts,
+        }
         save(st)
         if name == "tests" and not ok:
             print("FIXTURES FAILED — sweep aborted per rubric gate."); sys.exit(2)

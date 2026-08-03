@@ -4,7 +4,7 @@ A single module-level Runner drives pipeline subprocesses via asyncio, fans SSE
 events out to any number of subscribers, and re-ingests on success. All pipeline
 commands run with cwd=ROOT via PIPELINE_PY (the pipeline's 3.14 venv).
 
-Guards (full sweep): 45-min wall-clock cap; per-step attempt cap of 25 -> run
+Guards (full sweep): 45-min wall-clock cap; per-step execution cap of 2 -> run
 `sweep.py --skip <step>`; abort with no ingest if output contains FIXTURES FAILED;
 refuse to start if an external sweep touched results/sweep_state.json in the last
 3 minutes.
@@ -20,18 +20,16 @@ import uuid
 
 from . import config
 
-# Quick refresh: the reliable everyday path (ATS re-scrape + score + build).
+# Quick refresh: the reliable everyday path (ATS re-scrape + descriptions + score).
 QUICK_STEPS = [
-    ("scrape:ats", ["scraper.py", "--only", "ats"]),
-    ("desc:ats", ["rubric.py", "fetch", "--group", "ats"]),
-    ("score", ["rubric.py", "score"]),
-    ("build", ["build_tracker.py"]),
+    ("scrape:ats", ["scraper.py", "--only", "ats"], 60),
+    ("desc:ats", ["rubric.py", "fetch", "--group", "ats"], 60),
+    ("score", ["rubric.py", "score"], 60),
 ]
 
-QUICK_STEP_TIMEOUT = 15 * 60      # 15 min per quick step
-SWEEP_NEXT_TIMEOUT = 120          # per `sweep.py --next` call (sweep caps steps at 40s)
+SWEEP_NEXT_TIMEOUT = 30           # per `sweep.py --next` call (sweep caps steps at 25s)
 SWEEP_WALL_CAP = 45 * 60          # total full-sweep wall clock
-SWEEP_STEP_ATTEMPT_CAP = 25       # attempts on the same step before --skip
+SWEEP_STEP_ATTEMPT_CAP = 2        # total executions of a failing step before --skip
 EXTERNAL_SWEEP_WINDOW = 180       # seconds: a fresh sweep_state.json => external run
 HEARTBEAT_SECS = 15
 STREAM_MAX_SECS = 300             # recycle an SSE connection rather than pin its socket
@@ -173,6 +171,40 @@ class Runner:
         # (our own just-finished sweep keeps its mtime for the whole window).
         return mtime > self._own_state_mtime + 1e-6
 
+    @staticmethod
+    def _persisted_attempt_count(step: str) -> int | None:
+        """Attempt count written by sweep.py, or None when state is unavailable.
+
+        The runner's in-memory counter resets with the backend process. Reconciling
+        it with the durable history keeps the execution cap true across restarts.
+        """
+        try:
+            with open(config.RESULTS / "sweep_state.json", encoding="utf-8") as f:
+                state = json.load(f)
+            attempts = (state.get(step) or {}).get("attempts")
+            return len(attempts) if isinstance(attempts, list) else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _persisted_capped_step() -> str | None:
+        """Return the pending step whose durable history already reached the cap."""
+        try:
+            with open(config.RESULTS / "sweep_state.json", encoding="utf-8") as f:
+                state = json.load(f)
+            for step, record in state.items():
+                if step == "tests":
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                attempts = record.get("attempts")
+                if record.get("status") != "done" and isinstance(attempts, list) \
+                        and len(attempts) >= SWEEP_STEP_ATTEMPT_CAP:
+                    return step
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return None
+
     # ---------------------------------------------------------------- control
     async def start(self, kind: str):
         """Returns (ok, detail). Second start while running or external -> (False, msg)."""
@@ -280,20 +312,20 @@ class Runner:
 
     async def _run_quick(self):
         self.total = len(QUICK_STEPS)
-        for i, (label, cmd) in enumerate(QUICK_STEPS):
+        for i, (label, cmd, timeout) in enumerate(QUICK_STEPS):
             if self._cancel:
                 self._emit({"type": "error", "kind": "quick", "message": "cancelled"})
                 return
             self.step = label
             self.done = i
             self._emit({"type": "step", "kind": "quick", "step": label, "done": i, "total": self.total})
-            rc, _ = await self._spawn(cmd, QUICK_STEP_TIMEOUT, label)
+            rc, _ = await self._spawn(cmd, timeout, label)
             if self._cancel:
                 self._emit({"type": "error", "kind": "quick", "message": "cancelled"})
                 return
             if rc is None:
                 self._emit({"type": "error", "kind": "quick", "step": label,
-                            "message": f"step {label} exceeded the 15m window and was killed"})
+                            "message": f"step {label} exceeded its {timeout}s deadline and was killed"})
                 return
             if rc != 0:
                 self._emit({"type": "error", "kind": "quick", "step": label,
@@ -316,8 +348,31 @@ class Runner:
                             "message": "wall-clock cap (45m) exceeded; stopping"})
                 return
 
+            capped_step = self._persisted_capped_step()
+            if capped_step:
+                skip_rc, skip_lines = await self._spawn(
+                    ["sweep.py", "--skip", capped_step], 60, capped_step
+                )
+                self._mark_own_sweep_write()
+                if self._cancel:
+                    self._emit({"type": "error", "kind": "full", "message": "cancelled"})
+                    return
+                if skip_rc != 0 or not any(
+                    line.strip() == f"skipped {capped_step}" for line in skip_lines
+                ):
+                    self._emit({"type": "error", "kind": "full", "step": capped_step,
+                                "message": f"failed to skip stuck step {capped_step} (rc={skip_rc})"})
+                    return
+                self._emit({"type": "skipped", "kind": "full", "step": capped_step,
+                            "message": f"skipped stuck step {capped_step} after "
+                                       f"{SWEEP_STEP_ATTEMPT_CAP} attempts"})
+                continue
+
             rc, lines = await self._spawn(["sweep.py", "--next"], SWEEP_NEXT_TIMEOUT, self.step or "sweep")
             self._mark_own_sweep_write()
+            if self._cancel:
+                self._emit({"type": "error", "kind": "full", "message": "cancelled"})
+                return
             text = "\n".join(lines)
 
             if "FIXTURES FAILED" in text:
@@ -342,6 +397,9 @@ class Runner:
                 self.step = cur_step
                 steps_run += 1
                 attempts[cur_step] = attempts.get(cur_step, 0) + 1
+                persisted = self._persisted_attempt_count(cur_step)
+                if persisted is not None:
+                    attempts[cur_step] = max(attempts[cur_step], persisted)
                 self._emit({"type": "step", "kind": "full", "step": cur_step,
                             "done": self.done, "total": self.total})
 
@@ -351,28 +409,57 @@ class Runner:
                     # sweep_state.json is a stale all-done file from a PREVIOUS completed
                     # sweep — without a reset this run would be a silent no-op. A partial
                     # state (some steps pending) never hits this: --next runs a real step.
-                    await self._spawn(["sweep.py", "--reset"], 60, "reset")
+                    reset_rc, reset_lines = await self._spawn(["sweep.py", "--reset"], 60, "reset")
                     self._mark_own_sweep_write()
+                    if self._cancel:
+                        self._emit({"type": "error", "kind": "full", "message": "cancelled"})
+                        return
+                    if reset_rc != 0 or not any(line.strip() == "state reset" for line in reset_lines):
+                        self._emit({"type": "error", "kind": "full", "step": "reset",
+                                    "message": f"failed to reset sweep state (rc={reset_rc})"})
+                        return
                     did_reset = True
                     self._emit({"type": "log", "kind": "full",
                                 "line": "[info] previous sweep was complete; state reset for a fresh run"})
                     continue
                 break
 
+            if rc is not None and rc != 0:
+                self._emit({"type": "error", "kind": "full", "step": cur_step,
+                            "message": f"sweep.py --next failed (rc={rc})"})
+                return
+
+            if not cur_step:
+                self._emit({"type": "error", "kind": "full",
+                            "message": "sweep.py --next returned no step marker; stopping"})
+                return
+
+            if rc is not None and (done is None or nxt is None):
+                self._emit({"type": "error", "kind": "full", "step": cur_step,
+                            "message": f"sweep.py --next returned unparseable progress for {cur_step}; stopping"})
+                return
+
             # Persistently-stuck step -> skip past it.
-            if cur_step and attempts.get(cur_step, 0) > SWEEP_STEP_ATTEMPT_CAP:
-                await self._spawn(["sweep.py", "--skip", cur_step], 60, cur_step)
+            step_still_pending = rc is None or nxt == cur_step
+            if step_still_pending and attempts.get(cur_step, 0) >= SWEEP_STEP_ATTEMPT_CAP:
+                skip_rc, skip_lines = await self._spawn(["sweep.py", "--skip", cur_step], 60, cur_step)
                 self._mark_own_sweep_write()
+                if self._cancel:
+                    self._emit({"type": "error", "kind": "full", "message": "cancelled"})
+                    return
+                if skip_rc != 0 or not any(line.strip() == f"skipped {cur_step}" for line in skip_lines):
+                    self._emit({"type": "error", "kind": "full", "step": cur_step,
+                                "message": f"failed to skip stuck step {cur_step} (rc={skip_rc})"})
+                    return
                 self._emit({"type": "skipped", "kind": "full", "step": cur_step,
                             "message": f"skipped stuck step {cur_step} after {SWEEP_STEP_ATTEMPT_CAP} attempts"})
-                attempts[cur_step] = 0
                 continue
 
             if rc is None:
-                # --next itself hung past 120s (sweep caps steps at 40s). Loop; the
+                # --next itself hung past 30s (sweep caps steps at 25s). Loop; the
                 # attempt counter will skip a genuinely stuck step.
                 self._emit({"type": "log", "kind": "full", "step": cur_step,
-                            "line": "[warn] sweep.py --next exceeded 120s; retrying"})
+                            "line": f"[warn] sweep.py --next exceeded {SWEEP_NEXT_TIMEOUT}s; retrying"})
                 continue
 
         self.step = self.step or "done"
