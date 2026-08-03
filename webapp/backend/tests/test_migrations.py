@@ -19,7 +19,7 @@ import pytest
 from backend.config import STATUSES
 from backend.db import connect, init_db
 from backend.identity import seen_key as compute_seen_key
-from backend.migrations import MIGRATIONS, run_migrations
+from backend.migrations import MIGRATIONS, _migration_11_legacy_canonical_backfill, run_migrations
 
 CANONICAL_TABLES_BY_VERSION = {
     5: {"profile_versions"},
@@ -173,6 +173,19 @@ def build_v4_db(path):
     conn.close()
 
 
+def build_v10_db(path):
+    build_v4_db(path)
+    conn = connect(path)
+    import backend.migrations as migrations_mod
+    original = list(migrations_mod.MIGRATIONS)
+    migrations_mod.MIGRATIONS[:] = original[:10]
+    try:
+        run_migrations(conn, str(path))
+    finally:
+        migrations_mod.MIGRATIONS[:] = original
+    conn.close()
+
+
 def _objects(conn, object_type):
     return {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type=?", (object_type,)
@@ -206,7 +219,10 @@ def test_fresh_db_stamps_all_migrations_without_running_them(tmp_path):
     # review_* columns, applied_via present.
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_state)")}
     assert cols == {"seen_key", "url", "status", "notes", "follow_up_date", "applied_date",
-                     "starred", "hidden", "contact", "snoozed_until", "applied_via", "updated_at"}
+                     "starred", "hidden", "contact", "snoozed_until", "applied_via", "updated_at",
+                     "posting_id"}
+    event_cols = {r["name"] for r in conn.execute("PRAGMA table_info(state_events)")}
+    assert "posting_id" in event_cols
 
     # No backfill/migration events on an empty, never-migrated-for-real DB.
     assert conn.execute("SELECT COUNT(*) AS c FROM state_events").fetchone()["c"] == 0
@@ -243,7 +259,7 @@ def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
     upgraded_path = tmp_path / "upgraded_equivalent.db"
     build_v4_db(upgraded_path)
     upgraded = connect(upgraded_path)
-    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 11))
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 12))
 
     assert _canonical_structure(upgraded) == _canonical_structure(fresh)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -552,7 +568,7 @@ def test_malformed_source_health_does_not_abort_run_backfill(tmp_path):
     conn.commit()
 
     run_migrations(conn, str(path))
-    assert conn.execute("SELECT COUNT(*) FROM pipeline_runs").fetchone()[0] == 3
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_runs").fetchone()[0] == 4
     assert conn.execute("SELECT COUNT(*) FROM source_runs").fetchone()[0] == 0
     conn.close()
 
@@ -685,6 +701,410 @@ def test_posting_version_hash_is_scoped_to_posting(tmp_path):
     conn.execute(insert, ("v2", "p2", "same-content", "t0", "{}"))
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(insert, ("v3", "p1", "same-content", "t1", "{}"))
+    conn.close()
+
+
+def _build_backfill_v10(path):
+    build_v10_db(path)
+    conn = connect(path)
+    conn.execute("DELETE FROM state_events")
+    conn.execute("DELETE FROM job_state")
+    conn.execute("DELETE FROM jobs")
+    conn.execute("DELETE FROM job_history")
+
+    conn.executemany(
+        "INSERT INTO jobs (url, seen_key, tier, odds, odds_score, odds_why, is_new, title, "
+        "company, location, salary, salary_min, salary_max, posted, first_seen, remote, source, "
+        "also_seen_on, req_id, why, flags, desc_snippet, full_desc, latest_run, present) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("https://shared", "new-key", 4, "High", 88, "strong odds", 1, "New Role",
+             "Shared Co", "Remote", "$150k", 140000, 160000, "2026-07-03", "2026-07-03",
+             1, "ats", "board", "REQ-2", "excellent fit", '["visa"]', "snippet",
+             "Full current description", "2026-07-03", 1),
+            ("https://rich", "rich-key", 5, "Medium", 73, "credible", 0, "Platform Lead",
+             "Rich Co", "SF", "$200k", 190000, 220000, "2026-07-02", "2026-07-02",
+             0, "direct", None, "REQ-9", "rare match", '["onsite"]', "rich snippet",
+             "Rich database body", "2026-07-03", 1),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO job_history (url, run_date, seen_key, tier, odds, present) VALUES (?,?,?,?,?,?)",
+        [
+            ("https://shared", "2026-07-01", "old-key", 3, "Low", 1),
+            ("https://shared", "2026-07-03", "new-key", 4, "High", 1),
+            ("https://same-a", "2026-07-01", "same-key", 2, "Low", 1),
+            ("https://same-b", "2026-07-02", "same-key", 3, "Medium", 0),
+            ("https://rich", "2026-07-03", "rich-key", 5, "Medium", 1),
+            ("", "2026-07-02", "bad-key", 1, "Low", 1),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO job_state (seen_key, url, status, notes, follow_up_date, applied_date, "
+        "starred, hidden, contact, snoozed_until, applied_via, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("same-key", "https://same-b", "Interested", "ambiguous", None, None,
+             1, 0, "A", None, None, "2026-07-04T10:00:00"),
+            ("new-key", "https://shared", "Applied", "mapped", "2026-07-10", "2026-07-04",
+             0, 0, "B", None, "site", "2026-07-04T11:00:00"),
+            ("missing-key", None, "New", "orphan", None, None,
+             0, 1, "C", "2026-07-08", None, "2026-07-04T12:00:00"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO state_events (id, seen_key, url, field, old_value, new_value, at, source) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        [
+            (41, "same-key", "https://same-a", "status", None, "Interested",
+             "2026-07-04T10:00:00", "patch"),
+            (42, "new-key", "https://shared", "status", "Interested", "Applied",
+             "2026-07-04T11:00:00", "quick:applied"),
+            (43, "missing-key", None, "hidden", "0", "1",
+             "2026-07-04T12:00:00", "patch"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
+    fresh = connect(tmp_path / "fresh_v11.db")
+    init_db(fresh)
+    path = tmp_path / "v10_structure.db"
+    build_v10_db(path)
+    upgraded = connect(path)
+    assert run_migrations(upgraded, str(path)) == [(11, "legacy_canonical_backfill")]
+
+    for table in ("job_state", "state_events"):
+        fresh_columns = [(r["name"], r["type"], r["notnull"], r["pk"])
+                         for r in fresh.execute(f"PRAGMA table_info({table})")]
+        upgraded_columns = [(r["name"], r["type"], r["notnull"], r["pk"])
+                            for r in upgraded.execute(f"PRAGMA table_info({table})")]
+        assert upgraded_columns == fresh_columns
+        fresh_fks = {(r["from"], r["table"], r["to"], r["on_delete"])
+                     for r in fresh.execute(f"PRAGMA foreign_key_list({table})")}
+        upgraded_fks = {(r["from"], r["table"], r["to"], r["on_delete"])
+                        for r in upgraded.execute(f"PRAGMA foreign_key_list({table})")}
+        assert upgraded_fks == fresh_fks
+    assert upgraded.execute(
+        "SELECT sql FROM sqlite_master WHERE name='uq_job_state_posting_id'"
+    ).fetchone()[0] == fresh.execute(
+        "SELECT sql FROM sqlite_master WHERE name='uq_job_state_posting_id'"
+    ).fetchone()[0]
+    upgraded.close()
+    fresh.close()
+
+
+def test_legacy_canonical_backfill_preserves_lineages_history_content_and_state(tmp_path):
+    path = tmp_path / "backfill.db"
+    _build_backfill_v10(path)
+    conn = connect(path)
+    events_before = [dict(r) for r in conn.execute("SELECT * FROM state_events ORDER BY id")]
+
+    run_migrations(conn, str(path))
+
+    mappings = {(r["legacy_identity_value"], r["posting_id"]) for r in conn.execute(
+        "SELECT legacy_identity_value, posting_id FROM legacy_identity_map "
+        "WHERE legacy_identity_kind='lineage' AND namespace='legacy-db'"
+    )}
+    assert len(mappings) == 5
+    same_ids = {posting_id for value, posting_id in mappings if "same-key" in value}
+    assert len(same_ids) == 2
+
+    shared_aliases = conn.execute(
+        "SELECT pa.posting_id, pa.valid_to, m.legacy_identity_value "
+        "FROM posting_aliases pa JOIN legacy_identity_map m ON m.posting_id=pa.posting_id "
+        "WHERE pa.namespace='legacy-url' AND pa.value='https://shared' ORDER BY pa.valid_to"
+    ).fetchall()
+    assert len(shared_aliases) == 2
+    assert sum(r["valid_to"] is None for r in shared_aliases) == 1
+    assert "new-key" in next(r["legacy_identity_value"] for r in shared_aliases
+                             if r["valid_to"] is None)
+
+    assert conn.execute("SELECT COUNT(*) FROM job_history").fetchone()[0] == 6
+    assert conn.execute("SELECT COUNT(*) FROM run_postings").fetchone()[0] == 5
+    assert conn.execute(
+        "SELECT COUNT(*) FROM identity_migration_archive "
+        "WHERE artifact='job_history' AND reason='malformed lineage'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM run_postings WHERE first_seen_in_run=1"
+    ).fetchone()[0] == 5
+    shared_old = conn.execute(
+        "SELECT rp.posting_version_id, rp.present, rp.recorded_at FROM run_postings rp "
+        "JOIN legacy_identity_map m ON m.posting_id=rp.posting_id "
+        "WHERE m.legacy_identity_value LIKE '%old-key%'"
+    ).fetchone()
+    assert shared_old["posting_version_id"] is not None
+    assert (shared_old["present"], shared_old["recorded_at"]) == (1, "2026-07-01")
+    historical = conn.execute(
+        "SELECT version_kind, tier, odds FROM posting_versions WHERE posting_version_id=?",
+        (shared_old["posting_version_id"],),
+    ).fetchone()
+    assert tuple(historical) == ("legacy-history", 3, "Low")
+    assert conn.execute(
+        "SELECT title FROM compat_jobs WHERE url='https://shared'"
+    ).fetchone()[0] == "New Role"
+    current_rows = conn.execute(
+        "SELECT url, present FROM compat_jobs ORDER BY url"
+    ).fetchall()
+    assert [tuple(r) for r in current_rows] == [
+        ("https://rich", 1), ("https://shared", 1)
+    ]
+
+    rich = conn.execute(
+        "SELECT * FROM posting_versions WHERE title='Platform Lead'"
+    ).fetchone()
+    payload = json.loads(rich["payload_json"])
+    assert (rich["tier"], rich["odds"], rich["odds_score"], rich["odds_why"],
+            rich["why"], rich["flags"]) == (
+                5, "Medium", 73, "credible", "rare match", '["onsite"]'
+            )
+    assert payload["salary_min"] == 190000
+    assert payload["full_desc"] == "Rich database body"
+    score = conn.execute(
+        "SELECT * FROM score_versions WHERE posting_version_id=?", (rich["posting_version_id"],)
+    ).fetchone()
+    assert (score["profile_version_id"], score["scorer_hash"], score["tier"],
+            score["odds"], score["odds_score"]) == (
+                "legacy-import", "legacy-import", 5, "Medium", 73
+            )
+    assert json.loads(score["rationale_json"])["flags"] == '["onsite"]'
+    assert conn.execute(
+        "SELECT body FROM descriptions WHERE posting_id=?", (rich["posting_id"],)
+    ).fetchone()[0] == "Rich database body"
+    assert dict(conn.execute(
+        "SELECT profile_version_id, content_hash, profile_json FROM profile_versions "
+        "WHERE profile_version_id='legacy-import'"
+    ).fetchone()) == {
+        "profile_version_id": "legacy-import", "content_hash": "legacy-import", "profile_json": "{}"
+    }
+
+    states = {r["seen_key"]: r["posting_id"] for r in conn.execute(
+        "SELECT seen_key, posting_id FROM job_state"
+    )}
+    assert states["new-key"] is not None
+    assert states["same-key"] is None
+    assert states["missing-key"] is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM identity_migration_archive WHERE artifact='job_state'"
+    ).fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT posting_id FROM state_events WHERE id=42"
+    ).fetchone()[0] == states["new-key"]
+    assert conn.execute("SELECT posting_id FROM state_events WHERE id=41").fetchone()[0] is None
+    events_after = [dict(r) for r in conn.execute("SELECT * FROM state_events ORDER BY id")]
+    for row in events_after:
+        row.pop("posting_id")
+    assert events_after == events_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM identity_migration_archive WHERE artifact='state_event'"
+    ).fetchone()[0] == 2
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    conn.close()
+
+
+def test_recycled_url_alias_closes_at_next_first_seen(tmp_path):
+    path = tmp_path / "alias_bounds.db"
+    _build_backfill_v10(path)
+    conn = connect(path)
+    run_migrations(conn, str(path))
+
+    rows = conn.execute(
+        "SELECT valid_from, valid_to FROM posting_aliases "
+        "WHERE namespace='legacy-url' AND value='https://shared' ORDER BY valid_from"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("2026-07-01", "2026-07-03"), ("2026-07-03", None)
+    ]
+    conn.close()
+
+
+def test_current_job_without_history_gets_visible_run_membership(tmp_path):
+    path = tmp_path / "current_only.db"
+    build_v10_db(path)
+    conn = connect(path)
+    conn.execute(
+        "INSERT INTO jobs (url,seen_key,tier,title,latest_run,present) "
+        "VALUES ('https://current','current-key',4,'Current Role','2026-07-06',1)"
+    )
+    conn.commit()
+
+    run_migrations(conn, str(path))
+
+    row = conn.execute("SELECT title, tier FROM compat_jobs WHERE url='https://current'").fetchone()
+    assert tuple(row) == ("Current Role", 4)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM run_postings rp JOIN posting_aliases a "
+        "ON a.posting_id=rp.posting_id WHERE a.url='https://current'"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_conflicting_existing_history_mapping_rolls_back(tmp_path):
+    path = tmp_path / "history_conflict.db"
+    _build_backfill_v10(path)
+    conn = connect(path)
+    import backend.migrations as migrations_mod
+
+    real_insert = migrations_mod._legacy_uid
+    target_run = real_insert("pipeline_run", "2026-07-01")
+    target_posting = migrations_mod._lineage_posting_id("https://shared", "old-key")
+    conn.execute(
+        "INSERT INTO postings VALUES (?, 'active', 't0', 't0', NULL)", (target_posting,)
+    )
+    conn.execute(
+        "INSERT INTO pipeline_runs (run_uid,kind,status,legacy_run_date) "
+        "VALUES (?,'imported','imported','2026-07-01')",
+        (target_run,),
+    )
+    conn.execute(
+        "INSERT INTO run_postings "
+        "(run_uid,posting_id,present,first_seen_in_run,recorded_at) VALUES (?,?,0,0,'wrong')",
+        (target_run, target_posting),
+    )
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="mapping conflict"):
+        run_migrations(conn, str(path))
+    assert 11 not in {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
+    conn.close()
+
+
+def test_binary_state_archive_payload_is_reversible(tmp_path):
+    path = tmp_path / "binary_archive.db"
+    build_v10_db(path)
+    conn = connect(path)
+    conn.execute(
+        "INSERT INTO job_state (seen_key,notes,updated_at) VALUES ('missing',?,'t0')",
+        (sqlite3.Binary(b"\x00\xff"),),
+    )
+    conn.commit()
+
+    run_migrations(conn, str(path))
+
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM identity_migration_archive "
+        "WHERE artifact='job_state'"
+    ).fetchone()[0])
+    assert payload["notes"] == {"$type": "bytes", "base64": "AP8="}
+    conn.close()
+
+
+def test_migration_11_direct_rerun_is_idempotent(tmp_path):
+    path = tmp_path / "rerun_v11.db"
+    _build_backfill_v10(path)
+    conn = connect(path)
+    run_migrations(conn, str(path))
+    tables = ("postings", "posting_aliases", "identity_evidence", "legacy_identity_map",
+              "identity_migration_archive", "posting_versions", "descriptions",
+              "score_versions", "pipeline_runs", "run_postings")
+    before = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+              for table in tables}
+    state_before = [dict(r) for r in conn.execute("SELECT * FROM job_state ORDER BY seen_key")]
+    events_before = [dict(r) for r in conn.execute("SELECT * FROM state_events ORDER BY id")]
+
+    conn.execute("BEGIN IMMEDIATE")
+    _migration_11_legacy_canonical_backfill(conn)
+    conn.commit()
+
+    assert {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables} == before
+    assert [dict(r) for r in conn.execute("SELECT * FROM job_state ORDER BY seen_key")] == state_before
+    assert [dict(r) for r in conn.execute("SELECT * FROM state_events ORDER BY id")] == events_before
+    conn.close()
+
+
+def test_url_alias_observation_tie_is_deterministic_and_archived(tmp_path):
+    path = tmp_path / "alias_tie.db"
+    _build_backfill_v10(path)
+    conn = connect(path)
+    conn.execute(
+        "DELETE FROM job_history WHERE url='https://shared' AND seen_key='new-key'"
+    )
+    conn.execute(
+        "UPDATE jobs SET first_seen='2026-07-01', latest_run='2026-07-01' "
+        "WHERE url='https://shared'"
+    )
+    conn.commit()
+
+    run_migrations(conn, str(path))
+
+    aliases = conn.execute(
+        "SELECT posting_id, valid_to FROM posting_aliases "
+        "WHERE namespace='legacy-url' AND value='https://shared' ORDER BY posting_id"
+    ).fetchall()
+    assert len(aliases) == 2
+    active_before = next(r["posting_id"] for r in aliases if r["valid_to"] is None)
+    archive = conn.execute(
+        "SELECT candidate_posting_ids_json FROM identity_migration_archive "
+        "WHERE artifact='url_alias_ambiguity' AND locator='https://shared'"
+    ).fetchone()
+    assert json.loads(archive["candidate_posting_ids_json"]) == sorted(
+        r["posting_id"] for r in aliases
+    )
+
+    conn.execute("BEGIN IMMEDIATE")
+    _migration_11_legacy_canonical_backfill(conn)
+    conn.commit()
+    active_after = conn.execute(
+        "SELECT posting_id FROM posting_aliases WHERE namespace='legacy-url' "
+        "AND value='https://shared' AND valid_to IS NULL"
+    ).fetchone()[0]
+    assert active_after == active_before
+    conn.close()
+
+
+def test_migration_11_failure_rolls_back_columns_and_backfill(tmp_path):
+    path = tmp_path / "rollback_v11.db"
+    build_v10_db(path)
+    conn = connect(path)
+    conn.execute(
+        "CREATE TRIGGER fail_lineage BEFORE INSERT ON legacy_identity_map "
+        "BEGIN SELECT RAISE(ABORT, 'forced lineage failure'); END"
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced lineage failure"):
+        run_migrations(conn, str(path))
+
+    assert 11 not in {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
+    assert "posting_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(job_state)")}
+    assert "posting_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(state_events)")}
+    assert conn.execute("SELECT COUNT(*) FROM postings").fetchone()[0] == 0
+    conn.close()
+
+
+def test_state_posting_fk_and_partial_uniqueness(tmp_path):
+    conn = connect(tmp_path / "state_constraints.db")
+    init_db(conn)
+    conn.executemany(
+        "INSERT INTO postings VALUES (?,'active','t0','t0',NULL)", [("p1",), ("p2",)]
+    )
+    conn.execute(
+        "INSERT INTO job_state (seen_key, updated_at, posting_id) VALUES ('s1','t0','p1')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO job_state (seen_key, updated_at, posting_id) VALUES ('s2','t0','p1')"
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO state_events (seen_key,field,at,source,posting_id) "
+            "VALUES ('s1','status','t0','patch','missing')"
+        )
+    conn.execute(
+        "INSERT INTO state_events (seen_key,field,at,source,posting_id) "
+        "VALUES ('s1','status','t0','patch','p1')"
+    )
+    conn.execute(
+        "INSERT INTO state_events (seen_key,field,at,source,posting_id) "
+        "VALUES ('s1','notes','t1','patch','p1')"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM state_events WHERE posting_id='p1'").fetchone()[0] == 2
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM postings WHERE posting_id='p1'")
     conn.close()
 
 
@@ -875,7 +1295,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         raise RuntimeError("after ddl")
 
     orig = list(migrations_mod.MIGRATIONS)
-    migrations_mod.MIGRATIONS.append((11, "transactional_ddl_probe", create_then_boom))
+    migrations_mod.MIGRATIONS.append((12, "transactional_ddl_probe", create_then_boom))
     try:
         with pytest.raises(RuntimeError, match="after ddl"):
             run_migrations(conn, str(path))
@@ -886,7 +1306,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == set(range(1, 11))
+    assert versions == set(range(1, 12))
     conn.close()
 
 

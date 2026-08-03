@@ -27,8 +27,9 @@ CREATE TABLE IF NOT EXISTS job_state (
   status TEXT NOT NULL DEFAULT 'New', notes TEXT DEFAULT '',
   follow_up_date TEXT, applied_date TEXT, starred INTEGER NOT NULL DEFAULT 0,
   hidden INTEGER NOT NULL DEFAULT 0, contact TEXT DEFAULT '', snoozed_until TEXT,
-  applied_via TEXT,
-  updated_at TEXT NOT NULL);
+  updated_at TEXT NOT NULL,
+    applied_via TEXT,
+  posting_id TEXT REFERENCES postings(posting_id) ON DELETE RESTRICT);
 
 CREATE TABLE IF NOT EXISTS company_state (
   company TEXT PRIMARY KEY, contact TEXT DEFAULT '', notes TEXT DEFAULT '', updated_at TEXT NOT NULL);
@@ -90,18 +91,22 @@ def init_db(conn):
     from .migrations import (
         CANONICAL_DDL,
         JOB_STATE_ARCHIVE_DDL,
-        STATE_EVENTS_DDL,
+        STATE_EVENTS_CANONICAL_DDL,
         run_migrations,
     )
 
     fresh = _is_empty_database(conn)
     if not fresh and not _table_exists(conn, "jobs"):
-      raise RuntimeError("unsupported existing database: required jobs table is missing")
+        raise RuntimeError("unsupported existing database: required jobs table is missing")
     conn.executescript(DDL)
-    conn.executescript(STATE_EVENTS_DDL)       # events log is part of the baseline
+    conn.executescript(STATE_EVENTS_CANONICAL_DDL)  # events log is part of the baseline
     conn.executescript(JOB_STATE_ARCHIVE_DDL)  # collision archive (migration 3) too
     if fresh:
         conn.executescript(CANONICAL_DDL)
+        conn.execute(
+            "CREATE UNIQUE INDEX uq_job_state_posting_id "
+            "ON job_state(posting_id) WHERE posting_id IS NOT NULL"
+        )
     conn.commit()
     run_migrations(conn, _main_db_file(conn), fresh=fresh)
 

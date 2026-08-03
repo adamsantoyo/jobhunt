@@ -20,6 +20,8 @@ Design notes:
   local weeks from them. `schema_version.applied_at` and backup stamps use UTC — pure
   audit metadata, unrelated to the user-facing timeline.
 """
+import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -40,11 +42,17 @@ CREATE TABLE IF NOT EXISTS state_events (
   old_value TEXT,
   new_value TEXT,
   at TEXT NOT NULL,            -- ISO8601 local (matches job_state timestamps)
-  source TEXT NOT NULL         -- 'patch' | 'quick:<action>' | 'backfill' | 'ingest:picks' | 'migration'
+    source TEXT NOT NULL         -- 'patch' | 'quick:<action>' | 'backfill' | 'ingest:picks' | 'migration'
 );
 CREATE INDEX IF NOT EXISTS idx_events_seen_at ON state_events(seen_key, at);
 CREATE INDEX IF NOT EXISTS idx_events_field_at ON state_events(field, at);
 """
+
+STATE_EVENTS_CANONICAL_DDL = STATE_EVENTS_DDL.replace(
+    "  source TEXT NOT NULL         -- 'patch' | 'quick:<action>' | 'backfill' | 'ingest:picks' | 'migration'\n",
+    "  source TEXT NOT NULL,        -- 'patch' | 'quick:<action>' | 'backfill' | 'ingest:picks' | 'migration'\n"
+    "  posting_id TEXT REFERENCES postings(posting_id) ON DELETE RESTRICT\n",
+)
 
 # Archive of job_state rows that lose a seen_key collision during migration 3. A full
 # copy of the old row (retired review columns included, so nothing is silently lost)
@@ -205,6 +213,7 @@ CONTENT_DDL = """
 CREATE TABLE IF NOT EXISTS posting_versions (
     posting_version_id TEXT PRIMARY KEY,
     posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    version_kind TEXT NOT NULL DEFAULT 'source',
     alias_id TEXT REFERENCES posting_aliases(alias_id) ON DELETE RESTRICT,
     source_run_id TEXT REFERENCES source_runs(source_run_id) ON DELETE RESTRICT,
     version_hash TEXT NOT NULL,
@@ -223,6 +232,12 @@ CREATE TABLE IF NOT EXISTS posting_versions (
     odds TEXT,
     odds_score INTEGER,
     odds_why TEXT,
+    is_new INTEGER,
+    first_seen TEXT,
+    also_seen_on TEXT,
+    desc_snippet TEXT,
+    latest_run TEXT,
+    present INTEGER,
     why TEXT,
     flags TEXT,
     payload_json TEXT NOT NULL
@@ -336,25 +351,26 @@ SELECT (SELECT a2.url FROM posting_aliases a2
     ORDER BY a2.valid_from DESC, a2.alias_id DESC LIMIT 1) AS url,
          p.posting_id AS seen_key, v.tier AS tier,
              v.odds AS odds, v.odds_score AS odds_score, v.odds_why AS odds_why,
-             0 AS is_new, v.title AS title, v.company AS company, v.location AS location,
+             COALESCE(v.is_new, 0) AS is_new, v.title AS title,
+             v.company AS company, v.location AS location,
              v.salary AS salary, v.salary_min AS salary_min, v.salary_max AS salary_max,
-             v.posted AS posted, p.first_seen_at AS first_seen, v.remote AS remote,
-             v.source AS source, NULL AS also_seen_on, v.req_id AS req_id,
-             v.why AS why, v.flags AS flags, substr(d.body, 1, 500) AS desc_snippet,
-             d.body AS full_desc, rp.run_uid AS latest_run, rp.present AS present
-FROM run_postings rp
-JOIN postings p ON p.posting_id = rp.posting_id
-LEFT JOIN posting_versions v ON v.posting_version_id = rp.posting_version_id
+             v.posted AS posted, COALESCE(v.first_seen, p.first_seen_at) AS first_seen,
+             v.remote AS remote, v.source AS source, v.also_seen_on AS also_seen_on,
+             v.req_id AS req_id, v.why AS why, v.flags AS flags,
+             COALESCE(v.desc_snippet, substr(d.body, 1, 500)) AS desc_snippet,
+             d.body AS full_desc, v.latest_run AS latest_run,
+             COALESCE(v.present, 1) AS present
+FROM postings p
+JOIN posting_versions v ON v.posting_version_id = (
+    SELECT v2.posting_version_id FROM posting_versions v2
+    WHERE v2.posting_id = p.posting_id AND v2.version_kind IN ('source', 'legacy-current')
+    ORDER BY v2.observed_at DESC, v2.posting_version_id DESC LIMIT 1
+)
 LEFT JOIN descriptions d ON d.description_id = (
     SELECT d2.description_id FROM descriptions d2
     WHERE d2.posting_id = p.posting_id ORDER BY d2.fetched_at DESC, d2.description_id DESC LIMIT 1
 )
-WHERE rp.run_uid = (
-    SELECT rp2.run_uid FROM run_postings rp2 JOIN pipeline_runs pr2 ON pr2.run_uid = rp2.run_uid
-    WHERE rp2.posting_id = rp.posting_id AND pr2.status IN ('done', 'imported')
-    ORDER BY COALESCE(pr2.finished_at, pr2.requested_at, pr2.legacy_run_date) DESC,
-             pr2.run_uid DESC LIMIT 1
-);
+;
 
 CREATE VIEW IF NOT EXISTS compat_runs AS
 SELECT legacy_run_date AS run_date, kept_count AS kept, new_count AS new_this_run,
@@ -713,6 +729,430 @@ def _migration_10_compatibility(conn: sqlite3.Connection) -> None:
     _execute_ddl(conn, COMPATIBILITY_DDL)
 
 
+_LEGACY_LINEAGE_NAMESPACE = uuid.UUID("7ae26166-7694-5a9d-9eb2-c7031f0ccdfe")
+_LEGACY_IMPORT_AT = "legacy-import"
+
+
+def _canonical_json(value) -> str:
+    def encode_special(item):
+        if isinstance(item, bytes):
+            return {"$type": "bytes", "base64": base64.b64encode(item).decode("ascii")}
+        raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        default=encode_special,
+    )
+
+
+def _stable_hash(value) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _lineage_value(url: str, seen_key: str) -> str:
+    return _canonical_json([url, seen_key])
+
+
+def _lineage_posting_id(url: str, seen_key: str) -> str:
+    return str(uuid.uuid5(_LEGACY_LINEAGE_NAMESPACE, _lineage_value(url, seen_key)))
+
+
+def _archive_identity(conn, artifact, locator, payload, reason, candidates=None) -> str:
+    payload_json = _canonical_json(payload)
+    payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    archive_id = str(uuid.uuid5(
+        _LEGACY_LINEAGE_NAMESPACE,
+        _canonical_json(["archive", artifact, locator, payload_hash]),
+    ))
+    conn.execute(
+        "INSERT OR IGNORE INTO identity_migration_archive "
+        "(archive_id, artifact, locator, payload_json, reason, "
+        "candidate_posting_ids_json, payload_hash, archived_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (archive_id, artifact, locator, payload_json, reason,
+         _canonical_json(sorted(candidates)) if candidates else None,
+         payload_hash, _LEGACY_IMPORT_AT),
+    )
+    return archive_id
+
+
+def _observation_bounds(conn, url, seen_key):
+    observed = [r[0] for r in conn.execute(
+        "SELECT run_date FROM job_history WHERE url=? AND seen_key=? "
+        "AND run_date IS NOT NULL AND trim(run_date)<>''",
+        (url, seen_key),
+    )]
+    current = conn.execute(
+        "SELECT first_seen, latest_run FROM jobs WHERE url=? AND seen_key=?",
+        (url, seen_key),
+    ).fetchone()
+    if current:
+        observed.extend(value for value in (current["first_seen"], current["latest_run"])
+                        if value is not None and str(value).strip())
+    if not observed:
+        return _LEGACY_IMPORT_AT, _LEGACY_IMPORT_AT
+    values = [str(value) for value in observed]
+    return min(values), max(values)
+
+
+def _ensure_posting_columns(conn):
+    state_columns = {r["name"] for r in conn.execute("PRAGMA table_info(job_state)")}
+    if "posting_id" not in state_columns:
+        conn.execute(
+            "ALTER TABLE job_state ADD COLUMN posting_id TEXT "
+            "REFERENCES postings(posting_id) ON DELETE RESTRICT"
+        )
+    event_columns = {r["name"] for r in conn.execute("PRAGMA table_info(state_events)")}
+    if "posting_id" not in event_columns:
+        conn.execute(
+            "ALTER TABLE state_events ADD COLUMN posting_id TEXT "
+            "REFERENCES postings(posting_id) ON DELETE RESTRICT"
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_state_posting_id "
+        "ON job_state(posting_id) WHERE posting_id IS NOT NULL"
+    )
+    version_columns = {r["name"] for r in conn.execute("PRAGMA table_info(posting_versions)")}
+    if "version_kind" not in version_columns:
+        conn.execute(
+            "ALTER TABLE posting_versions ADD COLUMN version_kind TEXT NOT NULL DEFAULT 'source'"
+        )
+    for name, column_type in (
+        ("is_new", "INTEGER"), ("first_seen", "TEXT"), ("also_seen_on", "TEXT"),
+        ("desc_snippet", "TEXT"), ("latest_run", "TEXT"), ("present", "INTEGER"),
+    ):
+        if name not in version_columns:
+            conn.execute(f"ALTER TABLE posting_versions ADD COLUMN {name} {column_type}")
+
+
+def _migration_11_legacy_canonical_backfill(conn: sqlite3.Connection) -> None:
+    _ensure_posting_columns(conn)
+    _migration_6_runs(conn)
+    for view in ("compat_jobs", "compat_runs", "compat_job_history"):
+        conn.execute(f"DROP VIEW IF EXISTS {view}")
+    _execute_ddl(conn, COMPATIBILITY_DDL)
+
+    state_before = [dict(r) for r in conn.execute(
+        "SELECT * FROM job_state ORDER BY seen_key"
+    )]
+    events_before = [dict(r) for r in conn.execute(
+        "SELECT * FROM state_events ORDER BY id"
+    )]
+    for row in state_before:
+        row.pop("posting_id", None)
+    for row in events_before:
+        row.pop("posting_id", None)
+
+    lineage_rows = conn.execute(
+        "SELECT url, seen_key FROM jobs UNION SELECT url, seen_key FROM job_history"
+    ).fetchall()
+    valid_lineages = []
+    for row in lineage_rows:
+        url, seen_key = row["url"], row["seen_key"]
+        if url is None or seen_key is None or not str(url).strip() or not str(seen_key).strip():
+            _archive_identity(
+                conn, "lineage", _lineage_value(url, seen_key),
+                {"url": url, "seen_key": seen_key}, "malformed lineage",
+            )
+            continue
+        valid_lineages.append((url, seen_key))
+
+    lineages = {}
+    for url, seen_key in valid_lineages:
+        posting_id = _lineage_posting_id(url, seen_key)
+        lineage_value = _lineage_value(url, seen_key)
+        first_seen, last_seen = _observation_bounds(conn, url, seen_key)
+        lineage_hash = _stable_hash({"url": url, "seen_key": seen_key})
+        lineages[(url, seen_key)] = {
+            "posting_id": posting_id,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO postings "
+            "(posting_id, identity_status, first_seen_at, created_at) "
+            "VALUES (?, 'active', ?, ?)",
+            (posting_id, first_seen, _LEGACY_IMPORT_AT),
+        )
+        conn.execute(
+            "UPDATE postings SET first_seen_at = MIN(first_seen_at, ?) WHERE posting_id=?",
+            (first_seen, posting_id),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO legacy_identity_map "
+            "(legacy_identity_kind, namespace, legacy_identity_value, posting_id, mapped_at, "
+            "provenance_json) VALUES ('lineage','legacy-db',?,?,?,?)",
+            (lineage_value, posting_id, _LEGACY_IMPORT_AT,
+             _canonical_json({"url": url, "seen_key": seen_key, "lineage_hash": lineage_hash})),
+        )
+        evidence_id = str(uuid.uuid5(
+            _LEGACY_LINEAGE_NAMESPACE, _canonical_json(["evidence", lineage_value])
+        ))
+        conn.execute(
+            "INSERT OR IGNORE INTO identity_evidence "
+            "(evidence_id, posting_id, evidence_kind, evidence_json, evidence_hash, observed_at) "
+            "VALUES (?,?,'legacy-lineage',?,?,?)",
+            (evidence_id, posting_id,
+             _canonical_json({"url": url, "seen_key": seen_key, "lineage_hash": lineage_hash}),
+             lineage_hash, first_seen),
+        )
+
+    by_url = {}
+    for (url, seen_key), lineage in lineages.items():
+        by_url.setdefault(url, []).append((seen_key, lineage))
+    for url, entries in by_url.items():
+        entries.sort(key=lambda item: (
+            item[1]["first_seen"], item[1]["last_seen"], item[0], item[1]["posting_id"]
+        ))
+        latest_at = entries[-1][1]["last_seen"]
+        tied = [entry[1]["posting_id"] for entry in entries
+                if entry[1]["last_seen"] == latest_at]
+        if len(tied) > 1:
+            _archive_identity(
+                conn, "url_alias_ambiguity", url,
+                {"url": url, "observed_at": latest_at},
+                "multiple lineages share latest URL observation", tied,
+            )
+        for index, (seen_key, lineage) in enumerate(entries):
+            valid_to = entries[index + 1][1]["first_seen"] if index + 1 < len(entries) else None
+            alias_id = str(uuid.uuid5(
+                _LEGACY_LINEAGE_NAMESPACE,
+                _canonical_json(["url-alias", url, seen_key]),
+            ))
+            conn.execute(
+                "INSERT OR IGNORE INTO posting_aliases "
+                "(alias_id, posting_id, alias_kind, namespace, value, url, provenance_json, "
+                "confidence, valid_from, valid_to) VALUES (?,?,'url','legacy-url',?,?,?,?,?,?)",
+                (alias_id, lineage["posting_id"], url, url,
+                 _canonical_json({"url": url, "seen_key": seen_key}), 1.0,
+                 lineage["first_seen"], valid_to),
+            )
+
+    profile_id = "legacy-import"
+    conn.execute(
+        "INSERT OR IGNORE INTO profile_versions "
+        "(profile_version_id, content_hash, profile_json, created_at) VALUES (?,?,?,?)",
+        (profile_id, "legacy-import", "{}", _LEGACY_IMPORT_AT),
+    )
+
+    current_versions = {}
+    for row in conn.execute("SELECT * FROM jobs ORDER BY url").fetchall():
+        lineage = lineages.get((row["url"], row["seen_key"]))
+        if lineage is None:
+            _archive_identity(
+                conn, "jobs", f"url:{row['url']}", dict(row), "malformed lineage"
+            )
+            continue
+        posting_id = lineage["posting_id"]
+        payload = dict(row)
+        payload_json = _canonical_json(payload)
+        version_hash = _stable_hash({"posting_id": posting_id, "payload": payload})
+        version_id = str(uuid.uuid5(
+            _LEGACY_LINEAGE_NAMESPACE,
+            _canonical_json(["posting-version", posting_id, version_hash]),
+        ))
+        observed_at = str(row["latest_run"] or row["first_seen"] or lineage["last_seen"])
+        conn.execute(
+            "INSERT OR IGNORE INTO posting_versions "
+            "(posting_version_id, posting_id, version_kind, version_hash, observed_at, title, company, "
+            "location, salary, salary_min, salary_max, posted, remote, source, req_id, tier, "
+            "odds, odds_score, odds_why, is_new, first_seen, also_seen_on, desc_snippet, "
+            "latest_run, present, why, flags, payload_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (version_id, posting_id, "legacy-current", version_hash, observed_at,
+             row["title"], row["company"],
+             row["location"], row["salary"], row["salary_min"], row["salary_max"],
+             row["posted"], row["remote"], row["source"], row["req_id"], row["tier"],
+             row["odds"], row["odds_score"], row["odds_why"], row["is_new"],
+             row["first_seen"], row["also_seen_on"], row["desc_snippet"], row["latest_run"],
+             row["present"], row["why"], row["flags"], payload_json),
+        )
+        current_versions[(row["url"], row["seen_key"])] = version_id
+        if row["full_desc"] is not None and str(row["full_desc"]).strip():
+            body = row["full_desc"]
+            provenance_hash = _stable_hash({"posting_id": posting_id, "source": "jobs.full_desc"})
+            description_id = str(uuid.uuid5(
+                _LEGACY_LINEAGE_NAMESPACE,
+                _canonical_json(["description", posting_id, provenance_hash]),
+            ))
+            conn.execute(
+                "INSERT OR IGNORE INTO descriptions "
+                "(description_id, posting_id, posting_version_id, provenance_hash, content_hash, "
+                "fetch_status, body, fetched_at, metadata_json) "
+                "VALUES (?,?,?,?,?,'available',?,?,?)",
+                (description_id, posting_id, version_id, provenance_hash,
+                 hashlib.sha256(body.encode("utf-8")).hexdigest(), body, observed_at,
+                 _canonical_json({"source": "legacy jobs.full_desc"})),
+            )
+        rationale = {
+            "odds_why": row["odds_why"], "why": row["why"], "flags": row["flags"]
+        }
+        score_material = {
+            "tier": row["tier"], "odds": row["odds"], "odds_score": row["odds_score"],
+            "rationale": rationale,
+        }
+        score_hash = _stable_hash({"posting_version_id": version_id, "score": score_material})
+        score_id = str(uuid.uuid5(
+            _LEGACY_LINEAGE_NAMESPACE,
+            _canonical_json(["score-version", version_id, score_hash]),
+        ))
+        conn.execute(
+            "INSERT OR IGNORE INTO score_versions "
+            "(score_version_id, posting_version_id, profile_version_id, score_hash, scorer_hash, "
+            "tier, odds, odds_score, rationale_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (score_id, version_id, profile_id, score_hash, "legacy-import", row["tier"],
+             row["odds"], row["odds_score"], _canonical_json(rationale), observed_at),
+        )
+
+    history_rows = conn.execute(
+        "SELECT rowid AS legacy_rowid, * FROM job_history ORDER BY run_date, rowid"
+    ).fetchall()
+    earliest_history = {}
+    for row in history_rows:
+        lineage = lineages.get((row["url"], row["seen_key"]))
+        if lineage:
+            earliest_history[lineage["posting_id"]] = min(
+                earliest_history.get(lineage["posting_id"], row["run_date"]), row["run_date"]
+            )
+    history_accounted = 0
+    for row in history_rows:
+        locator = f"rowid:{row['legacy_rowid']}"
+        lineage = lineages.get((row["url"], row["seen_key"]))
+        if lineage is None:
+            archive_id = _archive_identity(
+                conn, "job_history", locator, dict(row), "malformed lineage"
+            )
+            if conn.execute(
+                "SELECT 1 FROM identity_migration_archive WHERE archive_id=?", (archive_id,)
+            ).fetchone() is None:
+                raise RuntimeError(f"job_history row was not archived: {locator}")
+            history_accounted += 1
+            continue
+        run_uid = _legacy_uid("pipeline_run", row["run_date"])
+        conn.execute(
+            "INSERT OR IGNORE INTO pipeline_runs "
+            "(run_uid, kind, status, legacy_run_date, trigger) "
+            "VALUES (?,'imported','imported',?,'legacy_migration')",
+            (run_uid, row["run_date"]),
+        )
+        history_payload = {
+            "url": row["url"], "run_date": row["run_date"],
+            "seen_key": row["seen_key"], "tier": row["tier"],
+            "odds": row["odds"], "present": row["present"],
+        }
+        history_hash = _stable_hash({
+            "posting_id": lineage["posting_id"], "history": history_payload,
+        })
+        version_id = str(uuid.uuid5(
+            _LEGACY_LINEAGE_NAMESPACE,
+            _canonical_json(["history-version", lineage["posting_id"], history_hash]),
+        ))
+        conn.execute(
+            "INSERT OR IGNORE INTO posting_versions "
+            "(posting_version_id, posting_id, version_kind, version_hash, observed_at, "
+            "tier, odds, payload_json) VALUES (?,?,?,?,?,?,?,?)",
+            (version_id, lineage["posting_id"], "legacy-history", history_hash, row["run_date"],
+             row["tier"], row["odds"], _canonical_json(history_payload)),
+        )
+        expected = (
+            version_id, row["present"],
+            int(row["run_date"] == earliest_history[lineage["posting_id"]]), row["run_date"],
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO run_postings "
+            "(run_uid, posting_id, posting_version_id, present, first_seen_in_run, recorded_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (run_uid, lineage["posting_id"], *expected),
+        )
+        mapped = conn.execute(
+            "SELECT posting_version_id, present, first_seen_in_run, recorded_at "
+            "FROM run_postings WHERE run_uid=? AND posting_id=?",
+            (run_uid, lineage["posting_id"]),
+        ).fetchone()
+        if mapped is None or tuple(mapped) != expected:
+            raise RuntimeError(f"job_history row mapping conflict: {locator}")
+        history_accounted += 1
+
+    for row in conn.execute("SELECT * FROM jobs ORDER BY url").fetchall():
+        lineage = lineages.get((row["url"], row["seen_key"]))
+        version_id = current_versions.get((row["url"], row["seen_key"]))
+        if lineage is None or version_id is None:
+            continue
+        run_date = row["latest_run"] or row["first_seen"] or lineage["last_seen"]
+        run_uid = _legacy_uid("pipeline_run", run_date)
+        conn.execute(
+            "INSERT OR IGNORE INTO pipeline_runs "
+            "(run_uid, kind, status, legacy_run_date, trigger) "
+            "VALUES (?,'imported','imported',?,'legacy_migration')",
+            (run_uid, run_date),
+        )
+        existing = conn.execute(
+            "SELECT 1 FROM run_postings WHERE run_uid=? AND posting_id=?",
+            (run_uid, lineage["posting_id"]),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO run_postings "
+                "(run_uid, posting_id, posting_version_id, present, first_seen_in_run, recorded_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (run_uid, lineage["posting_id"], version_id, row["present"],
+                 int(lineage["posting_id"] not in earliest_history), run_date),
+            )
+
+    by_seen_key = {}
+    for (_url, seen_key), lineage in lineages.items():
+        by_seen_key.setdefault(seen_key, set()).add(lineage["posting_id"])
+    for row in conn.execute("SELECT rowid AS legacy_rowid, * FROM job_state").fetchall():
+        candidates = sorted(by_seen_key.get(row["seen_key"], set()))
+        if len(candidates) == 1:
+            conn.execute("UPDATE job_state SET posting_id=? WHERE rowid=?",
+                         (candidates[0], row["legacy_rowid"]))
+        else:
+            conn.execute("UPDATE job_state SET posting_id=NULL WHERE rowid=?", (row["legacy_rowid"],))
+            _archive_identity(conn, "job_state", f"rowid:{row['legacy_rowid']}", dict(row),
+                              "canonical lineage resolution was not unique", candidates)
+    for row in conn.execute("SELECT * FROM state_events ORDER BY id").fetchall():
+        candidates = sorted(by_seen_key.get(row["seen_key"], set()))
+        if len(candidates) == 1:
+            conn.execute("UPDATE state_events SET posting_id=? WHERE id=?",
+                         (candidates[0], row["id"]))
+        else:
+            conn.execute("UPDATE state_events SET posting_id=NULL WHERE id=?", (row["id"],))
+            _archive_identity(conn, "state_event", f"id:{row['id']}", dict(row),
+                              "canonical lineage resolution was not unique", candidates)
+
+    mapped_lineages = sum(
+        conn.execute(
+            "SELECT posting_id FROM legacy_identity_map WHERE legacy_identity_kind='lineage' "
+            "AND namespace='legacy-db' AND legacy_identity_value=?",
+            (_lineage_value(url, seen_key),),
+        ).fetchone()[0] == lineage["posting_id"]
+        for (url, seen_key), lineage in lineages.items()
+    )
+    if mapped_lineages != len(valid_lineages):
+        raise RuntimeError(
+            f"lineage accounting mismatch: {len(valid_lineages)} valid, {mapped_lineages} mapped"
+        )
+    if history_accounted != len(history_rows):
+        raise RuntimeError(
+            f"history accounting mismatch: {len(history_rows)} rows, {history_accounted} accounted"
+        )
+    state_after = [dict(r) for r in conn.execute("SELECT * FROM job_state ORDER BY seen_key")]
+    events_after = [dict(r) for r in conn.execute("SELECT * FROM state_events ORDER BY id")]
+    for row in state_after:
+        row.pop("posting_id", None)
+    for row in events_after:
+        row.pop("posting_id", None)
+    if state_after != state_before or events_after != events_before:
+        raise RuntimeError("state or event content changed during canonical backfill")
+    for lineage in lineages.values():
+        first_seen = conn.execute(
+            "SELECT first_seen_at FROM postings WHERE posting_id=?", (lineage["posting_id"],)
+        ).fetchone()[0]
+        if first_seen > lineage["first_seen"]:
+            raise RuntimeError(f"posting first_seen moved later: {lineage['posting_id']}")
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
@@ -725,6 +1165,7 @@ MIGRATIONS = [
     (8, "posting_content", _migration_8_content),
     (9, "canonical_decisions", _migration_9_decisions),
     (10, "canonical_compatibility", _migration_10_compatibility),
+    (11, "legacy_canonical_backfill", _migration_11_legacy_canonical_backfill),
 ]
 
 
