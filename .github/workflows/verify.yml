@@ -1,0 +1,32 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Sync locked Python environment
+        run: uv sync --frozen --all-groups
+      - name: Run pipeline fixtures
+        run: |
+          cp config.example.json config.json
+          uv run --frozen python tests.py
+      - name: Run Python tests
+        run: uv run --frozen pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: webapp/frontend/package-lock.json
+      - name: Build frontend
+        run: npm --prefix webapp/frontend ci && npm --prefix webapp/frontend run build

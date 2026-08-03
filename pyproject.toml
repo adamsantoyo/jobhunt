@@ -1,0 +1,29 @@
+[project]
+name = "jobhunt-local"
+version = "0.1.0"
+description = "Local job discovery, scoring, and application command center"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "fastapi==0.139.2",
+  "openpyxl==3.1.5",
+  "pydantic==2.13.4",
+  "python-jobspy==1.1.82",
+  "requests==2.34.2",
+  "uvicorn[standard]==0.51.0",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.79,<1"]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.2",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["webapp"]
+testpaths = ["test_sweep_state.py", "webapp/backend/tests"]

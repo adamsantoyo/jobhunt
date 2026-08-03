@@ -28,11 +28,10 @@ tests.py             regression fixtures for the rubric engine (run before every
 ## Setup
 
 ```bash
-python3 -m venv .venv
-./.venv/bin/pip install python-jobspy openpyxl requests
-# optional: the LLM judgment pass (llm_review.py) uses the Anthropic SDK when
-# ANTHROPIC_API_KEY is set, and otherwise falls back to the local `claude` CLI:
-./.venv/bin/pip install anthropic
+brew install uv
+uv sync --frozen --all-groups
+# optional SDK support for llm_review.py (otherwise it falls back to the local CLI):
+uv sync --frozen --all-groups --extra llm
 cp config.example.json config.json      # then edit the "profile" block for yourself
 ```
 
@@ -42,17 +41,23 @@ experience, level, domain, comp, and location preferences.
 ## Run a sweep
 
 ```bash
-./.venv/bin/python sweep.py --next     # repeat until DONE (tests gate → scrape → desc → score → build)
-./.venv/bin/python sweep.py --status   # progress
-./.venv/bin/python sweep.py --reset    # fresh run (keeps the seen.jsonl ledger)
+uv run --frozen python sweep.py --next     # repeat until DONE
+uv run --frozen python sweep.py --status   # progress
+uv run --frozen python sweep.py --reset    # fresh run (keeps seen.jsonl)
 ```
 
 Then, optionally, the LLM judgment pass over borderline tiers:
 
 ```bash
-./.venv/bin/python llm_review.py       # needs ANTHROPIC_API_KEY, or falls back to the `claude` CLI
-./.venv/bin/python build_tracker.py    # rebuild with adjusted tiers
+uv run --frozen python llm_review.py       # API key/SDK, or local CLI fallback
+uv run --frozen python build_tracker.py    # explicit Excel export
 ```
+
+Run the local command center with `bash webapp/run.sh`.
+The launcher preserves optional lock-managed packages already installed in `.venv`.
+
+Verification: `uv run --frozen python tests.py`, `uv run --frozen pytest -q`, and
+`npm --prefix webapp/frontend ci && npm --prefix webapp/frontend run build`.
 
 ## Notes
 
