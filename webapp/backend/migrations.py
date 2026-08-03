@@ -391,6 +391,27 @@ LEFT JOIN posting_versions v ON v.posting_version_id = rp.posting_version_id
 WHERE pr.status IN ('done', 'imported');
 """
 
+LEGACY_ARTIFACT_IMPORTS_DDL = """
+CREATE TABLE IF NOT EXISTS legacy_artifact_imports (
+    import_id TEXT PRIMARY KEY,
+    artifact_kind TEXT NOT NULL,
+    artifact_path TEXT NOT NULL,
+    artifact_hash TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    processed_count INTEGER NOT NULL DEFAULT 0 CHECK (processed_count >= 0),
+    mapped_count INTEGER NOT NULL DEFAULT 0 CHECK (mapped_count >= 0),
+    duplicate_count INTEGER NOT NULL DEFAULT 0 CHECK (duplicate_count >= 0),
+    malformed_count INTEGER NOT NULL DEFAULT 0 CHECK (malformed_count >= 0),
+    archived_count INTEGER NOT NULL DEFAULT 0 CHECK (archived_count >= 0),
+    counts_json TEXT,
+    error_json TEXT,
+    UNIQUE (artifact_kind, artifact_hash)
+);
+"""
+
 CANONICAL_DDL = "\n".join((
         PROFILE_VERSIONS_DDL,
         RUNS_DDL,
@@ -398,6 +419,7 @@ CANONICAL_DDL = "\n".join((
         CONTENT_DDL,
         DECISIONS_DDL,
         COMPATIBILITY_DDL,
+        LEGACY_ARTIFACT_IMPORTS_DDL,
 ))
 
 
@@ -1153,6 +1175,10 @@ def _migration_11_legacy_canonical_backfill(conn: sqlite3.Connection) -> None:
             raise RuntimeError(f"posting first_seen moved later: {lineage['posting_id']}")
 
 
+def _migration_12_legacy_artifact_imports(conn: sqlite3.Connection) -> None:
+    _execute_ddl(conn, LEGACY_ARTIFACT_IMPORTS_DDL)
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
@@ -1166,6 +1192,7 @@ MIGRATIONS = [
     (9, "canonical_decisions", _migration_9_decisions),
     (10, "canonical_compatibility", _migration_10_compatibility),
     (11, "legacy_canonical_backfill", _migration_11_legacy_canonical_backfill),
+    (12, "legacy_artifact_imports", _migration_12_legacy_artifact_imports),
 ]
 
 

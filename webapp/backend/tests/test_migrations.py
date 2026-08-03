@@ -29,6 +29,7 @@ CANONICAL_TABLES_BY_VERSION = {
     8: {"posting_versions", "descriptions"},
     9: {"score_versions", "llm_reviews", "recommendations", "recommendation_events"},
     10: {"run_postings"},
+    12: {"legacy_artifact_imports"},
 }
 CANONICAL_VIEWS = {"compat_jobs", "compat_runs", "compat_job_history"}
 
@@ -186,6 +187,19 @@ def build_v10_db(path):
     conn.close()
 
 
+def build_v11_db(path):
+    build_v10_db(path)
+    conn = connect(path)
+    import backend.migrations as migrations_mod
+    original = list(migrations_mod.MIGRATIONS)
+    migrations_mod.MIGRATIONS[:] = original[:11]
+    try:
+        run_migrations(conn, str(path))
+    finally:
+        migrations_mod.MIGRATIONS[:] = original
+    conn.close()
+
+
 def _objects(conn, object_type):
     return {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type=?", (object_type,)
@@ -259,7 +273,7 @@ def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
     upgraded_path = tmp_path / "upgraded_equivalent.db"
     build_v4_db(upgraded_path)
     upgraded = connect(upgraded_path)
-    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 12))
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 13))
 
     assert _canonical_structure(upgraded) == _canonical_structure(fresh)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -774,7 +788,10 @@ def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
     path = tmp_path / "v10_structure.db"
     build_v10_db(path)
     upgraded = connect(path)
-    assert run_migrations(upgraded, str(path)) == [(11, "legacy_canonical_backfill")]
+    assert run_migrations(upgraded, str(path)) == [
+        (11, "legacy_canonical_backfill"),
+        (12, "legacy_artifact_imports"),
+    ]
 
     for table in ("job_state", "state_events"):
         fresh_columns = [(r["name"], r["type"], r["notnull"], r["pk"])
@@ -792,6 +809,29 @@ def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
     ).fetchone()[0] == fresh.execute(
         "SELECT sql FROM sqlite_master WHERE name='uq_job_state_posting_id'"
     ).fetchone()[0]
+    upgraded.close()
+    fresh.close()
+
+
+def test_v11_upgrade_matches_fresh_legacy_import_ledger(tmp_path):
+    fresh = connect(tmp_path / "fresh_v12.db")
+    init_db(fresh)
+    path = tmp_path / "v11_structure.db"
+    build_v11_db(path)
+    upgraded = connect(path)
+
+    assert run_migrations(upgraded, str(path)) == [(12, "legacy_artifact_imports")]
+    assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(legacy_artifact_imports)")] == [
+        tuple(r) for r in fresh.execute("PRAGMA table_info(legacy_artifact_imports)")
+    ]
+    upgraded_sql = upgraded.execute(
+        "SELECT sql FROM sqlite_master WHERE name='legacy_artifact_imports'"
+    ).fetchone()[0]
+    fresh_sql = fresh.execute(
+        "SELECT sql FROM sqlite_master WHERE name='legacy_artifact_imports'"
+    ).fetchone()[0]
+    assert upgraded_sql == fresh_sql
+    assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
     upgraded.close()
     fresh.close()
 
@@ -1295,7 +1335,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         raise RuntimeError("after ddl")
 
     orig = list(migrations_mod.MIGRATIONS)
-    migrations_mod.MIGRATIONS.append((12, "transactional_ddl_probe", create_then_boom))
+    migrations_mod.MIGRATIONS.append((13, "transactional_ddl_probe", create_then_boom))
     try:
         with pytest.raises(RuntimeError, match="after ddl"):
             run_migrations(conn, str(path))
@@ -1306,7 +1346,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == set(range(1, 12))
+    assert versions == set(range(1, 13))
     conn.close()
 
 
