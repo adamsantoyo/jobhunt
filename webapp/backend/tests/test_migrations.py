@@ -10,6 +10,7 @@ Two DB shapes are exercised:
 Never touches webapp/app.db; every DB here lives under tmp_path.
 """
 import glob
+import json
 import os
 import sqlite3
 
@@ -19,6 +20,17 @@ from backend.config import STATUSES
 from backend.db import connect, init_db
 from backend.identity import seen_key as compute_seen_key
 from backend.migrations import MIGRATIONS, run_migrations
+
+CANONICAL_TABLES_BY_VERSION = {
+    5: {"profile_versions"},
+    6: {"pipeline_runs", "source_runs", "run_events"},
+    7: {"postings", "posting_aliases", "posting_redirects", "identity_evidence",
+        "legacy_identity_map", "identity_migration_archive"},
+    8: {"posting_versions", "descriptions"},
+    9: {"score_versions", "llm_reviews", "recommendations", "recommendation_events"},
+    10: {"run_postings"},
+}
+CANONICAL_VIEWS = {"compat_jobs", "compat_runs", "compat_job_history"}
 
 # The pre-Phase-0 schema (job_state keyed on url, review_* columns present, no
 # schema_version / state_events / job_state_archive). Captured from the DDL at
@@ -148,6 +160,35 @@ def build_old_db(path):
     )
 
 
+def build_v4_db(path):
+    build_old_db(path)
+    conn = connect(path)
+    import backend.migrations as migrations_mod
+    original = list(migrations_mod.MIGRATIONS)
+    migrations_mod.MIGRATIONS[:] = original[:4]
+    try:
+        run_migrations(conn, str(path))
+    finally:
+        migrations_mod.MIGRATIONS[:] = original
+    conn.close()
+
+
+def _objects(conn, object_type):
+    return {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type=?", (object_type,)
+    )}
+
+
+def _canonical_structure(conn):
+    names = set().union(*CANONICAL_TABLES_BY_VERSION.values()) | CANONICAL_VIEWS
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    return {(r["type"], r["name"], r["tbl_name"], r["sql"])
+            for r in rows if r["tbl_name"] in names or r["name"] in names}
+
+
 # --------------------------------------------------------------------------- #
 # Fresh-DB stamp path
 # --------------------------------------------------------------------------- #
@@ -169,6 +210,99 @@ def test_fresh_db_stamps_all_migrations_without_running_them(tmp_path):
 
     # No backfill/migration events on an empty, never-migrated-for-real DB.
     assert conn.execute("SELECT COUNT(*) AS c FROM state_events").fetchone()["c"] == 0
+    assert _objects(conn, "table") >= set().union(*CANONICAL_TABLES_BY_VERSION.values())
+    assert _objects(conn, "view") >= CANONICAL_VIEWS
+    conn.close()
+
+
+def test_canonical_migrations_create_expected_objects_version_by_version(tmp_path):
+    path = tmp_path / "versions.db"
+    build_v4_db(path)
+    conn = connect(path)
+
+    for version, _name, migration in MIGRATIONS[4:]:
+        conn.execute("BEGIN IMMEDIATE")
+        migration(conn)
+        conn.commit()
+        expected_tables = set().union(*(
+            tables for at_version, tables in CANONICAL_TABLES_BY_VERSION.items()
+            if at_version <= version
+        ))
+        assert _objects(conn, "table") >= expected_tables
+        if version < 10:
+            assert not (_objects(conn, "view") & CANONICAL_VIEWS)
+        else:
+            assert _objects(conn, "view") >= CANONICAL_VIEWS
+    conn.close()
+
+
+def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
+    fresh = connect(tmp_path / "fresh_equivalent.db")
+    init_db(fresh)
+
+    upgraded_path = tmp_path / "upgraded_equivalent.db"
+    build_v4_db(upgraded_path)
+    upgraded = connect(upgraded_path)
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 11))
+
+    assert _canonical_structure(upgraded) == _canonical_structure(fresh)
+    assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert fresh.execute("PRAGMA foreign_key_check").fetchall() == []
+    fresh.close()
+    upgraded.close()
+
+
+def test_existing_init_db_backs_up_before_canonical_ddl(tmp_path):
+    path = tmp_path / "v4_init.db"
+    build_v4_db(path)
+    conn = connect(path)
+
+    init_db(conn)
+
+    backups = glob.glob(str(path) + ".bak.v5-*")
+    assert len(backups) == 1
+    backup = sqlite3.connect(backups[0])
+    tables = {r[0] for r in backup.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    assert "profile_versions" not in tables
+    assert "pipeline_runs" not in tables
+    backup.close()
+    assert "profile_versions" in _objects(conn, "table")
+    conn.close()
+
+
+def test_nonempty_database_without_jobs_is_not_stamped_as_fresh(tmp_path):
+    path = tmp_path / "nonempty_unknown.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    raw.commit()
+    raw.close()
+
+    conn = connect(path)
+    with pytest.raises(RuntimeError, match="required jobs table is missing"):
+        init_db(conn)
+    assert not glob.glob(str(path) + ".bak.*")
+    assert _objects(conn, "table") == {"unrelated"}
+    conn.close()
+
+
+def test_compatibility_views_expose_exact_legacy_columns(tmp_path):
+    conn = connect(tmp_path / "compat.db")
+    init_db(conn)
+    expected = {
+        "compat_jobs": ["url", "seen_key", "tier", "odds", "odds_score", "odds_why",
+                        "is_new", "title", "company", "location", "salary", "salary_min",
+                        "salary_max", "posted", "first_seen", "remote", "source",
+                        "also_seen_on", "req_id", "why", "flags", "desc_snippet",
+                        "full_desc", "latest_run", "present"],
+        "compat_runs": ["run_date", "kept", "new_this_run", "report_json",
+                        "source_health_json", "ingested_at"],
+        "compat_job_history": ["url", "run_date", "seen_key", "tier", "odds", "present"],
+    }
+    for view, columns in expected.items():
+        assert [r["name"] for r in conn.execute(f"PRAGMA table_info({view})")] == columns
+        assert conn.execute(f"SELECT * FROM {view}").fetchall() == []
     conn.close()
 
 
@@ -367,6 +501,193 @@ def test_old_schema_migration_idempotent_second_run(old_db):
     conn.close()
 
 
+def test_legacy_runs_backfill_is_deterministic_and_does_not_invent_start_times(tmp_path):
+    path = tmp_path / "legacy_runs.db"
+    build_v4_db(path)
+    conn = connect(path)
+    health = {
+        "zeta": {"rows": 8, "at": "2026-07-01T12:00:00", "refreshed": True},
+        "alpha": {"rows": 3, "status": "done", "started_at": "2026-07-01T11:00:00"},
+    }
+    conn.execute(
+        "INSERT INTO runs VALUES (?,?,?,?,?,?)",
+        ("2026-07-01", 11, 2, '{"ok":true}', json.dumps(health), "2026-07-01T12:05:00"),
+    )
+    conn.commit()
+
+    run_migrations(conn, str(path))
+    first_run = dict(conn.execute("SELECT * FROM pipeline_runs").fetchone())
+    first_sources = [dict(r) for r in conn.execute(
+        "SELECT * FROM source_runs ORDER BY source"
+    )]
+    assert first_run["requested_at"] is None
+    assert first_run["started_at"] is None
+    assert first_run["finished_at"] is None
+    assert [r["source"] for r in first_sources] == ["alpha", "zeta"]
+    assert first_sources[0]["started_at"] == "2026-07-01T11:00:00"
+    assert first_sources[1]["started_at"] is None
+    assert first_sources[1]["finished_at"] is None
+    assert first_sources[1]["item_count"] == 8
+
+    conn.execute("DELETE FROM schema_version WHERE version >= 6")
+    conn.commit()
+    run_migrations(conn, str(path))
+    assert dict(conn.execute("SELECT * FROM pipeline_runs").fetchone()) == first_run
+    assert [dict(r) for r in conn.execute(
+        "SELECT * FROM source_runs ORDER BY source"
+    )] == first_sources
+    conn.close()
+
+
+def test_malformed_source_health_does_not_abort_run_backfill(tmp_path):
+    path = tmp_path / "malformed_health.db"
+    build_v4_db(path)
+    conn = connect(path)
+    conn.executemany(
+        "INSERT INTO runs VALUES (?,?,?,?,?,?)",
+        [("2026-07-01", 1, 1, None, "not-json", "2026-07-01T00:00:00"),
+         ("2026-07-02", 2, 1, None, "[]", "2026-07-02T00:00:00"),
+         ("2026-07-03", 3, 1, None, '{"bad":"scalar"}', "2026-07-03T00:00:00")],
+    )
+    conn.commit()
+
+    run_migrations(conn, str(path))
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_runs").fetchone()[0] == 3
+    assert conn.execute("SELECT COUNT(*) FROM source_runs").fetchone()[0] == 0
+    conn.close()
+
+
+def test_nested_source_health_scalars_are_sanitized_not_bound(tmp_path):
+    path = tmp_path / "nested_health.db"
+    build_v4_db(path)
+    conn = connect(path)
+    health = json.dumps({"ats": {"rows": [], "deadline_at": {}, "status": ["bad"]}})
+    conn.execute(
+        "INSERT INTO runs VALUES (?,?,?,?,?,?)",
+        ("2026-07-04", 1, 1, None, health, "2026-07-04T12:00:00"),
+    )
+    conn.commit()
+
+    run_migrations(conn, str(path))
+
+    row = conn.execute("SELECT * FROM source_runs").fetchone()
+    assert row["item_count"] is None
+    assert row["deadline_at"] is None
+    assert row["status"] == "imported"
+    assert json.loads(row["metadata_json"])["rows"] == []
+    conn.close()
+
+
+def test_compat_runs_preserves_legacy_health_and_ingested_at(tmp_path):
+    path = tmp_path / "compat_run_values.db"
+    build_v4_db(path)
+    conn = connect(path)
+    health = '{"ats":{"rows":3}}'
+    conn.execute(
+        "INSERT INTO runs VALUES (?,?,?,?,?,?)",
+        ("2026-07-05", 3, 2, '{"date":"2026-07-05"}', health,
+         "2026-07-05T14:30:00"),
+    )
+    conn.commit()
+
+    run_migrations(conn, str(path))
+
+    row = conn.execute("SELECT * FROM compat_runs WHERE run_date='2026-07-05'").fetchone()
+    assert row["source_health_json"] == health
+    assert row["ingested_at"] == "2026-07-05T14:30:00"
+    conn.close()
+
+
+def test_canonical_fk_policies_and_uniqueness(tmp_path):
+    conn = connect(tmp_path / "constraints.db")
+    init_db(conn)
+    conn.execute("INSERT INTO postings VALUES ('p1','active','t0','t0',NULL)")
+    conn.execute("INSERT INTO postings VALUES ('p2','active','t0','t0',NULL)")
+    conn.execute(
+        "INSERT INTO posting_aliases VALUES ('a1','p1','url','web','same',NULL,NULL,NULL,NULL,'t0',NULL)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO posting_aliases VALUES ('a2','p2','url','web','same',NULL,NULL,NULL,NULL,'t0',NULL)"
+        )
+    conn.execute("UPDATE posting_aliases SET valid_to='t1' WHERE alias_id='a1'")
+    conn.execute(
+        "INSERT INTO posting_aliases VALUES ('a2','p2','url','web','same',NULL,NULL,NULL,NULL,'t1',NULL)"
+    )
+    conn.execute("INSERT INTO pipeline_runs (run_uid,kind,status) VALUES ('r1','full','done')")
+    conn.execute(
+        "INSERT INTO source_runs (source_run_id,run_uid,source,step,attempt,status) "
+        "VALUES ('s1','r1','ats','scrape',1,'done')"
+    )
+    conn.execute(
+        "INSERT INTO run_events VALUES ('e1','r1','s1',0,'started','t0',NULL)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO run_events VALUES ('e2','r1',NULL,0,'duplicate','t1',NULL)"
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM postings WHERE posting_id='p2'")
+    conn.execute("DELETE FROM pipeline_runs WHERE run_uid='r1'")
+    assert conn.execute("SELECT COUNT(*) FROM source_runs").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == 0
+    conn.close()
+
+
+def test_canonical_composite_foreign_keys_reject_cross_owner_links(tmp_path):
+    conn = connect(tmp_path / "composite_fks.db")
+    init_db(conn)
+    conn.executemany(
+        "INSERT INTO pipeline_runs (run_uid,kind,status) VALUES (?,'full','done')",
+        [("r1",), ("r2",)],
+    )
+    conn.execute(
+        "INSERT INTO source_runs (source_run_id,run_uid,source,step,attempt,status) "
+        "VALUES ('s1','r1','ats','scrape',1,'done')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO run_events VALUES ('e1','r2','s1',0,'bad','t0',NULL)")
+
+    conn.executemany(
+        "INSERT INTO postings VALUES (?,'active','t0','t0',NULL)", [("p1",), ("p2",)],
+    )
+    conn.execute(
+        "INSERT INTO posting_versions "
+        "(posting_version_id,posting_id,version_hash,observed_at,payload_json) "
+        "VALUES ('v2','p2','h2','t0','{}')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO run_postings "
+            "(run_uid,posting_id,posting_version_id,present,first_seen_in_run,recorded_at) "
+            "VALUES ('r1','p1','v2',1,0,'t0')"
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO run_postings "
+            "(run_uid,posting_id,source_run_id,present,first_seen_in_run,recorded_at) "
+            "VALUES ('r2','p1','s1',1,0,'t0')"
+        )
+    conn.close()
+
+
+def test_posting_version_hash_is_scoped_to_posting(tmp_path):
+    conn = connect(tmp_path / "version_hash_scope.db")
+    init_db(conn)
+    conn.execute("INSERT INTO postings VALUES ('p1','active','t0','t0',NULL)")
+    conn.execute("INSERT INTO postings VALUES ('p2','active','t0','t0',NULL)")
+    insert = (
+        "INSERT INTO posting_versions "
+        "(posting_version_id, posting_id, version_hash, observed_at, payload_json) "
+        "VALUES (?,?,?,?,?)"
+    )
+    conn.execute(insert, ("v1", "p1", "same-content", "t0", "{}"))
+    conn.execute(insert, ("v2", "p2", "same-content", "t0", "{}"))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(insert, ("v3", "p1", "same-content", "t1", "{}"))
+    conn.close()
+
+
 def test_old_schema_migration_creates_backup_file(old_db):
     path, _keys = old_db
     conn = connect(path)
@@ -554,7 +875,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         raise RuntimeError("after ddl")
 
     orig = list(migrations_mod.MIGRATIONS)
-    migrations_mod.MIGRATIONS.append((5, "transactional_ddl_probe", create_then_boom))
+    migrations_mod.MIGRATIONS.append((11, "transactional_ddl_probe", create_then_boom))
     try:
         with pytest.raises(RuntimeError, match="after ddl"):
             run_migrations(conn, str(path))
@@ -565,7 +886,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == {1, 2, 3, 4}
+    assert versions == set(range(1, 11))
     conn.close()
 
 

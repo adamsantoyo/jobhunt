@@ -64,6 +64,12 @@ def _table_exists(conn, name):
     ).fetchone() is not None
 
 
+def _is_empty_database(conn):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+    ).fetchone() is None
+
+
 def _main_db_file(conn):
     """On-disk path of this connection's main database, or None for :memory:.
     Derived from the connection itself so migrations back up exactly the file being
@@ -81,12 +87,21 @@ def init_db(conn):
     `fresh` is captured *before* the DDL runs: a brand-new DB has the full baseline
     (which already reflects the latest schema, including state_events) so migrations
     are stamped, not executed. An existing DB gets migrations run against it."""
-    from .migrations import JOB_STATE_ARCHIVE_DDL, STATE_EVENTS_DDL, run_migrations
+    from .migrations import (
+        CANONICAL_DDL,
+        JOB_STATE_ARCHIVE_DDL,
+        STATE_EVENTS_DDL,
+        run_migrations,
+    )
 
-    fresh = not _table_exists(conn, "jobs")
+    fresh = _is_empty_database(conn)
+    if not fresh and not _table_exists(conn, "jobs"):
+      raise RuntimeError("unsupported existing database: required jobs table is missing")
     conn.executescript(DDL)
     conn.executescript(STATE_EVENTS_DDL)       # events log is part of the baseline
     conn.executescript(JOB_STATE_ARCHIVE_DDL)  # collision archive (migration 3) too
+    if fresh:
+        conn.executescript(CANONICAL_DDL)
     conn.commit()
     run_migrations(conn, _main_db_file(conn), fresh=fresh)
 

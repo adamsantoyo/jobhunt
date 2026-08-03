@@ -20,8 +20,10 @@ Design notes:
   local weeks from them. `schema_version.applied_at` and backup stamps use UTC — pure
   audit metadata, unrelated to the user-facing timeline.
 """
+import json
 import os
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 
 from .config import STATUSES
@@ -57,6 +59,331 @@ CREATE TABLE IF NOT EXISTS job_state_archive (
   archived_reason TEXT, archived_at TEXT);
 """
 
+PROFILE_VERSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS profile_versions (
+    profile_version_id TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL UNIQUE,
+    profile_json TEXT NOT NULL,
+    rubric_hash TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
+RUNS_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_uid TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    profile_version_id TEXT REFERENCES profile_versions(profile_version_id) ON DELETE RESTRICT,
+    legacy_run_date TEXT UNIQUE,
+    legacy_ingested_at TEXT,
+    source_health_json TEXT,
+    requested_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    trigger TEXT,
+    config_hash TEXT,
+    scorer_hash TEXT,
+    code_hash TEXT,
+    kept_count INTEGER,
+    new_count INTEGER,
+    aggregate_report_json TEXT,
+    error_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status_requested
+    ON pipeline_runs(status, requested_at);
+
+CREATE TABLE IF NOT EXISTS source_runs (
+    source_run_id TEXT PRIMARY KEY,
+    run_uid TEXT NOT NULL REFERENCES pipeline_runs(run_uid) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    step TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt >= 1),
+    status TEXT NOT NULL,
+    deadline_at TEXT,
+    requested_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    item_count INTEGER,
+    fetched_count INTEGER,
+    accepted_count INTEGER,
+    changed_count INTEGER,
+    checkpoint_json TEXT,
+    error_json TEXT,
+    metadata_json TEXT,
+    UNIQUE (run_uid, source, step, attempt),
+    UNIQUE (source_run_id, run_uid)
+);
+CREATE INDEX IF NOT EXISTS idx_source_runs_run_status
+    ON source_runs(run_uid, status);
+
+CREATE TABLE IF NOT EXISTS run_events (
+    run_event_id TEXT PRIMARY KEY,
+    run_uid TEXT NOT NULL REFERENCES pipeline_runs(run_uid) ON DELETE CASCADE,
+    source_run_id TEXT,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    event_type TEXT NOT NULL,
+    at TEXT NOT NULL,
+    payload_json TEXT,
+    UNIQUE (run_uid, sequence),
+    FOREIGN KEY (source_run_id, run_uid)
+        REFERENCES source_runs(source_run_id, run_uid) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_run_events_source_run
+    ON run_events(source_run_id);
+"""
+
+IDENTITY_DDL = """
+CREATE TABLE IF NOT EXISTS postings (
+    posting_id TEXT PRIMARY KEY,
+    identity_status TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    retired_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS posting_aliases (
+    alias_id TEXT PRIMARY KEY,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    alias_kind TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    value TEXT NOT NULL,
+    url TEXT,
+    req_id TEXT,
+    provenance_json TEXT,
+    confidence REAL,
+    valid_from TEXT NOT NULL,
+    valid_to TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_posting_aliases_active
+    ON posting_aliases(alias_kind, namespace, value) WHERE valid_to IS NULL;
+CREATE INDEX IF NOT EXISTS idx_posting_aliases_posting
+    ON posting_aliases(posting_id);
+
+CREATE TABLE IF NOT EXISTS posting_redirects (
+    from_posting_id TEXT PRIMARY KEY REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    to_posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    CHECK (from_posting_id <> to_posting_id)
+);
+
+CREATE TABLE IF NOT EXISTS identity_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    alias_id TEXT REFERENCES posting_aliases(alias_id) ON DELETE RESTRICT,
+    evidence_kind TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL UNIQUE,
+    observed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS legacy_identity_map (
+    legacy_identity_kind TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    legacy_identity_value TEXT NOT NULL,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    mapped_at TEXT NOT NULL,
+    provenance_json TEXT,
+    PRIMARY KEY (legacy_identity_kind, namespace, legacy_identity_value)
+);
+
+CREATE TABLE IF NOT EXISTS identity_migration_archive (
+    archive_id TEXT PRIMARY KEY,
+    artifact TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    candidate_posting_ids_json TEXT,
+    payload_hash TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    UNIQUE (artifact, locator, payload_hash)
+);
+"""
+
+CONTENT_DDL = """
+CREATE TABLE IF NOT EXISTS posting_versions (
+    posting_version_id TEXT PRIMARY KEY,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    alias_id TEXT REFERENCES posting_aliases(alias_id) ON DELETE RESTRICT,
+    source_run_id TEXT REFERENCES source_runs(source_run_id) ON DELETE RESTRICT,
+    version_hash TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    title TEXT,
+    company TEXT,
+    location TEXT,
+    salary TEXT,
+    salary_min INTEGER,
+    salary_max INTEGER,
+    posted TEXT,
+    remote INTEGER,
+    source TEXT,
+    req_id TEXT,
+    tier INTEGER,
+    odds TEXT,
+    odds_score INTEGER,
+    odds_why TEXT,
+    why TEXT,
+    flags TEXT,
+    payload_json TEXT NOT NULL
+    ,UNIQUE (posting_version_id, posting_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_posting_versions_posting_hash
+    ON posting_versions(posting_id, version_hash);
+CREATE INDEX IF NOT EXISTS idx_posting_versions_posting_observed
+    ON posting_versions(posting_id, observed_at);
+
+CREATE TABLE IF NOT EXISTS descriptions (
+    description_id TEXT PRIMARY KEY,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    posting_version_id TEXT REFERENCES posting_versions(posting_version_id) ON DELETE RESTRICT,
+    alias_id TEXT REFERENCES posting_aliases(alias_id) ON DELETE RESTRICT,
+    source_run_id TEXT REFERENCES source_runs(source_run_id) ON DELETE RESTRICT,
+    provenance_hash TEXT NOT NULL UNIQUE,
+    content_hash TEXT,
+    fetch_status TEXT NOT NULL,
+    body TEXT,
+    fetched_at TEXT NOT NULL,
+    metadata_json TEXT,
+    CHECK (body IS NOT NULL OR fetch_status = 'unavailable')
+);
+CREATE INDEX IF NOT EXISTS idx_descriptions_posting_fetched
+    ON descriptions(posting_id, fetched_at);
+"""
+
+DECISIONS_DDL = """
+CREATE TABLE IF NOT EXISTS score_versions (
+    score_version_id TEXT PRIMARY KEY,
+    posting_version_id TEXT NOT NULL REFERENCES posting_versions(posting_version_id) ON DELETE RESTRICT,
+    profile_version_id TEXT NOT NULL REFERENCES profile_versions(profile_version_id) ON DELETE RESTRICT,
+    source_run_id TEXT REFERENCES source_runs(source_run_id) ON DELETE RESTRICT,
+    score_hash TEXT NOT NULL,
+    scorer_hash TEXT NOT NULL,
+    config_hash TEXT,
+    code_hash TEXT,
+    tier INTEGER,
+    odds TEXT,
+    odds_score INTEGER,
+    rationale_json TEXT,
+    created_at TEXT NOT NULL
+    ,UNIQUE (posting_version_id, profile_version_id, score_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_score_versions_posting_profile
+    ON score_versions(posting_version_id, profile_version_id, created_at);
+
+CREATE TABLE IF NOT EXISTS llm_reviews (
+    llm_review_id TEXT PRIMARY KEY,
+    posting_version_id TEXT NOT NULL REFERENCES posting_versions(posting_version_id) ON DELETE RESTRICT,
+    profile_version_id TEXT NOT NULL REFERENCES profile_versions(profile_version_id) ON DELETE RESTRICT,
+    score_version_id TEXT REFERENCES score_versions(score_version_id) ON DELETE RESTRICT,
+    source_run_id TEXT REFERENCES source_runs(source_run_id) ON DELETE RESTRICT,
+    review_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    review_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (posting_version_id, profile_version_id, review_hash)
+);
+
+CREATE TABLE IF NOT EXISTS recommendations (
+    recommendation_id TEXT PRIMARY KEY,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    posting_version_id TEXT NOT NULL REFERENCES posting_versions(posting_version_id) ON DELETE RESTRICT,
+    profile_version_id TEXT NOT NULL REFERENCES profile_versions(profile_version_id) ON DELETE RESTRICT,
+    score_version_id TEXT REFERENCES score_versions(score_version_id) ON DELETE RESTRICT,
+    llm_review_id TEXT REFERENCES llm_reviews(llm_review_id) ON DELETE RESTRICT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    recommendation_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    retired_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_recommendations_posting_status
+    ON recommendations(posting_id, status);
+
+CREATE TABLE IF NOT EXISTS recommendation_events (
+    recommendation_event_id TEXT PRIMARY KEY,
+    recommendation_id TEXT NOT NULL REFERENCES recommendations(recommendation_id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    event_type TEXT NOT NULL,
+    at TEXT NOT NULL,
+    payload_json TEXT,
+    UNIQUE (recommendation_id, sequence)
+);
+"""
+
+COMPATIBILITY_DDL = """
+CREATE TABLE IF NOT EXISTS run_postings (
+    run_uid TEXT NOT NULL REFERENCES pipeline_runs(run_uid) ON DELETE CASCADE,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    posting_version_id TEXT REFERENCES posting_versions(posting_version_id) ON DELETE RESTRICT,
+    source_run_id TEXT,
+    present INTEGER NOT NULL DEFAULT 1 CHECK (present IN (0, 1)),
+    first_seen_in_run INTEGER NOT NULL DEFAULT 0 CHECK (first_seen_in_run IN (0, 1)),
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (run_uid, posting_id),
+    FOREIGN KEY (posting_version_id, posting_id)
+        REFERENCES posting_versions(posting_version_id, posting_id) ON DELETE RESTRICT,
+    FOREIGN KEY (source_run_id, run_uid)
+        REFERENCES source_runs(source_run_id, run_uid) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_run_postings_posting
+    ON run_postings(posting_id, run_uid);
+
+CREATE VIEW IF NOT EXISTS compat_jobs AS
+SELECT (SELECT a2.url FROM posting_aliases a2
+    WHERE a2.posting_id = p.posting_id AND a2.valid_to IS NULL AND a2.url IS NOT NULL
+    ORDER BY a2.valid_from DESC, a2.alias_id DESC LIMIT 1) AS url,
+         p.posting_id AS seen_key, v.tier AS tier,
+             v.odds AS odds, v.odds_score AS odds_score, v.odds_why AS odds_why,
+             0 AS is_new, v.title AS title, v.company AS company, v.location AS location,
+             v.salary AS salary, v.salary_min AS salary_min, v.salary_max AS salary_max,
+             v.posted AS posted, p.first_seen_at AS first_seen, v.remote AS remote,
+             v.source AS source, NULL AS also_seen_on, v.req_id AS req_id,
+             v.why AS why, v.flags AS flags, substr(d.body, 1, 500) AS desc_snippet,
+             d.body AS full_desc, rp.run_uid AS latest_run, rp.present AS present
+FROM run_postings rp
+JOIN postings p ON p.posting_id = rp.posting_id
+LEFT JOIN posting_versions v ON v.posting_version_id = rp.posting_version_id
+LEFT JOIN descriptions d ON d.description_id = (
+    SELECT d2.description_id FROM descriptions d2
+    WHERE d2.posting_id = p.posting_id ORDER BY d2.fetched_at DESC, d2.description_id DESC LIMIT 1
+)
+WHERE rp.run_uid = (
+    SELECT rp2.run_uid FROM run_postings rp2 JOIN pipeline_runs pr2 ON pr2.run_uid = rp2.run_uid
+    WHERE rp2.posting_id = rp.posting_id AND pr2.status IN ('done', 'imported')
+    ORDER BY COALESCE(pr2.finished_at, pr2.requested_at, pr2.legacy_run_date) DESC,
+             pr2.run_uid DESC LIMIT 1
+);
+
+CREATE VIEW IF NOT EXISTS compat_runs AS
+SELECT legacy_run_date AS run_date, kept_count AS kept, new_count AS new_this_run,
+             aggregate_report_json AS report_json, source_health_json AS source_health_json,
+             legacy_ingested_at AS ingested_at
+FROM pipeline_runs WHERE status IN ('done', 'imported');
+
+CREATE VIEW IF NOT EXISTS compat_job_history AS
+SELECT (SELECT a2.url FROM posting_aliases a2
+                WHERE a2.posting_id = rp.posting_id AND a2.valid_from <= rp.recorded_at
+                    AND (a2.valid_to IS NULL OR a2.valid_to > rp.recorded_at) AND a2.url IS NOT NULL
+                ORDER BY a2.valid_from DESC, a2.alias_id DESC LIMIT 1) AS url,
+                         pr.legacy_run_date AS run_date, rp.posting_id AS seen_key,
+             v.tier AS tier, v.odds AS odds, rp.present AS present
+FROM run_postings rp
+JOIN pipeline_runs pr ON pr.run_uid = rp.run_uid
+LEFT JOIN posting_versions v ON v.posting_version_id = rp.posting_version_id
+WHERE pr.status IN ('done', 'imported');
+"""
+
+CANONICAL_DDL = "\n".join((
+        PROFILE_VERSIONS_DDL,
+        RUNS_DDL,
+        IDENTITY_DDL,
+        CONTENT_DDL,
+        DECISIONS_DDL,
+        COMPATIBILITY_DDL,
+))
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -65,6 +392,12 @@ def _utc_now_iso() -> str:
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _database_has_tables(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
     ).fetchone() is not None
 
 
@@ -282,12 +615,116 @@ def _migration_4_applied_via(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE job_state ADD COLUMN applied_via TEXT")
 
 
+def _migration_5_profile_versions(conn: sqlite3.Connection) -> None:
+    _execute_ddl(conn, PROFILE_VERSIONS_DDL)
+
+
+_LEGACY_RUN_NAMESPACE = uuid.UUID("fe5578bd-9624-5c99-96fd-27ab276f5c9f")
+
+
+def _legacy_uid(kind: str, *parts) -> str:
+    material = "\x1f".join(str(part) for part in (kind,) + parts)
+    return str(uuid.uuid5(_LEGACY_RUN_NAMESPACE, material))
+
+
+def _legacy_scalar(value, *, integer=False):
+    if value is None or isinstance(value, (dict, list, tuple)):
+        return None
+    if integer:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return str(value)
+
+
+def _migration_6_runs(conn: sqlite3.Connection) -> None:
+    _execute_ddl(conn, RUNS_DDL)
+    if not _table_exists(conn, "runs"):
+        return
+
+    for row in conn.execute(
+        "SELECT rowid AS legacy_rowid, run_date, kept, new_this_run, report_json, "
+        "source_health_json, ingested_at FROM runs ORDER BY run_date, rowid"
+    ).fetchall():
+        identity = row["run_date"] if row["run_date"] is not None else f"rowid:{row['legacy_rowid']}"
+        run_uid = _legacy_uid("pipeline_run", identity)
+        conn.execute(
+            "INSERT OR IGNORE INTO pipeline_runs "
+            "(run_uid, kind, status, legacy_run_date, legacy_ingested_at, source_health_json, "
+            "trigger, kept_count, new_count, aggregate_report_json) "
+            "VALUES (?, 'imported', 'imported', ?, ?, ?, 'legacy_migration', ?, ?, ?)",
+            (run_uid, row["run_date"], row["ingested_at"], row["source_health_json"],
+             row["kept"], row["new_this_run"], row["report_json"]),
+        )
+        try:
+            health = json.loads(row["source_health_json"] or "")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(health, dict):
+            continue
+        for source in sorted(health):
+            details = health[source]
+            if not isinstance(details, dict):
+                continue
+            step = _legacy_scalar(details.get("step")) or "legacy"
+            try:
+                attempt = max(1, int(details.get("attempt", 1)))
+            except (TypeError, ValueError):
+                attempt = 1
+            status = _legacy_scalar(details.get("status")) or "imported"
+            source_run_id = _legacy_uid("source_run", run_uid, source, step, attempt)
+            metadata_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+            conn.execute(
+                "INSERT OR IGNORE INTO source_runs "
+                "(source_run_id, run_uid, source, step, attempt, status, deadline_at, "
+                "requested_at, started_at, finished_at, item_count, fetched_count, "
+                "accepted_count, changed_count, checkpoint_json, error_json, metadata_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (source_run_id, run_uid, str(source), step, attempt, status,
+                 _legacy_scalar(details.get("deadline_at")),
+                 _legacy_scalar(details.get("requested_at")),
+                 _legacy_scalar(details.get("started_at")),
+                 _legacy_scalar(details.get("finished_at")),
+                 _legacy_scalar(details.get("rows", details.get("count")), integer=True),
+                 _legacy_scalar(details.get("fetched_count"), integer=True),
+                 _legacy_scalar(details.get("accepted_count"), integer=True),
+                 _legacy_scalar(details.get("changed_count"), integer=True),
+                 json.dumps(details.get("checkpoint"), sort_keys=True)
+                 if "checkpoint" in details else None,
+                 json.dumps(details.get("error"), sort_keys=True)
+                 if "error" in details else None, metadata_json),
+            )
+
+
+def _migration_7_identity(conn: sqlite3.Connection) -> None:
+    _execute_ddl(conn, IDENTITY_DDL)
+
+
+def _migration_8_content(conn: sqlite3.Connection) -> None:
+    _execute_ddl(conn, CONTENT_DDL)
+
+
+def _migration_9_decisions(conn: sqlite3.Connection) -> None:
+    _execute_ddl(conn, DECISIONS_DDL)
+
+
+def _migration_10_compatibility(conn: sqlite3.Connection) -> None:
+    _execute_ddl(conn, COMPATIBILITY_DDL)
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
     (2, "backfill_state_events", _migration_2_backfill),
     (3, "rekey_job_state_on_seen_key", _migration_3_rekey_job_state),
     (4, "job_state_applied_via", _migration_4_applied_via),
+    (5, "profile_versions", _migration_5_profile_versions),
+    (6, "pipeline_runs", _migration_6_runs),
+    (7, "posting_identity", _migration_7_identity),
+    (8, "posting_content", _migration_8_content),
+    (9, "canonical_decisions", _migration_9_decisions),
+    (10, "canonical_compatibility", _migration_10_compatibility),
 ]
 
 
@@ -376,7 +813,7 @@ def run_migrations(conn: sqlite3.Connection, db_path, *, dry_run=False, fresh=No
         return _dry_run_pending(conn)
 
     if fresh is None:
-        fresh = not _table_exists(conn, "jobs")
+        fresh = not _database_has_tables(conn)
 
     if fresh:
         conn.execute("BEGIN IMMEDIATE")
