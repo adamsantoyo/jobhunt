@@ -8,14 +8,40 @@ Descriptions cache: results/descriptions.jsonl  {url, desc}
 Output: results/jobs_scored_<date>.csv with tier, why, flags
 """
 import argparse, csv, datetime, glob, html as htmlmod, json, os, re, sys, time
+from dataclasses import dataclass as _dataclass
 import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scraper import parse_salary, canon_company, norm, dedupe, VERIFY
+import candidate_profile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 JH = {**UA, "Accept": "application/json"}
 DESC = os.path.join(HERE, "results", "descriptions.jsonl")
+
+# Code-version identifier for the scoring ALGORITHM (independent of
+# profile.json's content hash, which versions the candidate-preference DATA
+# rubric applies). Bump this string whenever score_row's or hireability's
+# logic changes shape: a new dimension, a new blocker rule, a changed
+# clamp/cap, a changed feature-vector key set. Do NOT bump it for a
+# profile.json data edit (new skill regex, adjusted comp band, added target
+# employer) -- that produces a new profile_version_id, not a new rubric_hash.
+# A score_versions row keys on (posting_version_id, profile_version_id,
+# score_hash); rubric_hash is what lets a stored score be traced back to the
+# exact scoring code that produced it even when the profile and the posting
+# are both unchanged. Mirrors CANONICAL_HASH_FIELDS' bump discipline in
+# webapp/backend/sources/contract.py.
+RUBRIC_VERSION = "rubric-2026.08-v1"
+
+_RPROFILE_CACHE = None
+def _rprofile():
+    """Memoized validated candidate profile (profile.json). Raises
+    profile.ProfileValidationError loudly on first use if the file is
+    malformed -- never silently falls back to defaults."""
+    global _RPROFILE_CACHE
+    if _RPROFILE_CACHE is None:
+        _RPROFILE_CACHE = candidate_profile.load_profile()
+    return _RPROFILE_CACHE
 
 _CFG_CACHE = None
 def load_cfg():
@@ -209,7 +235,7 @@ def fetch_microsoft(cands):
 def _relevant(title):
     """Cheap family prefilter so per-row desc fetchers only pull plausible rows."""
     t = (title or "").lower()
-    return any(k in t for fam in FAMILY.values() for k in fam)
+    return any(k in t for fam in _rprofile().families.keywords.values() for k in fam)
 
 def _ldjson_desc(url):
     try:
@@ -319,137 +345,112 @@ def fetch_costco_desc(cands):
     return out
 
 # ---------------- hireability (odds axis, orthogonal to fit tier) ----------------
-# His resume vocabulary — overlap with a JD proxies both ATS keyword match and how well
-# he can speak to the role in an interview. More overlap => better odds.
-# One regex per distinct skill concept — synonyms are OR'd inside a single entry so a JD
-# can't score the same concept twice (e.g. "REST API" must not count both api and rest-api).
-HIS_SKILLS = [r"product support", r"technical support", r"troubleshoot", r"help ?desk", r"service ?now",
- r"rest(ful)? apis?|\bapi\b", r"\bsaas\b", r"escalation", r"incident", r"ticket",
- r"\bentra\b|azure ad|active directory", r"\bintune\b", r"autopilot",
- r"microsoft 365|\bm365\b|office 365", r"defender", r"powershell", r"\bpython\b", r"sharepoint",
- r"power platform", r"azure devops|\bado\b", r"\bfirmware\b", r"bios|uefi", r"device driver",
- r"\bimaging\b", r"endpoint", r"\bmdm\b", r"\biam\b", r"single sign|\bsso\b", r"\bazure\b",
- r"\bwindows\b", r"hardware (validation|test)", r"\blab\b"]
-# Employers whose support/ops reqs draw very large applicant pools -> lower odds despite good fit.
-HIGH_COMPETITION = ["anthropic","openai","google","alphabet","meta","facebook","apple","nvidia","amazon",
- "aws","microsoft","netflix","databricks","stripe","datadog","pinterest","airbnb","snowflake","uber","lyft",
- "coinbase","salesforce","linkedin","roblox","tesla","spacex","figma","notion","rippling","ramp","brex",
- "plaid","scale ai","cohere","reddit","dropbox","twitch","robinhood","instacart","doordash","nvidia"]
+# His resume vocabulary, high-competition employer list, staffing agencies, domain
+# keywords, target employers, location gates, level calibration, comp bands, and the
+# point value of every rule below live in profile.json (repo root), not here -- see
+# candidate_profile.py for the validated/compiled loader. rubric.py only applies them by name.
+#
+# ScoreResult / OddsResult are the "explained" companions to score_row()/hireability():
+# same computation, plus the feature vector that fired (named rule -> point contribution,
+# or {"blocker": <code>} when the row was excluded) and the two hashes needed to make a
+# stored score reproducible -- which profile.json produced it (profile_hash) and which
+# version of this scoring code produced it (rubric_hash, see RUBRIC_VERSION above).
+@_dataclass(frozen=True)
+class ScoreResult:
+    tier: int
+    why: str
+    flags: list
+    features: dict
+    profile_hash: str
+    rubric_hash: str
+
+@_dataclass(frozen=True)
+class OddsResult:
+    label: str
+    score: int
+    why: str
+    features: dict
+    profile_hash: str
+    rubric_hash: str
+
+def _hireability_core(r, desc):
+    """Shared implementation behind hireability() and hireability_explained().
+    Returns an OddsResult; hireability() unpacks it to the legacy 3-tuple so
+    every existing caller (tests.py, sweeprunner.py's cmd_score) is untouched."""
+    prof = _rprofile()
+    W = prof.weights.hireability
+    t = (r["title"] or "").lower(); company = (r["company"] or "").lower()
+    d = (desc or "").lower().replace("\\", "")
+    flags = r.get("flags", "") if isinstance(r.get("flags"), str) else ", ".join(r.get("flags") or [])
+    s, why, features = 0, [], {}
+    # level gap vs his ~4yrs IC-I/II profile
+    if prof.level.hireability_staff_principal_pattern.search(t):
+        s += W["staff_principal"]; features["staff_principal"] = W["staff_principal"]
+        why.append("staff/principal level")
+    elif prof.level.hireability_senior_pattern.search(t):
+        s += W["senior"]; features["senior"] = W["senior"]
+        why.append("senior level")
+    elif prof.level.hireability_junior_pattern.search(t):
+        s += W["junior"]; features["junior"] = W["junior"]
+        why.append("junior/associate level")
+    # years required
+    yreq, _ = years_required(desc)
+    if yreq and yreq <= prof.experience.hireability_bonus_years_max:
+        s += W["years_low"]; features["years_low"] = W["years_low"]; why.append(f"asks {yreq}yrs")
+    elif yreq and yreq >= prof.experience.hireability_penalty_years_min:
+        s += W["years_high"]; features["years_high"] = W["years_high"]; why.append(f"asks {yreq}yrs")
+    # applicant-pool size proxy
+    if any(p.search(company) for p in prof.competition.high_competition_patterns):
+        s += W["high_competition"]; features["high_competition"] = W["high_competition"]
+        why.append("high-competition employer")  # word-boundary: 'meta' must not match 'Metabase'
+    # employment type: staffing/vendor W2 is a lower hiring bar (and a real vendor-to-FTE path)
+    if "Staffing/W2" in flags:
+        s += W["staffing_w2"]; features["staffing_w2"] = W["staffing_w2"]
+        why.append("staffing/vendor (lower bar)")
+    # resume/JD keyword overlap — only meaningful on a substantial JD; a short summary
+    # snippet lacking keywords is not evidence of a poor match, so don't penalize it.
+    if len(d) > 400:
+        hits = sum(1 for p in prof.skills.his_skills if p.search(d))
+        if hits >= 6:
+            s += W["skills_strong"]; features["skills_strong"] = W["skills_strong"]; why.append(f"{hits} skills match")
+        elif hits >= 3:
+            s += W["skills_moderate"]; features["skills_moderate"] = W["skills_moderate"]; why.append(f"{hits} skills match")
+        elif hits <= 1:
+            s += W["skills_thin"]; features["skills_thin"] = W["skills_thin"]; why.append("thin skills match")
+        # exact daily-stack bonus (his literal admin tools)
+        if all(p.search(d) for p in prof.skills.exact_stack_patterns):
+            s += W["exact_stack"]; features["exact_stack"] = W["exact_stack"]; why.append("his exact stack")
+    elif d:
+        why.append("short JD (skills unscored)")
+    # comp expectation vs a below-market current comp and the target band
+    try: hi = int(r.get("salary_max") or 0)
+    except (TypeError, ValueError): hi = 0
+    if hi >= prof.comp.hireability_high_bar:
+        s += W["comp_high_bar"]; features["comp_high_bar"] = W["comp_high_bar"]; why.append("comp implies higher bar")
+    elif 0 < hi < prof.comp.hireability_near_level:
+        s += W["comp_near_level"]; features["comp_near_level"] = W["comp_near_level"]; why.append("comp near his level")
+    if "degree-gated" in flags:
+        s += W["degree_gated"]; features["degree_gated"] = W["degree_gated"]; why.append("hard degree gate")
+    label = "Likely" if s >= prof.hireability_labels.likely_threshold \
+        else ("Reach" if s <= prof.hireability_labels.reach_threshold else "Target")
+    return OddsResult(label=label, score=s, why="; ".join(why[:4]), features=features,
+                       profile_hash=prof.content_hash, rubric_hash=RUBRIC_VERSION)
 
 def hireability(r, desc):
     """Odds of actually landing it, scored ORTHOGONALLY to the fit tier. Returns
     (label, score, reasons). Positive = more winnable. This is a heuristic proxy, not a
     prediction: it models applicant-pool size, level gap, resume/JD keyword overlap,
     employment-type bar, and comp expectation — none of which the fit rubric touches."""
-    t = (r["title"] or "").lower(); company = (r["company"] or "").lower()
-    d = (desc or "").lower().replace("\\", "")
-    flags = r.get("flags", "") if isinstance(r.get("flags"), str) else ", ".join(r.get("flags") or [])
-    s, why = 0, []
-    # level gap vs his ~4yrs IC-I/II profile
-    if re.search(r"\b(staff|principal|distinguished|director|head)\b", t):
-        s -= 3; why.append("staff/principal level")
-    elif re.search(r"\b(senior|sr\.?|lead|iii|iv)\b|\blevel ?[3-9]\b|\bl[3-9]\b|\bgrade ?[4-9]\b", t):
-        s -= 2; why.append("senior level")
-    elif re.search(r"\b(junior|associate|entry|tier ?1|level ?1|\bi\b|\bii\b|tier ?2|level ?2)\b", t):
-        s += 2; why.append("junior/associate level")
-    # years required
-    yreq, _ = years_required(desc)
-    if yreq and yreq <= 3: s += 1; why.append(f"asks {yreq}yrs")
-    elif yreq and yreq >= 6: s -= 1; why.append(f"asks {yreq}yrs")
-    # applicant-pool size proxy
-    if any(re.search(r"\b" + re.escape(c) + r"\b", company) for c in HIGH_COMPETITION):
-        s -= 2; why.append("high-competition employer")  # word-boundary: 'meta' must not match 'Metabase'
-    # employment type: staffing/vendor W2 is a lower hiring bar (and a real vendor-to-FTE path)
-    if "Staffing/W2" in flags: s += 2; why.append("staffing/vendor (lower bar)")
-    # resume/JD keyword overlap — only meaningful on a substantial JD; a short summary
-    # snippet lacking keywords is not evidence of a poor match, so don't penalize it.
-    if len(d) > 400:
-        hits = sum(1 for p in HIS_SKILLS if re.search(p, d))
-        if hits >= 6: s += 2; why.append(f"{hits} skills match")
-        elif hits >= 3: s += 1; why.append(f"{hits} skills match")
-        elif hits <= 1: s -= 1; why.append("thin skills match")
-        # exact daily-stack bonus (his literal admin tools)
-        if re.search(r"\bintune\b", d) and re.search(r"\bentra\b|azure ad|active directory", d):
-            s += 1; why.append("his exact stack")
-    elif d:
-        why.append("short JD (skills unscored)")
-    # comp expectation vs a below-market current comp and the target band
-    try: hi = int(r.get("salary_max") or 0)
-    except (TypeError, ValueError): hi = 0
-    if hi >= 200000: s -= 1; why.append("comp implies higher bar")
-    elif 0 < hi < 95000: s += 1; why.append("comp near his level")
-    if "degree-gated" in flags: s -= 1; why.append("hard degree gate")
-    label = "Likely" if s >= 3 else ("Reach" if s <= -2 else "Target")
-    return label, s, "; ".join(why[:4])
+    res = _hireability_core(r, desc)
+    return res.label, res.score, res.why
+
+def hireability_explained(r, desc):
+    """Same computation as hireability(), plus the feature vector that fired and
+    the profile/rubric hashes -- what Phase 3.3's persistence layer stores
+    alongside a score."""
+    return _hireability_core(r, desc)
 
 # ---------------- scoring ----------------
-STAFFING = ["apex systems","kforce","k-tek","teksystems","insight global","robert half","horizontal talent",
- "vaco","galactic minds","hmg america","vdart","sgs consulting","agreeya","smart folks","maven companies",
- "skylineit","allwyn","inspyr","benchmark it","team red dog","wipro","capgemini","infosys","tata consultancy",
- "cognizant","hcl","ltimindtree","randstad","aerotek","collabera","diverse lynx","mastech","kelly","adecco",
- "experis","modis","akkodis","cybercoders","motion recruitment","jobot","talentburst","russell tobin","eteam",
- "mindlance","artech","pyramid consulting","intelliswift","compunnel","softworld","staffing","recruiting","talent"]
-DOMAIN2 = [r"identity (and|&) access", r"identity management", r"\biam\b", r"\bentra\b", r"\bintune\b",
- r"endpoint (management|security|devices)", r"\bm365\b", r"microsoft 365", r"office 365", r"\bazure\b",
- r"active directory", r"single sign[- ]on", r"\bsso\b", r"\bmdm\b", r"device management", r"cloud support",
- r"data ?center", r"hardware (validation|test|qualification)", r"\blabs?\b", r"laboratory", r"\bracks?\b",
- r"\bsilicon\b", r"\bsku\b", r"server (hardware|fleet|platform)", r"\bfleet\b",
- r"\bllms?\b", r"large language model", r"generative ai", r"product support", r"developer support",
- r"rest(ful)? apis?", r"api support"]
-DOMAIN1 = [r"servicenow", r"\bitsm\b", r"\bitil\b", r"healthcare", r"hospital", r"health[- ]tech",
- r"manufacturing", r"test floor", r"\bfactory\b", r"government cloud", r"govcloud", r"citizenship",
- r"u\.?s\.? citizen", r"public sector", r"\bgis\b", r"arcgis", r"escalation", r"incident management",
- r"\bsaas\b"]
-NON_US = [r"\bchina\b", r"\bcanada\b", r"\bindia\b", r"\buk\b", r"united kingdom", r"\bmexico\b", r"\blatam\b",
- r"bengaluru", r"bangalore", r"hyderabad", r"chennai", r"mumbai", r"\bpune\b", r"noida", r"gurgaon",
- r"berlin", r"paris", r"london", r"dublin", r"madrid", r"barcelona", r"amsterdam", r"warsaw", r"krakow",
- r"toronto", r"vancouver,? b\.?c\.?", r"montreal", r"ontario", r"british columbia", r"tokyo", r"sydney",
- r"\baustralia\b", r"\bperth\b", r"melbourne", r"brisbane", r"adelaide", r"auckland", r"new zealand",
- r"singapore", r"tel aviv", r"s[aã]o paulo", r"mexico city", r"bogot[aá]", r"costa rica", r"heredia",
- # gaps exposed by global company boards (AMD, AppsFlyer, Datadog, Qualcomm) 2026-07-18
- r"taiwan", r"taipei", r"hsinchu", r"malaysia", r"penang", r"\bpoland\b", r"gdansk", r"\bisrael\b",
- r"herzliya", r"argentina", r"buenos aires", r"thailand", r"bangkok", r"\bkorea\b", r"seoul",
- r"\bjapan\b", r"\bosaka\b", r"beijing", r"shanghai", r"shenzhen", r"\bvietnam\b", r"philippines",
- r"\bmanila\b", r"indonesia", r"jakarta", r"\bbrazil\b", r"colombia", r"\bchile\b", r"\bperu\b",
- r"ukraine", r"\bkyiv\b", r"hungary", r"budapest", r"czech", r"prague", r"romania", r"bucharest",
- r"\bfinland\b", r"helsinki", r"\bsweden\b", r"stockholm", r"\bnorway\b", r"\boslo\b", r"denmark",
- r"copenhagen", r"switzerland", r"zurich", r"\bgeneva\b", r"austria", r"vienna", r"\bitaly\b",
- r"\bmilan\b", r"\brome\b", r"\bgreece\b", r"athens", r"turkey", r"istanbul", r"\buae\b", r"dubai",
- r"abu dhabi", r"saudi", r"riyadh", r"\bqatar\b", r"\bdoha\b", r"hong kong", r"south africa",
- r"johannesburg", r"cape town", r"\begypt\b", r"\bcairo\b", r"\bkenya\b", r"nairobi", r"\bnigeria\b",
- r"\blagos\b", r"lisbon", r"portugal", r"\bspain\b", r"\bmunich\b", r"germany", r"\bfrance\b",
- r"netherlands", r"ireland", r"\bbelgium\b", r"brussels",
- # multi-region tags: a bare "remote" must not read as US-remote when the region is foreign
- r"\bemea\b", r"\bapac\b", r"\bmena\b", r"\bcemea\b", r"europe", r"asia[\s-]?pacific",
- r"middle east", r"\banz\b"]
-# California carved out entirely — Bay Area is the active target metro, SoCal the long-term home
-OTHER_STATE = r"\b(alabama|alaska|arizona|arkansas|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|west virginia|wisconsin|wyoming|district of columbia|atlanta|austin|boston|denver|chicago|herndon|reston)\b"
-# two-letter state abbreviations after a separator ("Bastrop, TX", "Remote - CO") — WA and CA excluded
-ST_ABBR = re.compile(r"[,\-–]\s*(al|ak|az|ar|co|ct|de|dc|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wv|wi|wy)\b")
-CA_PAT = re.compile(r",\s*ca\b|\bcalifornia\b")
-SOCAL = ["los angeles", "san diego", "irvine", "santa monica", "long beach", "orange county", "pasadena",
-         "burbank", "el segundo", "hawthorne", "carlsbad", "anaheim", "costa mesa", "torrance",
-         "culver city", "riverside", "san bernardino", "ventura", "santa barbara"]
-# named-target employers (career-position doc 2026-07-18): AI/platform support + silicon/aerospace lanes
-TARGET_CO = [r"\banthropic\b", r"\bpylon\b", r"\bdatadog\b", r"\bappsflyer\b", r"\bnvidia\b",
-             r"\bamd\b", r"\bqualcomm\b", r"annapurna", r"\bspacex\b", r"blue origin"]
-# WA cities far outside the 45-min-from-Redmond commute range (relocation -1, not exclusion)
-FAR_WA = ["spokane", "vancouver, wa", "pasco", "kennewick", "richland", "yakima", "wenatchee",
-          "bellingham", "walla walla", "moses lake", "pullman", "longview", "port angeles"]
-DC_PAT = r"district of columbia|washington,?\s*d\.?c\.?|\bwashington dc\b"
-DISQ_SKILL = ["systemverilog","uvm","rtl","asic design","fpga development","rf design","signal integrity","kernel development",
- "device driver development","cpa","registered nurse"," rn ","journeyman","electrician license","pe license","phd required"]
-FAMILY = {
- "support": ["support engineer","technical support","escalation engineer","supportability","support analyst","customer engineer","application support","product support","support specialist","developer support"],
- "techops": ["technical operations","operations engineer","technology operations","ops engineer","site operations","it operations"],
- "validation": ["validation","hardware test","test engineer","qualification","sku"],
- "tpm": ["technical program manager","program manager","tpm","technical project manager"],
- "tam": ["technical account manager","solutions engineer","customer success engineer","forward deployed"],
-}
-# The ONLY in-scope role families (2026-07-19). Anything outside this set — TPM, solutions
-# engineer, account management — is excluded from the output entirely, not just down-ranked.
-# Widen this tuple to re-open those lanes.
-IN_SCOPE_FAMILIES = ("support", "techops", "validation")
 # config-driven (single source of truth: config.json profile), memoized
 _P = _METRO_C = _BAY_C = _EXCL_C = None
 def _profile():
@@ -469,8 +470,6 @@ def _title_excl():
     if _EXCL_C is None:
         _EXCL_C = [re.compile(r"\b" + re.escape(x.strip()) + r"\b") for x in _profile().get("title_exclude", [])]
     return _EXCL_C
-# IC roles titled "Manager" that are NOT people management
-_MGR_IC = re.compile(r"\b(?:program|project|product|account|engagement|escalation|incident|release|case)\s+manager\b")
 
 def posting_age_days(posted):
     """Days since posting, from ISO dates or 'Posted 30+ Days Ago' strings. None if unknown."""
@@ -514,17 +513,32 @@ def salary_from_desc(d):
             return lo, hi
     return None, None
 
-def score_row(r, desc):
-    """Rubric scoring per RUBRIC.md. Mutates r's salary fields when a band is
-    recovered from the description (WA pay-transparency extraction)."""
+def _score_row_core(r, desc):
+    """Shared implementation behind score_row() and score_row_explained().
+    Returns (tier, why, flags, features) -- the 3-tuple callers already know,
+    plus a features dict of {named_rule: point_contribution} for every rule
+    that fired, or {"blocker": <code>} for the single rule that excluded the
+    row. Every literal that used to live in a module-level constant here
+    (skills/domain/location/family/exclusion word lists, level and comp
+    thresholds, and the point value of every rule) now comes from
+    profile.json via `prof` -- rubric.py only supplies the shape of the
+    algorithm. The final `max(1, min(5, score))` clamp is the one exception:
+    the 1-5 output scale is the rubric's structural contract (consumers like
+    the tracker key off it), not a candidate preference, so it stays literal."""
+    prof = _rprofile()
+    W = prof.weights.score_row
     t = (r["title"] or "").lower()
     d = (desc or "").lower().replace("\\", "")
     company = (r["company"] or "").lower()
     loc = (r["location"] or "").lower()
-    why, flags = [], []
+    why, flags, features = [], [], {}
+
+    def blocked(reason, flags_, code):
+        return 0, reason, flags_, {"blocker": code}
+
     # location gate — Bay Area or US-remote ONLY (2026-07-18 directive: "bay area and remote only")
-    if any(re.search(p, loc) for p in NON_US):
-        return 0, "non-US location", ["blocker"]
+    if any(p.search(loc) for p in prof.location.non_us_patterns):
+        return blocked("non-US location", ["blocker"], "non_us_location")
     # A Bay Area city name counts as local only when a CA marker is also present. This both
     # rejects cross-state collisions ("Fremont, NE") AND keeps multi-location postings that
     # list SF alongside other cities ("San Francisco, CA | New York City, NY | Seattle, WA").
@@ -534,70 +548,80 @@ def score_row(r, desc):
     is_remote = str(r.get("remote", "")).strip().lower() == "true" \
         or bool(re.search(r"\bremote\b|work from home|\bwfh\b|\banywhere\b|\bnationwide\b|\bvirtual\b", loc))
     if not (bay_area or is_remote):
-        return 0, "not Bay Area or US-remote", ["off-target-loc"]
+        return blocked("not Bay Area or US-remote", ["off-target-loc"], "off_target_location")
     # family / function
-    fam = next((f for f, kws in FAMILY.items() if any(k in t for k in kws)), None)
+    fam = next((f for f, kws in prof.families.keywords.items() if any(k in t for k in kws)), None)
     if not fam:
-        fam = next((f for f, kws in FAMILY.items() if any(k in d[:1500] for k in kws)), None)
-    func = 3 if fam in ("support", "techops", "validation") else (2 if fam in ("tpm", "tam") else 1)
+        fam = next((f for f, kws in prof.families.keywords.items() if any(k in d[:1500] for k in kws)), None)
+    func = prof.families.function_weight.get(fam, 1)
+    top_func = max(prof.families.function_weight.values())
     # blockers — clearance judged per sentence so "able to obtain" elsewhere can't mask a hold-requirement
     for sent in re.split(r"[.;\n]", d):
-        if re.search(r"ts/?sci|top secret|secret clearance|security clearance", sent):
-            if re.search(r"requir|must|condition of employment|currently hold|active", sent) \
-               and not re.search(r"obtain|eligib", sent):
-                return 0, "requires active clearance", ["blocker"]
+        if prof.exclusions.clearance_required_pattern.search(sent):
+            if prof.exclusions.clearance_condition_pattern.search(sent) \
+               and not prof.exclusions.clearance_exception_pattern.search(sent):
+                return blocked("requires active clearance", ["blocker"], "active_clearance")
     # title excludes are word-boundary matches from config.json profile.title_exclude
     # ("intern" no longer swallows "Internal"/"International")
-    if any(k in d for k in DISQ_SKILL) or any(p.search(t) for p in _title_excl()):
-        return 0, "specialist/level blocker", ["blocker"]
+    if any(k in d for k in prof.exclusions.disqualifying_skills) or any(p.search(t) for p in _title_excl()):
+        return blocked("specialist/level blocker", ["blocker"], "specialist_skill_or_title")
     # people-management: any "Manager"/"Supervisor" in the title once IC manager
     # phrases (Program/Project/Product/Account/... Manager) are removed
-    if re.search(r"\bmanager\b|\bsupervisor\b", _MGR_IC.sub(" ", t)):
-        return 0, "people-management role", ["blocker"]
+    if prof.exclusions.people_management_pattern.search(prof.exclusions.ic_manager_pattern.sub(" ", t)):
+        return blocked("people-management role", ["blocker"], "people_management")
     yrs_req, yrs_pref = years_required(d)
-    if yrs_req and yrs_req >= 8:
-        return 0, f"requires {yrs_req}+ years", ["blocker"]
+    if yrs_req and yrs_req >= prof.experience.blocker_years_min:
+        return blocked(f"requires {yrs_req}+ years", ["blocker"], "years_required_too_high")
     score = func
-    if func == 3: why.append("core function match")
+    if func == top_func:
+        why.append("core function match"); features["function_match"] = func
     # level
-    senior = bool(re.search(r"\b(senior|sr\.?|staff|lead|iii|iv)\b", t))
+    senior = bool(prof.level.score_senior_pattern.search(t))
     if fam == "tpm" and senior:
-        score -= 2; flags.append("too-senior")
-    elif fam == "tpm" and re.search(r"\bii\b", t):
-        score -= 1; flags.append("tpm-ii-stretch")
-    elif fam == "validation" and senior and any(k in t for k in ["design", "verification"]):
-        return 0, "senior design/verification role", ["blocker"]
+        score += W["tpm_senior"]; flags.append("too-senior"); features["tpm_senior"] = W["tpm_senior"]
+    elif fam == "tpm" and prof.level.tpm_ii_pattern.search(t):
+        score += W["tpm_ii_stretch"]; flags.append("tpm-ii-stretch"); features["tpm_ii_stretch"] = W["tpm_ii_stretch"]
+    elif fam == "validation" and senior and any(k in t for k in prof.level.validation_design_keywords):
+        return blocked("senior design/verification role", ["blocker"], "senior_design_verification")
     elif senior and fam in ("validation", "techops"):
-        score -= 1; flags.append("stretch-level")
-    elif senior and fam == "support" and any(b in company for b in ["microsoft", "amazon", "google", "meta", "apple"]):
-        score -= 1; flags.append("stretch-level")
-    if yrs_req and 6 <= yrs_req <= 7: score -= 1; flags.append(f"{yrs_req}yrs-required")
-    elif yrs_req and yrs_req <= 3: score += 1; why.append(f"asks {yrs_req}yrs")
-    if yrs_pref and yrs_pref >= 8: score -= 1; flags.append(f"{yrs_pref}yrs-preferred")
+        score += W["stretch_level"]; flags.append("stretch-level"); features["stretch_level"] = W["stretch_level"]
+    elif senior and fam == "support" and any(b in company for b in prof.level.support_bigtech_companies):
+        score += W["stretch_level"]; flags.append("stretch-level"); features["stretch_level"] = W["stretch_level"]
+    if yrs_req and prof.experience.score_penalty_years_low <= yrs_req <= prof.experience.score_penalty_years_high:
+        score += W["years_penalty"]; flags.append(f"{yrs_req}yrs-required"); features["years_penalty"] = W["years_penalty"]
+    elif yrs_req and yrs_req <= prof.experience.score_bonus_years_max:
+        score += W["years_bonus"]; why.append(f"asks {yrs_req}yrs"); features["years_bonus"] = W["years_bonus"]
+    if yrs_pref and yrs_pref >= prof.experience.score_pref_penalty_years_min:
+        score += W["years_pref_penalty"]; flags.append(f"{yrs_pref}yrs-preferred"); features["years_pref_penalty"] = W["years_pref_penalty"]
     # domain (word-boundary regex; EEO boilerplate stripped)
     d_clean = re.sub(r"(equal (employment )?opportunity|eeo|gender identity|sexual orientation)[^.]*\.", " ", d)
-    hits2 = [p for p in DOMAIN2 if re.search(p, d_clean) or re.search(p, t)]
-    hits1 = [p for p in DOMAIN1 if re.search(p, d_clean) or re.search(p, t)]
-    dom = 2 if hits2 else (1 if hits1 else 0)
-    if hits2: why.append("domain: " + ",".join(h.replace("\\b", "").replace("\\", "") for h in hits2[:3]))
-    elif hits1: why.append("domain: " + ",".join(h.replace("\\b", "").replace("\\", "") for h in hits1[:2]))
+    hits2 = [p for p in prof.domain.tier2_patterns if p.search(d_clean) or p.search(t)]
+    hits1 = [p for p in prof.domain.tier1_patterns if p.search(d_clean) or p.search(t)]
+    dom = W["domain_tier2"] if hits2 else (W["domain_tier1"] if hits1 else 0)
+    if hits2:
+        why.append("domain: " + ",".join(h.pattern.replace("\\b", "").replace("\\", "") for h in hits2[:3]))
+        features["domain_tier2"] = W["domain_tier2"]
+    elif hits1:
+        why.append("domain: " + ",".join(h.pattern.replace("\\b", "").replace("\\", "") for h in hits1[:2]))
+        features["domain_tier1"] = W["domain_tier1"]
     score += dom
     # No support/validation/techops/tpm/tam role family = it doesn't relate — exclude it from
     # the output entirely (a lone domain keyword like "azure" on a Data/Silicon Engineer role
     # is not a support job). Previously these were kept as tier-2 noise.
     if fam is None:
-        return 0, "no role-family match", ["skip"]
-    if fam not in IN_SCOPE_FAMILIES:
-        return 0, "off-focus role (tpm/solutions/account-mgmt)", ["skip"]
-    if any(re.search(p, company) for p in TARGET_CO) and fam:
-        score += 1; flags.append("target-co"); why.append("named-target employer")
+        return blocked("no role-family match", ["skip"], "no_role_family_match")
+    if fam not in prof.families.in_scope:
+        return blocked("off-focus role (tpm/solutions/account-mgmt)", ["skip"], "off_focus_role")
+    if any(p.search(company) for p in prof.targets.employer_patterns) and fam:
+        score += W["target_co"]; flags.append("target-co"); why.append("named-target employer")
+        features["target_co"] = W["target_co"]
     why.append("Bay Area" if bay_area else "US-remote")
-    if re.search(r"\bstaff\b", t):
-        score = min(score, 2); flags.append("level-out")  # Principal/Staff: "Out (cap at 2)"
+    if prof.level.staff_cap_pattern.search(t):
+        score = min(score, prof.tier_rules.staff_cap_tier); flags.append("level-out")  # Principal/Staff: "Out (cap at 2)"
     # logistics: posting age (>30d = -1 per RUBRIC dimension 6)
     age = posting_age_days(r.get("posted"))
-    if age is not None and age > 30:
-        score -= 1; flags.append("30d+")
+    if age is not None and age > prof.tier_rules.stale_penalty_days:
+        score += W["stale_30d"]; flags.append("30d+"); features["stale_30d"] = W["stale_30d"]
     # comp — posting field first, then WA pay-transparency extraction from description
     lo, hi = parse_salary(r.get("salary") or "")
     if not lo:
@@ -612,29 +636,48 @@ def score_row(r, desc):
             r["salary"] = f"${lo:,}-${hi:,} (from description)"
             flags.append("salary-from-desc")
     if lo: r["salary_min"], r["salary_max"] = int(lo), int(hi or lo)
-    if lo and hi and lo <= 150000 and hi >= 99000: score += 1; why.append("comp in band")
-    elif hi and hi < 85000: score -= 1; flags.append("low-comp")
+    if lo and hi and lo <= prof.comp.band_high and hi >= prof.comp.band_low:
+        score += W["comp_in_band"]; why.append("comp in band"); features["comp_in_band"] = W["comp_in_band"]
+    elif hi and hi < prof.comp.low_comp_threshold:
+        score += W["low_comp"]; flags.append("low-comp"); features["low_comp"] = W["low_comp"]
     # employment type
-    if "c2c" in d or "corp to corp" in d or "third party" in d:
-        score -= 2; flags.append("C2C")
-    elif any(s in company for s in STAFFING):
-        score -= 1; flags.append("Staffing/W2")
+    if any(k in d for k in prof.employers.c2c_keywords):
+        score += W["c2c"]; flags.append("C2C"); features["c2c"] = W["c2c"]
+    elif any(s in company for s in prof.employers.staffing_agencies):
+        score += W["staffing_w2"]; flags.append("Staffing/W2"); features["staffing_w2"] = W["staffing_w2"]
     if not desc:
         flags.append("desc-unavailable")
-    if re.search(r"bachelor'?s? degree (is )?required", d) and "equivalent" not in d:
-        score -= 1; flags.append("degree-gated")
-    tier = max(1, min(5, score))
+    if prof.exclusions.degree_required_pattern.search(d) and prof.exclusions.degree_equivalent_exception not in d:
+        score += W["degree_gated"]; flags.append("degree-gated"); features["degree_gated"] = W["degree_gated"]
+    tier = max(1, min(5, score))  # structural: the rubric's 1-5 output scale, not a preference
     # RUBRIC tier mapping enforced: 5 requires Function 3 (fam is None already excluded above)
-    if func < 3 and tier > 4:
-        tier = 4; flags.append("func-cap")
-    if not desc and tier > 3:
-        tier = 3; flags.append("needs-desc")  # rule zero: no 4/5 without a read description
+    if func < prof.tier_rules.func_cap_min_func and tier > prof.tier_rules.func_cap_tier:
+        tier = prof.tier_rules.func_cap_tier; flags.append("func-cap")
+    if not desc and tier > prof.tier_rules.no_desc_cap_tier:
+        tier = prof.tier_rules.no_desc_cap_tier; flags.append("needs-desc")  # rule zero: no 4/5 without a read description
     # ghost-listing guards: very old or undated aggregator postings can't be 4/5
-    if age is not None and age > 90:
-        tier = min(tier, 3); flags.append("stale-90d+")
+    if age is not None and age > prof.tier_rules.stale_cap_days:
+        tier = min(tier, prof.tier_rules.stale_cap_tier); flags.append("stale-90d+")
     elif age is None and (r.get("source") or "").startswith(AGG_SOURCES):
-        if tier > 3: tier = 3; flags.append("undated-aggregator")
-    return tier, "; ".join(why[:6]), flags
+        if tier > prof.tier_rules.undated_aggregator_cap_tier:
+            tier = prof.tier_rules.undated_aggregator_cap_tier; flags.append("undated-aggregator")
+    return tier, "; ".join(why[:6]), flags, features
+
+def score_row(r, desc):
+    """Rubric scoring per RUBRIC.md. Mutates r's salary fields when a band is
+    recovered from the description (WA pay-transparency extraction)."""
+    tier, why, flags, _features = _score_row_core(r, desc)
+    return tier, why, flags
+
+def score_row_explained(r, desc):
+    """Same computation as score_row(), plus the feature vector that fired
+    (or the blocker name) and the profile/rubric hashes -- what Phase 3.3's
+    persistence layer stores alongside a score so a tier is reproducible and
+    auditable after profile.json or RUBRIC_VERSION later change."""
+    tier, why, flags, features = _score_row_core(r, desc)
+    prof = _rprofile()
+    return ScoreResult(tier=tier, why=why, flags=flags, features=features,
+                        profile_hash=prof.content_hash, rubric_hash=RUBRIC_VERSION)
 
 def load_picks():
     """Human picks (picks.json) + LLM-confirmed picks (picks_llm.json, written by

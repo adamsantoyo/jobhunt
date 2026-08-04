@@ -20,6 +20,7 @@ jobs:
       - name: Run pipeline fixtures
         run: |
           cp config.example.json config.json
+          cp profile.example.json profile.json
           uv run --frozen python tests.py
       - name: Run Python tests
         run: uv run --frozen pytest -q

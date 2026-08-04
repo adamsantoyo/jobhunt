@@ -1,6 +1,8 @@
 # ---- personal data: never publish ----
 # personal profile (targets, salary band)
 config.json
+# candidate-scoring profile: target employers, comp band, skills, exclusions
+profile.json
 # personal resume / scoring calibration
 RUBRIC.md
 # personal targeting narrative

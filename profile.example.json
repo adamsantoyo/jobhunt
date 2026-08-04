@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "location": {
+    "non_us_patterns": [
+      "\\bexamplestan\\b",
+      "example city one",
+      "example city two",
+      "\\bexample region\\b"
+    ],
+    "other_state_pattern": "\\b(example state one|example state two|example remote city)\\b",
+    "socal_cities": [
+      "example city three",
+      "example city four"
+    ],
+    "far_wa_cities": [
+      "example city five",
+      "example city six"
+    ],
+    "dc_pattern": "example federal district|example dc pattern"
+  },
+  "families": {
+    "keywords": {
+      "role_family_a": [
+        "example title one",
+        "example title two"
+      ],
+      "role_family_b": [
+        "example title three"
+      ],
+      "role_family_c": [
+        "example title four",
+        "example title five"
+      ]
+    },
+    "in_scope": [
+      "role_family_a",
+      "role_family_b"
+    ],
+    "function_weight": {
+      "role_family_a": 3,
+      "role_family_b": 2,
+      "role_family_c": 1
+    }
+  },
+  "domain": {
+    "tier2_patterns": [
+      "example domain skill one",
+      "\\bexampletool\\b",
+      "example platform name"
+    ],
+    "tier1_patterns": [
+      "example industry term",
+      "example certification"
+    ]
+  },
+  "skills": {
+    "his_skills": [
+      "example skill one",
+      "example skill two",
+      "\\bexampletool\\b",
+      "example skill three"
+    ],
+    "exact_stack_patterns": [
+      "\\bexampletool\\b",
+      "example platform name"
+    ]
+  },
+  "targets": {
+    "employer_patterns": [
+      "\\bexamplecorp\\b",
+      "\\backmeco\\b",
+      "example target employer"
+    ]
+  },
+  "competition": {
+    "high_competition_employers": [
+      "bigtechco",
+      "megacorp",
+      "unicorn startup inc"
+    ]
+  },
+  "employers": {
+    "staffing_agencies": [
+      "example staffing agency",
+      "example recruiting firm",
+      "staffing",
+      "recruiting"
+    ],
+    "c2c_keywords": [
+      "c2c",
+      "corp to corp",
+      "third party"
+    ]
+  },
+  "exclusions": {
+    "disqualifying_skills": [
+      "example disqualifying skill one",
+      "example disqualifying skill two"
+    ],
+    "clearance_required_pattern": "ts/?sci|top secret|secret clearance|security clearance",
+    "clearance_condition_pattern": "requir|must|condition of employment|currently hold|active",
+    "clearance_exception_pattern": "obtain|eligib",
+    "people_management_pattern": "\\bmanager\\b|\\bsupervisor\\b",
+    "ic_manager_titles": [
+      "program",
+      "project",
+      "product",
+      "account"
+    ],
+    "degree_required_pattern": "bachelor'?s? degree (is )?required",
+    "degree_equivalent_exception": "equivalent"
+  },
+  "level": {
+    "hireability_staff_principal_pattern": "\\b(staff|principal|distinguished|director|head)\\b",
+    "hireability_senior_pattern": "\\b(senior|sr\\.?|lead|iii|iv)\\b|\\blevel ?[3-9]\\b|\\bl[3-9]\\b",
+    "hireability_junior_pattern": "\\b(junior|associate|entry|tier ?1|level ?1)\\b",
+    "score_senior_pattern": "\\b(senior|sr\\.?|staff|lead|iii|iv)\\b",
+    "staff_cap_pattern": "\\bstaff\\b",
+    "tpm_ii_pattern": "\\bii\\b",
+    "validation_design_keywords": [
+      "example design keyword",
+      "example verification keyword"
+    ],
+    "support_bigtech_companies": [
+      "bigtechco",
+      "megacorp"
+    ]
+  },
+  "comp": {
+    "hireability_high_bar": 150000,
+    "hireability_near_level": 70000,
+    "band_low": 80000,
+    "band_high": 120000,
+    "low_comp_threshold": 60000
+  },
+  "experience": {
+    "hireability_bonus_years_max": 3,
+    "hireability_penalty_years_min": 6,
+    "blocker_years_min": 8,
+    "score_penalty_years_low": 6,
+    "score_penalty_years_high": 7,
+    "score_bonus_years_max": 3,
+    "score_pref_penalty_years_min": 8
+  },
+  "tier_rules": {
+    "staff_cap_tier": 2,
+    "func_cap_min_func": 3,
+    "func_cap_tier": 4,
+    "no_desc_cap_tier": 3,
+    "stale_penalty_days": 30,
+    "stale_cap_days": 90,
+    "stale_cap_tier": 3,
+    "undated_aggregator_cap_tier": 3
+  },
+  "hireability_labels": {
+    "likely_threshold": 3,
+    "reach_threshold": -2
+  },
+  "weights": {
+    "hireability": {
+      "staff_principal": -3,
+      "senior": -2,
+      "junior": 2,
+      "years_low": 1,
+      "years_high": -1,
+      "high_competition": -2,
+      "staffing_w2": 2,
+      "skills_strong": 2,
+      "skills_moderate": 1,
+      "skills_thin": -1,
+      "exact_stack": 1,
+      "comp_high_bar": -1,
+      "comp_near_level": 1,
+      "degree_gated": -1
+    },
+    "score_row": {
+      "tpm_senior": -2,
+      "tpm_ii_stretch": -1,
+      "stretch_level": -1,
+      "years_penalty": -1,
+      "years_bonus": 1,
+      "years_pref_penalty": -1,
+      "domain_tier2": 2,
+      "domain_tier1": 1,
+      "target_co": 1,
+      "stale_30d": -1,
+      "comp_in_band": 1,
+      "low_comp": -1,
+      "c2c": -2,
+      "staffing_w2": -1,
+      "degree_gated": -1
+    }
+  }
+}

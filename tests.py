@@ -194,6 +194,107 @@ check("registry: spacex", canon_company("SpaceX") in reg and reg[canon_company("
 check("registry: costco", reg.get("costco wholesale", ("",))[0] == "costco")
 check("registry: fred hutch", canon_company("Fred Hutchinson Cancer Center") in reg)
 check("registry: starbucks eightfold", reg.get(canon_company("Starbucks"), ("",))[0] == "eightfold")
+
+print("== profile.py: validation, hashing, feature vectors (Phase 3.4) ==")
+import candidate_profile as _prof_mod
+from rubric import score_row_explained, hireability_explained, RUBRIC_VERSION
+
+_PROFILE_DOC = _json.load(open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "profile.json")))
+
+def _mutated(fn):
+    """Deep-copy the real profile.json, let fn(doc) mutate it in place, return it."""
+    d = _json.loads(_json.dumps(_PROFILE_DOC))
+    fn(d)
+    return d
+
+def _rejects(name, mutate_fn, needle=""):
+    d = _mutated(mutate_fn)
+    try:
+        _prof_mod.build_profile(d)
+        check(name, False, "expected ProfileValidationError, got none")
+    except _prof_mod.ProfileValidationError as e:
+        check(name, needle in str(e), str(e))
+
+# -- validation failures --
+check("valid profile.json loads clean", _prof_mod.build_profile(_PROFILE_DOC) is not None)
+
+# profile.example.json (tracked, scrubbed placeholder) must independently pass
+# the same validator as the real (gitignored) profile.json -- this is what
+# keeps CI green without the real candidate data ever being committed.
+_EXAMPLE_PROFILE_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "profile.example.json")
+_EXAMPLE_PROFILE_DOC = _json.load(open(_EXAMPLE_PROFILE_PATH))
+check("profile.example.json loads clean through the validator",
+      _prof_mod.build_profile(_EXAMPLE_PROFILE_DOC) is not None)
+_rejects("unknown top-level key rejected", lambda d: d.update(bogus_field=1), "unknown key")
+_rejects("missing top-level key rejected", lambda d: d.pop("comp"), "missing required key")
+_rejects("bad regex reported by field name", lambda d: d["location"].__setitem__(
+    "non_us_patterns", ["[unclosed"] + d["location"]["non_us_patterns"][1:]), "location.non_us_patterns")
+_rejects("wrong type rejected", lambda d: d["comp"].__setitem__("band_low", "99000"), "expected an integer")
+_rejects("missing score_row weight rejected", lambda d: d["weights"]["score_row"].pop("c2c"), "missing required weight")
+_rejects("extra score_row weight rejected", lambda d: d["weights"]["score_row"].__setitem__("nonsense", 1), "unknown weight key")
+_rejects("missing hireability weight rejected", lambda d: d["weights"]["hireability"].pop("senior"), "missing required weight")
+_rejects("unknown family in in_scope rejected", lambda d: d["families"].__setitem__("in_scope", ["ghost_family"]), "unknown family")
+
+# -- empty-collection guards (an empty list here silently changes scorer
+# behavior instead of raising: e.g. an empty ic_manager_titles compiles
+# `\b(?:)\s+manager\b`, which matches every "<word> manager" title and
+# silently disables the people-management blocker; an empty
+# exact_stack_patterns makes the `all()` bonus check vacuously true and fires
+# on every long JD) --
+_rejects("empty ic_manager_titles rejected", lambda d: d["exclusions"].__setitem__("ic_manager_titles", []),
+         "must be non-empty")
+_rejects("empty exact_stack_patterns rejected", lambda d: d["skills"].__setitem__("exact_stack_patterns", []),
+         "must be non-empty")
+_rejects("empty families.function_weight rejected", lambda d: d["families"].__setitem__("function_weight", {}),
+         "must be non-empty")
+_rejects("empty families.in_scope rejected", lambda d: d["families"].__setitem__("in_scope", []),
+         "must be non-empty")
+_rejects("empty families.keywords rejected", lambda d: d["families"].__setitem__("keywords", {}),
+         "must be non-empty")
+_rejects("empty location.non_us_patterns rejected", lambda d: d["location"].__setitem__("non_us_patterns", []),
+         "must be non-empty")
+_rejects("empty targets.employer_patterns rejected", lambda d: d["targets"].__setitem__("employer_patterns", []),
+         "must be non-empty")
+
+# -- families.function_weight keys must exactly match families.keywords keys --
+_rejects("function_weight missing a keyword family rejected",
+         lambda d: d["families"]["function_weight"].pop("tam"), "missing weight")
+_rejects("function_weight extra unknown family rejected",
+         lambda d: d["families"]["function_weight"].__setitem__("ghost_family", 1), "unknown family key")
+
+# -- hash stability --
+h1 = _prof_mod.profile_content_hash(_PROFILE_DOC)
+h2 = _prof_mod.profile_content_hash(_json.loads(_json.dumps(_PROFILE_DOC)))
+check("same doc -> same content hash", h1 == h2)
+reordered = dict(reversed(list(_PROFILE_DOC.items())))
+check("key-order independent hash", _prof_mod.profile_content_hash(reordered) == h1)
+mutated_doc = _mutated(lambda d: d["comp"].__setitem__("band_low", 1))
+check("changed doc -> different content hash", _prof_mod.profile_content_hash(mutated_doc) != h1)
+
+row_ver = _prof_mod.build_profile_version_row(_PROFILE_DOC)
+check("version row has all five columns", set(row_ver) == {"profile_version_id", "content_hash", "profile_json", "rubric_hash", "created_at"})
+check("version row content_hash matches profile_content_hash", row_ver["content_hash"] == h1)
+check("version row rubric_hash is None (scorer identity lives in score_versions.scorer_hash)", row_ver["rubric_hash"] is None)
+row_ver2 = _prof_mod.build_profile_version_row(_PROFILE_DOC)
+check("version row id/hash idempotent across calls", row_ver["profile_version_id"] == row_ver2["profile_version_id"]
+      and row_ver["content_hash"] == row_ver2["content_hash"])
+
+# -- feature-vector correctness (hand-computed) --
+res = score_row_explained(row("Support Engineer"), "General duties. 5 years experience needed for this role.")
+check("score_row_explained: plain-family-only row features == {function_match: 3}", res.features == {"function_match": 3}, res.features)
+check("score_row_explained: features sum to tier when no cap engaged", sum(res.features.values()) == res.tier, (res.features, res.tier))
+check("score_row_explained: carries profile_hash + rubric_hash", res.profile_hash == h1 and res.rubric_hash == RUBRIC_VERSION)
+
+blocked_res = score_row_explained(row("Manager, Technical Support Engineer", "CoreWeave", "San Jose, CA"), GOOD_DESC)
+check("score_row_explained: blocked row features == {blocker: code}", blocked_res.features == {"blocker": "people_management"}, blocked_res.features)
+check("score_row_explained: blocked row tier is 0", blocked_res.tier == 0)
+
+hire_r = row("IT Support Specialist II", company="Acme Co"); hire_r["salary_max"] = "80000"; hire_r["flags"] = ""
+hres = hireability_explained(hire_r, "Support Windows endpoints with Intune and Entra ID, Active Directory, M365, ServiceNow tickets. 2+ years.")
+check("hireability_explained: hand-computed features", hres.features == {"junior": 2, "comp_near_level": 1}, hres.features)
+check("hireability_explained: features sum to score", sum(hres.features.values()) == hres.score, (hres.features, hres.score))
+check("hireability_explained: score composes to label", hres.label == "Likely" and hres.score >= 3, (hres.label, hres.score))
+
 print()
 print(f"{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
