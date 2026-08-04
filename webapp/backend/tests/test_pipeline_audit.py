@@ -101,7 +101,7 @@ def test_fully_backfilled_database_is_ready_and_json_safe(tmp_path):
 
     assert report["readiness"] == {"ready": True, "blockers": []}
     assert report["database"] == {
-        "integrity_check": "ok", "foreign_key_violation_count": 0, "schema_version": 15,
+        "integrity_check": "ok", "foreign_key_violation_count": 0, "schema_version": 18,
     }
     for private_value in (
         PRIVATE_URL, PRIVATE_KEY, PRIVATE_TITLE, PRIVATE_COMPANY, PRIVATE_NOTES,
@@ -142,9 +142,12 @@ def test_current_missing_and_unexpected_rows_are_counted(tmp_path):
         "VALUES ('extra-alias','extra','url','native','extra','https://extra','2026-01-01')"
     )
     conn.execute(
+        # 'legacy-current', because that is the only kind `compat_jobs` selects: the
+        # view answers "did the legacy jobs table survive the migration", so a row
+        # that is unexpected THERE is a backfilled row with no legacy counterpart.
         "INSERT INTO posting_versions "
         "(posting_version_id,posting_id,version_kind,version_hash,observed_at,tier,payload_json) "
-        "VALUES ('extra-version','extra','source','extra-hash','2026-01-01',1,'{}')"
+        "VALUES ('extra-version','extra','legacy-current','extra-hash','2026-01-01',1,'{}')"
     )
     conn.commit()
 
@@ -152,6 +155,49 @@ def test_current_missing_and_unexpected_rows_are_counted(tmp_path):
 
     assert parity["missing_canonical"] == 1
     assert parity["unexpected_canonical"] == 1
+    conn.close()
+
+
+def test_scheduler_written_postings_stay_out_of_the_legacy_parity_view(tmp_path):
+    """A posting the Phase 3.1 scheduler discovered is not a legacy job.
+
+    `compat_jobs` exists to prove the legacy `jobs` table survived the canonical
+    migration, and the audit reports anything in it without a counterpart in `jobs` as
+    unexplained. Before migration 17 the view also selected 'source' versions — inert
+    while nothing wrote them, and a corpus-sized parity break from the moment the
+    scheduler started minting one per posting it found.
+    """
+    conn, _ = _backfilled_db(tmp_path)
+    before = build_audit_report(conn)
+
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at) "
+        "VALUES ('p-sched','active','2026-08-01','2026-08-01')"
+    )
+    conn.execute(
+        "INSERT INTO pipeline_runs (run_uid,kind,status,requested_at) "
+        "VALUES ('run-sched','full_direct','succeeded','2026-08-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO posting_versions (posting_version_id,posting_id,version_kind,"
+        "version_hash,observed_at,title,company,payload_json) "
+        "VALUES ('v-sched','p-sched','source','sha256:abc','2026-08-01','T','C','{}')"
+    )
+    conn.execute(
+        "INSERT INTO run_postings (run_uid,posting_id,posting_version_id,present,"
+        "first_seen_in_run,recorded_at,membership_kind,source_state_json) "
+        "VALUES ('run-sched','p-sched','v-sched',1,1,'2026-08-01','snapshot','{}')"
+    )
+    conn.commit()
+
+    after = build_audit_report(conn)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM compat_jobs WHERE seen_key='p-sched'"
+    ).fetchone()[0] == 0
+    assert after["conservation"]["current_jobs"] == before["conservation"]["current_jobs"]
+    assert after["parity"]["current_jobs"] == before["parity"]["current_jobs"]
+    assert after["readiness"] == before["readiness"]
     conn.close()
 
 

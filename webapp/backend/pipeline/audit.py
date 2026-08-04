@@ -414,7 +414,17 @@ def build_audit_report(conn):
         for row in legacy_jobs if (row["url"], row["seen_key"]) in lineage_map
     )
     actual_memberships = {
-        (row["legacy_run_date"], row["posting_id"]) for row in run_posting_rows
+        (row["legacy_run_date"], row["posting_id"])
+        for row in run_posting_rows
+        # LEGACY runs only. `expected_memberships` is built from `job_history` and
+        # `jobs`, both keyed by a legacy run DATE, so it can only ever describe runs
+        # that came from the legacy database. A canonical run — anything the scheduler
+        # executes — has no `legacy_run_date` at all, and counting its memberships
+        # here reports every posting the scheduler ever discovered as an unexplained
+        # membership: not data loss, just a Phase 1 parity check being asked a Phase 2
+        # question. Orphan detection above deliberately still counts these rows, since
+        # a scheduler-discovered posting IS owned by its run.
+        if row["legacy_run_date"] is not None
     }
     unexplained_membership_count = len(actual_memberships - expected_memberships)
 

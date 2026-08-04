@@ -268,6 +268,48 @@ CREATE INDEX IF NOT EXISTS idx_descriptions_posting_fetched
     ON descriptions(posting_id, fetched_at);
 """
 
+# The one index Phase 3.1 adds (migration 16). "What did this run mint?" is the
+# question every downstream consumer of a run's changes asks — the run's own report
+# counts them, and 3.2/3.3 select the versions to describe and score — and without an
+# index on `source_run_id` that question is a full scan of `posting_versions`, whose
+# size grows with the whole corpus rather than with the run. The roadmap's rule for
+# this phase is explicit: never scan all postings after each source.
+#
+# Shared verbatim by CONTENT_DDL (fresh databases, appended below) and migration 16
+# (existing ones), for the sqlite_master text-equality reason spelled out above
+# migration 14's columns. `IF NOT EXISTS` makes both paths idempotent, which is what
+# lets a database created at v8 with the appended DDL run migration 16 as a no-op.
+POSTING_VERSION_SOURCE_RUN_INDEX = "idx_posting_versions_source_run"
+
+POSTING_VERSION_SOURCE_RUN_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {POSTING_VERSION_SOURCE_RUN_INDEX}
+    ON posting_versions(source_run_id);
+"""
+
+CONTENT_DDL += POSTING_VERSION_SOURCE_RUN_INDEX_DDL
+
+# run_postings.source_state_json — Phase 3.1's per-observation content state.
+#
+# A JSON object mapping each OBSERVING SOURCE INSTANCE's namespace to the
+# `posting_versions.posting_version_id` that source had current at this observation:
+#
+#     {"greenhouse:acme": "…-uuid-…", "jobspy:indeed": "…-uuid-…"}
+#
+# It exists because `content_hash()` includes the source that produced the record, so
+# two sources describing ONE posting can never agree on a hash. A single "current
+# version" per posting therefore alternates every time the sources take turns, and the
+# posting reads as changed forever. State is per (posting, source instance); this
+# column is where a run records the whole of it, which makes "did anything about this
+# posting move" a comparison of two strings rather than a guess about whose turn it
+# was. Canonical JSON (sorted keys), so equal states compare equal as text.
+#
+# Nullable: every pre-existing row — legacy imports, and any run written before this
+# phase — genuinely has no such state, and NULL says so where an empty object would
+# claim the posting had been observed with no sources.
+RUN_POSTING_SOURCE_STATE_COLUMN_DDL = """
+ALTER TABLE run_postings ADD COLUMN source_state_json TEXT;
+"""
+
 DECISIONS_DDL = """
 CREATE TABLE IF NOT EXISTS score_versions (
     score_version_id TEXT PRIMARY KEY,
@@ -346,7 +388,24 @@ CREATE TABLE IF NOT EXISTS run_postings (
 );
 CREATE INDEX IF NOT EXISTS idx_run_postings_posting
     ON run_postings(posting_id, run_uid);
+"""
 
+# `compat_jobs` is a LEGACY-PARITY view and nothing else: Phase 1's audit compares it
+# row for row against the `jobs` table it was built from, and Phase 4 is where readers
+# move to canonical tables. It is therefore bounded to migration 11's backfilled
+# 'legacy-current' versions.
+#
+# Migration 17 narrowed it. Before Phase 3.1 nothing wrote a 'source' version, so the
+# original `version_kind IN ('source', 'legacy-current')` was inert; the moment the
+# scheduler started minting source versions, every posting it discovered appeared here
+# as a job with NULL tier/odds — a row with no counterpart in `jobs`, which is exactly
+# what the parity audit is built to report as unexplained. Scheduler-discovered
+# postings are not legacy jobs and must not masquerade as them.
+#
+# Shared verbatim by COMPATIBILITY_DDL (fresh databases) and migration 17 (existing
+# ones), so an upgraded database's sqlite_master text is byte-identical to a fresh
+# one's.
+COMPAT_JOBS_VIEW_DDL = """
 CREATE VIEW IF NOT EXISTS compat_jobs AS
 SELECT (SELECT a2.url FROM posting_aliases a2
     WHERE a2.posting_id = p.posting_id AND a2.valid_to IS NULL AND a2.url IS NOT NULL
@@ -365,7 +424,7 @@ SELECT (SELECT a2.url FROM posting_aliases a2
 FROM postings p
 JOIN posting_versions v ON v.posting_version_id = (
     SELECT v2.posting_version_id FROM posting_versions v2
-    WHERE v2.posting_id = p.posting_id AND v2.version_kind IN ('source', 'legacy-current')
+    WHERE v2.posting_id = p.posting_id AND v2.version_kind = 'legacy-current'
     ORDER BY v2.observed_at DESC, v2.posting_version_id DESC LIMIT 1
 )
 LEFT JOIN descriptions d ON d.description_id = (
@@ -373,7 +432,9 @@ LEFT JOIN descriptions d ON d.description_id = (
     WHERE d2.posting_id = p.posting_id ORDER BY d2.fetched_at DESC, d2.description_id DESC LIMIT 1
 )
 ;
+"""
 
+COMPATIBILITY_DDL += COMPAT_JOBS_VIEW_DDL + """
 CREATE VIEW IF NOT EXISTS compat_runs AS
 SELECT legacy_run_date AS run_date, kept_count AS kept, new_count AS new_this_run,
              aggregate_report_json AS report_json, source_health_json AS source_health_json,
@@ -538,6 +599,7 @@ CANONICAL_DDL = "\n".join((
         RUN_POSTING_MEMBERSHIP_OBJECTS_DDL,
         SCHEDULER_PERSISTENCE_COLUMNS_DDL,
         POSTING_PRESENCE_COLUMNS_DDL,
+        RUN_POSTING_SOURCE_STATE_COLUMN_DDL,
 ))
 
 
@@ -1342,6 +1404,62 @@ def _migration_15_posting_presence(conn: sqlite3.Connection) -> None:
             _execute_ddl(conn, ddl)
 
 
+def _migration_16_posting_version_source_run_index(conn: sqlite3.Connection) -> None:
+    """Index `posting_versions.source_run_id` for Phase 3.1's change accounting.
+
+    Index-only: 3.1 needs no new column. A source version is identified by
+    `UNIQUE (posting_id, version_hash)` — content that reverts to an earlier state
+    re-links the row that already exists rather than writing a second one — and which
+    version was current at an observation is already recorded, per run, by
+    `run_postings.posting_version_id`. What was missing is only the ability to ask
+    "which versions did this run mint?" without scanning the table.
+
+    `CREATE INDEX IF NOT EXISTS` is idempotent by construction, so this needs no
+    PRAGMA guard of the sort migrations 13-15 use for columns, and it is safe on both
+    a fresh database (CONTENT_DDL already created it) and a re-invocation from the
+    migration tests.
+    """
+    _execute_ddl(conn, POSTING_VERSION_SOURCE_RUN_INDEX_DDL)
+
+
+def _migration_17_compat_jobs_legacy_only(conn: sqlite3.Connection) -> None:
+    """Narrow `compat_jobs` to migration 11's legacy-current versions.
+
+    The view existed to prove the legacy `jobs` table survived the canonical
+    migration, and it selected each posting's newest version of kind 'source' OR
+    'legacy-current'. Nothing wrote a 'source' version until Phase 3.1, so the extra
+    kind was inert — and the moment the scheduler began minting them, every posting it
+    discovered showed up in a LEGACY-PARITY view as a job with NULL tier and NULL odds
+    and no row in `jobs` to match, which the Phase 1 audit correctly reports as
+    unexplained. Canonical readers arrive in Phase 4; until then this view answers
+    exactly one question, about exactly the rows migration 11 created.
+
+    Recreate rather than ALTER, because SQLite has no ALTER VIEW. The DROP is
+    unconditional and the CREATE re-runs the shared constant, so an upgraded database
+    ends up with the same sqlite_master text as a fresh one, and re-invoking this
+    migration directly (as the migration tests do) is inert.
+    """
+    _execute_ddl(conn, "DROP VIEW IF EXISTS compat_jobs;\n" + COMPAT_JOBS_VIEW_DDL)
+
+
+def _migration_18_run_posting_source_state(conn: sqlite3.Connection) -> None:
+    """Add `run_postings.source_state_json` — Phase 3.1's per-source content state.
+
+    Per-column PRAGMA guard rather than a bare ALTER, matching migrations 4, 13, 14
+    and 15: a fresh database already has the column from CANONICAL_DDL, and the
+    migration tests re-invoke this function directly against one.
+
+    No backfill. A row written before this phase recorded no per-source state, and
+    NULL says that honestly — it also means the first run after this migration sees no
+    previous state for anything and marks the whole corpus dirty exactly once, which
+    is the correct one-time answer for a database that has never had a content
+    baseline (see `runstore.dirty_posting_ids`).
+    """
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(run_postings)")}
+    if "source_state_json" not in columns:
+        _execute_ddl(conn, RUN_POSTING_SOURCE_STATE_COLUMN_DDL)
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
@@ -1359,6 +1477,9 @@ MIGRATIONS = [
     (13, "run_posting_membership", _migration_13_run_posting_membership),
     (14, "scheduler_persistence_columns", _migration_14_scheduler_persistence),
     (15, "posting_presence_columns", _migration_15_posting_presence),
+    (16, "posting_version_source_run_index", _migration_16_posting_version_source_run_index),
+    (17, "compat_jobs_legacy_only", _migration_17_compat_jobs_legacy_only),
+    (18, "run_posting_source_state", _migration_18_run_posting_source_state),
 ]
 
 

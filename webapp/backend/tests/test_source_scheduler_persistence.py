@@ -383,7 +383,7 @@ def test_a_second_run_reuses_the_posting_and_records_new_membership(tmp_path):
     assert {r["run_uid"]: r["n"] for r in flags} == {first.run_uid: 2, second.run_uid: 0}
 
 
-def test_content_hash_is_stored_for_phase_three_to_diff(tmp_path):
+def test_content_hash_is_stored_and_is_the_versions_own_hash(tmp_path):
     connect = make_connect(tmp_path)
     adapter = FakeAdapter("src", instances=("board",), body=fast(2))
 
@@ -393,8 +393,16 @@ def test_content_hash_is_stored_for_phase_three_to_diff(tmp_path):
     assert len(hashes) == 2
     assert all(h and h.startswith("sha256:") for h in hashes)
     assert len(set(hashes)) == 2
-    # Phase 2 records the hash and nothing else; versioning is Phase 3.1.
-    assert scalar(connect, "SELECT COUNT(*) FROM posting_versions") == 0
+    # Phase 3.1: the membership row's hash and the version it links are the same
+    # statement about the same content, and nothing may let them diverge — the
+    # version lookup on the next run compares against the version's copy.
+    assert scalar(connect, "SELECT COUNT(*) FROM posting_versions") == 2
+    assert scalar(
+        connect,
+        "SELECT COUNT(*) FROM run_postings rp JOIN posting_versions v "
+        "  ON v.posting_version_id = rp.posting_version_id "
+        "WHERE v.version_hash <> rp.content_hash",
+    ) == 0
 
 
 def test_a_changed_record_changes_its_stored_hash(tmp_path):
@@ -426,6 +434,14 @@ def test_a_changed_record_changes_its_stored_hash(tmp_path):
     assert len(hashes) == 2
     assert hashes[0] != hashes[1], "a material change must be visible to Phase 3.1"
     assert scalar(connect, "SELECT COUNT(*) FROM postings") == 1
+    # And Phase 3.1 acted on it: one posting, two versions, one per observed content.
+    # (`test_source_posting_versions.py` owns the versioning rules in full; this is
+    # the hash-level assertion that the change was detectable in the first place.)
+    assert scalar(connect, "SELECT COUNT(*) FROM posting_versions") == 2
+    assert scalar(
+        connect,
+        "SELECT COUNT(DISTINCT posting_version_id) FROM run_postings",
+    ) == 2
 
 
 def test_the_legacy_tables_are_never_written(tmp_path):

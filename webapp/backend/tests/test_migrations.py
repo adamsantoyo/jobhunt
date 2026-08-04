@@ -299,7 +299,7 @@ def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
     upgraded_path = tmp_path / "upgraded_equivalent.db"
     build_v4_db(upgraded_path)
     upgraded = connect(upgraded_path)
-    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 16))
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 19))
 
     assert _canonical_structure(upgraded) == _canonical_structure(fresh)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -834,6 +834,9 @@ def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
         (13, "run_posting_membership"),
         (14, "scheduler_persistence_columns"),
         (15, "posting_presence_columns"),
+        (16, "posting_version_source_run_index"),
+        (17, "compat_jobs_legacy_only"),
+        (18, "run_posting_source_state"),
     ]
 
     for table in ("job_state", "state_events"):
@@ -868,6 +871,9 @@ def test_v11_upgrade_matches_fresh_legacy_import_ledger(tmp_path):
         (13, "run_posting_membership"),
         (14, "scheduler_persistence_columns"),
         (15, "posting_presence_columns"),
+        (16, "posting_version_source_run_index"),
+        (17, "compat_jobs_legacy_only"),
+        (18, "run_posting_source_state"),
     ]
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(legacy_artifact_imports)")] == [
         tuple(r) for r in fresh.execute("PRAGMA table_info(legacy_artifact_imports)")
@@ -912,6 +918,9 @@ def test_v12_upgrade_classifies_current_only_membership_and_fixes_history_view(t
         (13, "run_posting_membership"),
         (14, "scheduler_persistence_columns"),
         (15, "posting_presence_columns"),
+        (16, "posting_version_source_run_index"),
+        (17, "compat_jobs_legacy_only"),
+        (18, "run_posting_source_state"),
     ]
     assert conn.execute(
         "SELECT membership_kind FROM run_postings"
@@ -945,7 +954,12 @@ def test_v14_upgrade_matches_fresh_posting_presence_structure(tmp_path):
     before = {r["name"] for r in upgraded.execute("PRAGMA table_info(postings)")}
     assert not (before & set(migrations_mod.POSTING_PRESENCE_COLUMNS))
 
-    assert run_migrations(upgraded, str(path)) == [(15, "posting_presence_columns")]
+    assert run_migrations(upgraded, str(path)) == [
+        (15, "posting_presence_columns"),
+        (16, "posting_version_source_run_index"),
+        (17, "compat_jobs_legacy_only"),
+        (18, "run_posting_source_state"),
+    ]
 
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(postings)")] == [
         tuple(r) for r in fresh.execute("PRAGMA table_info(postings)")
@@ -964,6 +978,184 @@ def test_v14_upgrade_matches_fresh_posting_presence_structure(tmp_path):
     }
     assert len(added) == 6
     assert set(added.values()) == {(0, None)}
+    assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
+    upgraded.close()
+    fresh.close()
+
+
+def test_migration_16_indexes_posting_versions_by_source_run(tmp_path):
+    """Migration 16 gives an upgraded database the same index a fresh one has.
+
+    The index is what keeps "which versions did this run mint?" — asked once per run
+    by the change accounting, and by Phase 3.2/3.3 afterwards — off a full scan of
+    `posting_versions`, whose size tracks the corpus rather than the run. Both halves
+    are asserted: that the index exists, and that its recorded sql is character-
+    identical to the fresh database's, because sqlite_master stores the creating text
+    verbatim and a re-spelled CREATE INDEX would make the two structurally unequal.
+    """
+    import backend.migrations as migrations_mod
+
+    fresh = connect(tmp_path / "fresh_v16.db")
+    init_db(fresh)
+
+    # A database migrated BEFORE this phase: migration 8 created `posting_versions`
+    # without the index, and its schema_version stops at 15. Built by removing both
+    # from a current database rather than by replaying an old CONTENT_DDL, because
+    # the sqlite_master text of everything else must stay exactly what today's code
+    # produces for the comparison below to mean anything.
+    name = migrations_mod.POSTING_VERSION_SOURCE_RUN_INDEX
+    path = tmp_path / "v15_without_index.db"
+    upgraded = connect(path)
+    init_db(upgraded)
+    upgraded.execute(f"DROP INDEX {name}")
+    upgraded.execute("DELETE FROM schema_version WHERE version >= 16")
+    upgraded.commit()
+    assert upgraded.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)
+    ).fetchone() is None
+
+    assert run_migrations(upgraded, str(path)) == [
+        (16, "posting_version_source_run_index"),
+        (17, "compat_jobs_legacy_only"),
+        (18, "run_posting_source_state"),
+    ]
+
+    upgraded_sql = upgraded.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
+    ).fetchone()
+    fresh_sql = fresh.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
+    ).fetchone()
+    assert upgraded_sql is not None and fresh_sql is not None
+    assert upgraded_sql[0] == fresh_sql[0]
+    # Idempotent: the migration tests re-invoke migrations directly, and a fresh
+    # database already created this index from CONTENT_DDL.
+    migrations_mod._migration_16_posting_version_source_run_index(upgraded)
+    assert upgraded.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?", (name,)
+    ).fetchone()[0] == 1
+    upgraded.close()
+    fresh.close()
+
+
+def test_migration_17_narrows_compat_jobs_to_legacy_versions(tmp_path):
+    """Migration 17 recreates `compat_jobs` without 'source' versions.
+
+    The view is a LEGACY-PARITY view: the Phase 1 audit compares it to the `jobs`
+    table row for row. Once Phase 3.1 began minting a 'source' version per posting the
+    scheduler discovered, every one of them appeared here as a job with no counterpart
+    in `jobs`. Asserted on behaviour (a source version is invisible, a legacy-current
+    one is not) and on sqlite_master text (an upgraded database's view must be
+    character-identical to a fresh one's).
+    """
+    import backend.migrations as migrations_mod
+
+    fresh = connect(tmp_path / "fresh_v17.db")
+    init_db(fresh)
+
+    path = tmp_path / "v16_wide_view.db"
+    upgraded = connect(path)
+    init_db(upgraded)
+    # Put the pre-17 view back, exactly as migration 10 wrote it, and rewind the
+    # stamps that follow it.
+    upgraded.execute("DROP VIEW compat_jobs")
+    upgraded.executescript(
+        migrations_mod.COMPAT_JOBS_VIEW_DDL.replace(
+            "v2.version_kind = 'legacy-current'",
+            "v2.version_kind IN ('source', 'legacy-current')",
+        )
+    )
+    upgraded.execute("DELETE FROM schema_version WHERE version >= 17")
+    upgraded.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at) "
+        "VALUES ('p','active','t0','t0')"
+    )
+    upgraded.execute(
+        "INSERT INTO posting_versions (posting_version_id,posting_id,version_kind,"
+        "version_hash,observed_at,title,payload_json) "
+        "VALUES ('v-src','p','source','h1','t1','Scheduler Found This','{}')"
+    )
+    upgraded.commit()
+    assert upgraded.execute("SELECT COUNT(*) FROM compat_jobs").fetchone()[0] == 1, (
+        "the fixture must reproduce the wide view, or the migration proves nothing"
+    )
+
+    assert run_migrations(upgraded, str(path)) == [
+        (17, "compat_jobs_legacy_only"),
+        (18, "run_posting_source_state"),
+    ]
+
+    assert upgraded.execute("SELECT COUNT(*) FROM compat_jobs").fetchone()[0] == 0
+    upgraded.execute(
+        "INSERT INTO posting_versions (posting_version_id,posting_id,version_kind,"
+        "version_hash,observed_at,title,payload_json) "
+        "VALUES ('v-legacy','p','legacy-current','h2','t2','Imported','{}')"
+    )
+    assert upgraded.execute("SELECT COUNT(*) FROM compat_jobs").fetchone()[0] == 1, (
+        "legacy-current versions are exactly what the view still exists for"
+    )
+    assert upgraded.execute(
+        "SELECT sql FROM sqlite_master WHERE type='view' AND name='compat_jobs'"
+    ).fetchone()[0] == fresh.execute(
+        "SELECT sql FROM sqlite_master WHERE type='view' AND name='compat_jobs'"
+    ).fetchone()[0]
+    upgraded.close()
+    fresh.close()
+
+
+def test_migration_18_adds_the_source_state_column_without_backfilling_it(tmp_path):
+    """Migration 18 adds `run_postings.source_state_json`, nullable and empty.
+
+    NULL is the honest value for a row written before per-source content state
+    existed, and it is load-bearing: `runstore.dirty_posting_ids` reads a NULL state as
+    "no baseline", so the first run after the upgrade reports the corpus dirty exactly
+    once rather than silently treating unknown content as unchanged.
+    """
+    import backend.migrations as migrations_mod
+
+    fresh = connect(tmp_path / "fresh_v18.db")
+    init_db(fresh)
+
+    path = tmp_path / "v17_no_state.db"
+    upgraded = connect(path)
+    init_db(upgraded)
+    upgraded.execute("ALTER TABLE run_postings DROP COLUMN source_state_json")
+    upgraded.execute("DELETE FROM schema_version WHERE version >= 18")
+    upgraded.execute(
+        "INSERT INTO pipeline_runs (run_uid,kind,status,requested_at) "
+        "VALUES ('r','imported','imported','t0')"
+    )
+    upgraded.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at) "
+        "VALUES ('p','active','t0','t0')"
+    )
+    upgraded.execute(
+        "INSERT INTO run_postings (run_uid,posting_id,present,first_seen_in_run,recorded_at) "
+        "VALUES ('r','p',1,1,'t0')"
+    )
+    upgraded.commit()
+
+    assert run_migrations(upgraded, str(path)) == [(18, "run_posting_source_state")]
+
+    assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(run_postings)")] == [
+        tuple(r) for r in fresh.execute("PRAGMA table_info(run_postings)")
+    ]
+    assert upgraded.execute(
+        "SELECT sql FROM sqlite_master WHERE name='run_postings'"
+    ).fetchone()[0] == fresh.execute(
+        "SELECT sql FROM sqlite_master WHERE name='run_postings'"
+    ).fetchone()[0]
+    added = [
+        (r["notnull"], r["dflt_value"])
+        for r in upgraded.execute("PRAGMA table_info(run_postings)")
+        if r["name"] == "source_state_json"
+    ]
+    assert added == [(0, None)]
+    assert upgraded.execute(
+        "SELECT source_state_json FROM run_postings"
+    ).fetchone()[0] is None, "no backfill: a pre-3.1 row genuinely recorded no state"
+    # Idempotent under the direct re-invocation the migration tests make.
+    migrations_mod._migration_18_run_posting_source_state(upgraded)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
     upgraded.close()
     fresh.close()
@@ -1560,7 +1752,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == set(range(1, 16))
+    assert versions == set(range(1, 19))
     conn.close()
 
 

@@ -117,6 +117,7 @@ from .writer import (
     RunEvent,
     SqliteWriter,
     StartRun,
+    SummarizeChanges,
     WriterError,
     absorb_cancel,
 )
@@ -791,7 +792,15 @@ class Scheduler:
                     run_status=run_status,
                     timeout=drain_timeout,
                 )
-                report = _run_report(plan, results, gates, writer, profile, absence)
+                # Phase 3.1. Counted after the same drain, from the same committed
+                # rows, and NOT gated on the run's outcome the way the presence pass
+                # is: summarising what changed asserts nothing about what is missing,
+                # so a cancelled or failed run's partial deliveries are still
+                # legitimately described by it.
+                changes = await self._settle_changes(
+                    writer, run_uid=run_uid, at=finished_at, timeout=drain_timeout
+                )
+                report = _run_report(plan, results, gates, writer, profile, absence, changes)
                 writer.submit_soon(
                     FinishRun(
                         run_uid=run_uid,
@@ -1466,6 +1475,38 @@ class Scheduler:
             return None
         return op.report
 
+    # -- changes ----------------------------------------------------------- #
+    async def _settle_changes(
+        self,
+        writer: SqliteWriter,
+        *,
+        run_uid: str,
+        at: str,
+        timeout: float | None = None,
+    ) -> dict | None:
+        """Count what this run changed, or decline to and say so with `None`.
+
+        Same shape and the same suppression rules as `_settle_presence`, for the same
+        reason: this runs inside `_execute`'s `finally`, where a raise would replace
+        the run's outcome with a persistence error and where the run task may itself
+        be under cancellation.
+
+        `None` means "not counted", never "nothing changed" — and it costs nothing,
+        because the counts are derived, not stored: `runstore.change_summary` and
+        `runstore.dirty_posting_ids` answer the same question from the committed rows
+        at any later time, from any connection.
+        """
+        if writer.failure is not None:
+            return None
+        op = SummarizeChanges(run_uid=run_uid, at=at)
+        drained = False
+        with absorb_cancel():
+            await writer.submit(op)
+            drained = await writer.drain(timeout=timeout)
+        if not drained or writer.failure is not None:
+            return None
+        return op.report
+
     # -- helpers ----------------------------------------------------------- #
     async def _close_stream(
         self, stream: object, *, cancelled: bool, cleanup: set[asyncio.Task]
@@ -1631,6 +1672,7 @@ def _run_report(
     writer: SqliteWriter,
     profile: run_profiles.RunProfile,
     absence: dict | None = None,
+    changes: dict | None = None,
 ) -> dict[str, object]:
     return {
         # Phase 2.5: the run kind and the profile it was scheduled under,
@@ -1645,6 +1687,15 @@ def _run_report(
         #: dead writer). That is a materially different statement from a pass that
         #: ran and marked nothing, and the report must not conflate them.
         "presence": absence,
+        #: Phase 3.1's change accounting: how many of the postings this run observed
+        #: moved to a different content version ("N changed"), split into first
+        #: sightings and updates, beside the number of `posting_versions` rows the run
+        #: actually minted. The gap between `changed` and `versions_created` is
+        #: content that reverted to a state already on file. None means the count did
+        #: not run (dead writer) — materially different from a count of zero, and the
+        #: report must not conflate them. The dirty IDS are not here on purpose: they
+        #: are recomputed on demand by `runstore.dirty_posting_ids(conn, run_uid)`.
+        "changed": changes,
         "succeeded": sum(1 for t in results if t.status == "succeeded"),
         "failed": sum(1 for t in results if t.status in ("failed", "timeout")),
         "cancelled": sum(1 for t in results if t.status == "cancelled"),

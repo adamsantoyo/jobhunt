@@ -62,6 +62,7 @@ __all__ = [
     "RunEvent",
     "SqliteWriter",
     "StartRun",
+    "SummarizeChanges",
     "WriteOp",
     "WriterError",
     "WriterStats",
@@ -301,6 +302,11 @@ class RecordBatch:
             source_run_id=self.source_run_id,
             fetched_count=self.fetched_count,
             accepted_delta=outcome.accepted,
+            # Phase 3.1: how many of this attempt's records moved their posting's
+            # current source version, accumulated in the same transaction that
+            # moved them. `source_runs.changed_count` has been NULL since
+            # migration 6 waiting for exactly this.
+            changed_delta=outcome.changed,
             checkpoint_json=self.checkpoint_json,
         )
         return outcome
@@ -381,6 +387,45 @@ class MarkPresence:
                 )
             )
         self.events = tuple(events)
+        self.report = report
+        return report
+
+
+@dataclass(slots=True)
+class SummarizeChanges:
+    """Phase 3.1's change accounting for one run, read inside the writer transaction.
+
+    A read, not a write — but it has to be a writer op all the same, because the
+    writer owns the only connection during a run and the counts have to be taken from
+    the committed snapshot that every batch has landed in.
+
+    Not frozen, for `MarkPresence`'s reason: the report only exists once the SQL has
+    run, so `apply` publishes it by ASSIGNING `self.events`/`self.report`, never by
+    appending, so a busy-database rollback that replays the batch overwrites rather
+    than doubles them.
+
+    The dirty IDS are deliberately NOT carried here: a run can dirty tens of thousands
+    of postings, and the run report is not a work queue. Phase 3.2/3.3 ask
+    `runstore.dirty_posting_ids(conn, run_uid)` for the list, which is recomputed from
+    committed rows and therefore survives a restart between this run and their work.
+    """
+
+    run_uid: str
+    at: str
+    events: tuple[RunEvent, ...] = ()
+    #: The run's change counts, or None when it has not run yet.
+    report: dict | None = field(default=None, compare=False)
+
+    def apply(self, conn: sqlite3.Connection) -> dict:
+        report = runstore.change_summary(conn, self.run_uid)
+        self.events = (
+            RunEvent(
+                run_uid=self.run_uid,
+                event_type="run.changes_summarized",
+                at=self.at,
+                payload=dict(report),
+            ),
+        )
         self.report = report
         return report
 

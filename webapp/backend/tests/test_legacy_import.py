@@ -480,7 +480,7 @@ def test_audit_uses_same_seen_validation_as_import(imported_db, tmp_path):
 def test_import_allows_future_schema_versions(imported_db, tmp_path):
     conn, _ = imported_db
     conn.execute(
-        "INSERT INTO schema_version VALUES (16,'future test','2026-08-03T00:00:00')"
+        "INSERT INTO schema_version VALUES (99,'future test','2026-08-03T00:00:00')"
     )
     conn.commit()
     results = tmp_path / "results"
