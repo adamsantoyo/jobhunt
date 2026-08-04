@@ -205,6 +205,49 @@ def test_the_bridge_is_idempotent(conn):
     ).fetchone()[0] == 1
 
 
+def test_the_canonical_match_half_of_the_bridge_is_idempotent_too(conn):
+    """The OTHER branch, which ran every day forever.
+
+    `test_the_bridge_is_idempotent` covers the branch that inserts an alias, and
+    that one settles because the alias lookup deciding the branch is the same one
+    guarding the insert. The canonical-match branch had no such guard: the redirect
+    is `INSERT OR IGNORE` on the loser's primary key so the TABLE settled, but the
+    return value was dropped, and `emit_invalidation`'s id mixes in `run_uid` -- so
+    a collision merged on Monday queued the survivor for rescoring again on Tuesday,
+    Wednesday, and every day after, and `canonical_matches` reported a fresh
+    duplicate the cutover had already dealt with. Three runs, not two: the second
+    run is where a per-run id first differs, and the third is what proves the
+    counter is not merely off by one.
+    """
+    normalized = "https://boards.example.com/acme/jobs/42"
+    for n in (1, 2, 3):
+        run(conn, f"run-{n}")
+    posting(conn, "legacy-old", first_seen="2025-01-01T00:00:00+00:00")
+    posting(conn, "canonical-new", first_seen="2026-08-01T00:00:00+00:00")
+    alias(conn, "legacy-old", kind="url", namespace="legacy-url", value=normalized)
+    alias(conn, "canonical-new", kind="url", namespace="url", value=normalized, confidence=0.5)
+    alias(conn, "canonical-new", kind="source_req", namespace="greenhouse:acme", value="42")
+
+    reports = [
+        resolver.bridge_legacy_url_aliases(conn, run_uid=f"run-{n}", at=AT) for n in (1, 2, 3)
+    ]
+
+    assert reports[0]["canonical_matches"] == 1
+    assert reports[0]["invalidated"] == ("canonical-new",)
+    assert reports[0]["already_matched"] == 0
+    for later in reports[1:]:
+        assert later["canonical_matches"] == 0, "a settled merge is not a new duplicate"
+        assert later["invalidated"] == (), "the survivor must not re-enter the work list"
+        assert later["already_matched"] == 1
+
+    assert redirects(conn) == {("legacy-old", "canonical-new"): "normalization-bridge"}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM identity_evidence WHERE evidence_kind='canonical-match'"
+    ).fetchone()[0] == 1
+    assert invalidations(conn) == [("canonical-new", "canonical-match", None)]
+    assert conn.execute("SELECT COUNT(*) FROM score_invalidations").fetchone()[0] == 1
+
+
 def test_an_ambiguous_normalization_bridges_nothing_and_is_archived(conn):
     """Two raw URLs differing only in a tracking parameter, recorded against two
     different legacy lineages. Bridging either one asserts an identity the evidence

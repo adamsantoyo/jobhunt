@@ -36,6 +36,13 @@ row keeps its tier, its rationale, and a pointer to its replacement. "Why did th
 posting drop from 4 to 3 on the 4th" is then answerable from evidence instead of
 from a changelog nobody wrote.
 
+AND WHY AN INPUT CAN COME BACK. Every id here is content-derived, so an input that
+reverts (A -> B -> A on one posting version) does not describe a new row -- it
+describes the row A already wrote, which is now superseded. `persist_scores`
+RE-CURRENTS that row rather than re-minting it; re-minting is a primary key
+violation, and a deterministic id means every retry violates it again. See
+`persist_scores`' "REVERTING INPUTS".
+
 Conventions, identical to `runstore`'s: explicit `sqlite3.Connection`, no
 transaction control, no `config.DB_PATH`, and the write step is a `writer.WriteOp`
 so Phase 4 wires it with `writer.submit` and no scheduler or writer edit.
@@ -44,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -89,6 +97,10 @@ __all__ = [
 _LOOKUP_CHUNK = 400
 
 _SCORE_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://jobhunt.local/canonical/score-version")
+
+#: "No row on file", which `dict.get(...)` alone cannot say here: a row that IS on
+#: file and current has `superseded_at` of None, and the two mean opposite things.
+_ABSENT = object()
 
 
 class ScoreFeatureError(ValueError):
@@ -302,22 +314,76 @@ def description_for(
 # --------------------------------------------------------------------------- #
 # Selection and persistence
 # --------------------------------------------------------------------------- #
-def validate_features(features: Mapping[str, object], required: frozenset) -> dict:
-    """Refuse to persist a vector carrying a key outside the closed contract.
+def validate_features(
+    features: Mapping[str, object],
+    required: frozenset,
+    *,
+    required_present: frozenset,
+) -> dict:
+    """Refuse to persist a vector that is not REPLAYABLE. Three checks, two directions.
 
-    The contract is what makes a stored score REPLAYABLE
-    (`rubric.reconstruct_tier`). A key the replayer has never heard of is either a
-    contribution it will not sum or a cap it will not apply, and either way the
-    replayed tier silently disagrees with the stored one. Failing the write turns
-    "somebody added a dimension and forgot the replayer" into an error at the
-    moment it happens rather than into a corpus of scores nobody can re-derive.
+    The contract is what makes a stored score replayable
+    (`rubric.reconstruct_tier`), and a one-directional check only closes one of the
+    two ways to break it:
+
+      NO UNKNOWN KEY. A key the replayer has never heard of is either a
+        contribution it will not sum or a cap it will not apply, and either way the
+        replayed tier silently disagrees with the stored one.
+      NO MISSING KEY. `required_present` is what the replayer INDEXES rather than
+        probes -- `reconstruct_tier` reads `features["raw_score"]` directly, so a
+        vector without it does not replay wrong, it raises `KeyError` years later
+        on a row nothing can re-derive. Caps stay optional on purpose: a cap that
+        did not fire has nothing to record, and `reconstruct_tier` reads each one
+        through `if cap in features`.
+      NO NON-NUMBER. Every value is summed, mins'd or compared by the replayer, so
+        a string, a None or a NaN is a row that either raises or silently poisons
+        an arithmetic answer (`NaN` propagates through `min` and never equals
+        itself). `bool` is rejected too although it is an `int` subclass: `True` as
+        a contribution means somebody stored a flag where a point value belongs.
+
+    A BLOCKED vector is the other legal shape and is closed in both directions at
+    once: exactly `{"blocker": <code>}`, whose value is a code string rather than a
+    number. `reconstruct_tier` returns 0 on the key's presence alone, so a blocked
+    vector carrying contributions as well would be describing two different things.
+
+    Failing the write turns "somebody added a dimension and forgot the replayer"
+    into an error at the moment it happens rather than into a corpus of scores
+    nobody can re-derive.
     """
-    unknown = set(features) - set(required)
+    keys = set(features)
+    unknown = keys - set(required)
     if unknown:
         raise ScoreFeatureError(
             f"feature vector carries key(s) outside the stored-feature contract: "
             f"{sorted(unknown)}"
         )
+
+    if candidate_profile.SCORE_ROW_BLOCKER_FEATURE in keys:
+        extra = keys - candidate_profile.BLOCKED_SCORE_ROW_FEATURES
+        if extra:
+            raise ScoreFeatureError(
+                f"a blocked feature vector carries nothing but "
+                f"{sorted(candidate_profile.BLOCKED_SCORE_ROW_FEATURES)}, not {sorted(extra)}"
+            )
+        code = features[candidate_profile.SCORE_ROW_BLOCKER_FEATURE]
+        if not isinstance(code, str) or not code:
+            raise ScoreFeatureError(f"blocker must be a non-empty code string, got {code!r}")
+        return dict(features)
+
+    missing = set(required_present) - keys
+    if missing:
+        raise ScoreFeatureError(
+            f"feature vector is missing key(s) the replayer requires: {sorted(missing)}"
+        )
+
+    for key in sorted(keys):
+        value = features[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ScoreFeatureError(
+                f"feature {key!r} must be a number, got {type(value).__name__} ({value!r})"
+            )
+        if not math.isfinite(value):
+            raise ScoreFeatureError(f"feature {key!r} must be finite, got {value!r}")
     return dict(features)
 
 
@@ -361,12 +427,74 @@ def current_score_inputs(
     return found
 
 
+def _score_version_id(
+    *, posting_version_id: str, profile_version_id: str, score_digest: str
+) -> str:
+    """The row id a (version, profile, input, scorer) tuple ALWAYS lands on.
+
+    Deterministic, and that is a property with consequences in both directions.
+    It makes a re-run of the same work land on the row it already wrote instead of
+    minting a second one -- and it means an input that REVERTS (A -> B -> A on one
+    posting version) lands back on a row that already exists and is superseded. It
+    is a plain function so `persist_scores` can find that row before the scorer
+    runs, since none of the four inputs depends on the score.
+    """
+    return str(
+        uuid.uuid5(
+            _SCORE_NAMESPACE,
+            runstore.canonical_json([posting_version_id, profile_version_id, score_digest]),
+        )
+    )
+
+
+def _supersession_state(
+    conn: sqlite3.Connection, score_version_ids: Sequence[str]
+) -> dict[str, str | None]:
+    """`{score_version_id: superseded_at}` for the ids already on file.
+
+    Keyed on the PRIMARY KEY and chunked like every other lookup here, because the
+    revert check runs once per batch and must not become one probe per row.
+    """
+    found: dict[str, str | None] = {}
+    ids = list(dict.fromkeys(score_version_ids))
+    for start in range(0, len(ids), _LOOKUP_CHUNK):
+        chunk = ids[start:start + _LOOKUP_CHUNK]
+        rows = conn.execute(
+            "SELECT score_version_id, superseded_at FROM score_versions "
+            f"WHERE score_version_id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        )
+        for row in rows:
+            found[row["score_version_id"]] = row["superseded_at"]
+    return found
+
+
 @dataclass(frozen=True, slots=True)
 class ScoreOutcome:
+    """What one batch did, in terms that add up.
+
+    `selected == scored + recurrent + reused + skipped` is the accounting the run
+    report is read with, so the four are disjoint by construction:
+
+      scored     rows INSERTED. New evidence, and the only rows the scorer ran for.
+      recurrent  rows RE-CURRENTED: the input reverted to one this (version,
+                 profile, scorer) was already scored under, so the superseded row
+                 it maps to was made current again rather than re-inserted (which
+                 is the primary key violation this counter exists to name). No
+                 scorer call, no new row -- the stored tier, rationale and vector
+                 are the ones that input produced when it was first seen.
+      reused     the current row already matched the input; nothing was written.
+      blocked    of the rows SCORED, how many the rubric blocked. Not disjoint
+                 with the three above -- it is a breakdown of `scored`, and a
+                 re-currented blocked row is not counted here because this pass
+                 did not decide it.
+    """
+
     scored: int = 0
     reused: int = 0
     superseded: int = 0
     blocked: int = 0
+    recurrent: int = 0
     score_version_ids: tuple[str, ...] = ()
 
 
@@ -381,19 +509,37 @@ def persist_scores(
 ) -> ScoreOutcome:
     """Score whatever needs it, supersede whatever it replaces, in one transaction.
 
-    Four batched steps, in this exact order, and the order is forced by
+    Five batched steps, in this exact order, and the order is forced by
     `uq_score_versions_current`:
 
       1. read the current rows for these versions (the anti-join above) and keep
-         only the items whose `input_hash` differs;
+         only the items whose `input_hash` differs; then split those by whether the
+         row their input maps to ALREADY EXISTS (see REVERTING INPUTS below);
       2. mark the rows being replaced superseded, with `superseded_by` still NULL.
          This FREES the partial unique index. It cannot be done after the insert
          (the index would reject the new row) and `superseded_by` cannot be set
          here, because the row it points at does not exist yet and the foreign key
          is checked immediately;
       3. insert the new rows;
-      4. fill in `superseded_by` on the rows from step 2, now that their
-         replacements exist.
+      4. re-current the reverted rows, clearing BOTH `superseded_at` and the now
+         false `superseded_by` they still carry from the transition that retired
+         them. After step 2 freed the index this is the only current row for its
+         key, so the index sees exactly one at every commit boundary;
+      5. fill in `superseded_by` on the rows from step 2, now that the rows that
+         replaced them -- inserted or re-currented -- exist.
+
+    REVERTING INPUTS. `score_version_id` is deterministic over (posting version,
+    profile version, input, scorer), so an input that goes A -> B -> A on ONE
+    posting version maps its third state back onto the row its first state wrote.
+    The anti-join cannot see that row: it reads current rows only, and that one is
+    superseded. Inserting anyway violates the primary key AND migration 9's
+    `UNIQUE (posting_version_id, profile_version_id, score_hash)`, and because the
+    id is deterministic every retry violates it again -- the pass is stuck, not
+    merely failed. So a reverting input RE-CURRENTS its existing row instead. The
+    stored tier, rationale and feature vector are the ones that exact input already
+    produced, which is why re-currenting is not merely cheaper than rescoring but
+    is the only answer consistent with the rest of this module: identical input,
+    identical scorer, identical row.
 
     Every step is one statement or one `executemany`. Nothing here is per-row I/O.
     """
@@ -416,34 +562,68 @@ def persist_scores(
     if not work:
         return ScoreOutcome(reused=reused)
 
+    # The row each work item lands on, known BEFORE the scorer runs because none of
+    # the id's four inputs depends on the score. One batched lookup then says which
+    # of those rows already exist, which is the whole revert check.
+    planned: list[tuple[WorkRow, str, str]] = []
+    for item in work:
+        digest = score_hash(input_digest=item.input_digest, scorer_hash=scorer.scorer_hash)
+        planned.append((
+            item,
+            digest,
+            _score_version_id(
+                posting_version_id=item.posting_version_id,
+                profile_version_id=profile_version_id,
+                score_digest=digest,
+            ),
+        ))
+    on_file = _supersession_state(conn, [row_id for _item, _digest, row_id in planned])
+
+    fresh: list[tuple[WorkRow, str, str]] = []
+    reverted: list[tuple[WorkRow, str]] = []
+    for item, digest, row_id in planned:
+        state = on_file.get(row_id, _ABSENT)
+        if state is _ABSENT:
+            fresh.append((item, digest, row_id))
+        elif state is not None:
+            reverted.append((item, row_id))
+        else:
+            # On file and already CURRENT under this exact input, which the
+            # anti-join should have reused. Only reachable if a stored `input_hash`
+            # disagrees with the id it is filed under -- a row to leave alone, not
+            # one to replace, so it counts as reused rather than as work.
+            reused += 1
+
+    landing = [(item, row_id) for item, _digest, row_id in fresh]
+    landing += list(reverted)
+    if not landing:
+        return ScoreOutcome(reused=reused)
+
     replaced = {
         item.posting_version_id: current[item.posting_version_id][0]
-        for item in work
+        for item, _row_id in landing
         if item.posting_version_id in current
     }
 
     inserts: list[tuple] = []
     blocked = 0
-    for item in work:
+    for item, digest, score_version_id in fresh:
         result = rubric.score_row_explained(
             dict(item.row), item.description, is_aggregator=item.is_aggregator
         )
         odds = rubric.hireability_explained(dict(item.row), item.description)
         features = validate_features(
-            result.features, candidate_profile.REQUIRED_SCORE_ROW_FEATURES
+            result.features,
+            candidate_profile.REQUIRED_SCORE_ROW_FEATURES,
+            required_present=candidate_profile.REQUIRED_PRESENT_SCORE_ROW_FEATURES,
         )
         odds_features = validate_features(
-            odds.features, candidate_profile.REQUIRED_HIREABILITY_FEATURES
+            odds.features,
+            candidate_profile.REQUIRED_HIREABILITY_FEATURES,
+            required_present=candidate_profile.REQUIRED_PRESENT_HIREABILITY_FEATURES,
         )
         if candidate_profile.SCORE_ROW_BLOCKER_FEATURE in features:
             blocked += 1
-        digest = score_hash(input_digest=item.input_digest, scorer_hash=scorer.scorer_hash)
-        score_version_id = str(
-            uuid.uuid5(
-                _SCORE_NAMESPACE,
-                runstore.canonical_json([item.posting_version_id, profile_version_id, digest]),
-            )
-        )
         inserts.append((
             score_version_id,
             item.posting_id,
@@ -478,16 +658,31 @@ def persist_scores(
             (at, *old_ids),
         )
 
-    conn.executemany(
-        "INSERT INTO score_versions "
-        "(score_version_id, posting_id, posting_version_id, profile_version_id, "
-        "source_run_id, score_hash, scorer_hash, input_hash, tier, odds, odds_score, "
-        "rationale_json, features_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        inserts,
-    )
+    if inserts:
+        conn.executemany(
+            "INSERT INTO score_versions "
+            "(score_version_id, posting_id, posting_version_id, profile_version_id, "
+            "source_run_id, score_hash, scorer_hash, input_hash, tier, odds, odds_score, "
+            "rationale_json, features_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            inserts,
+        )
+
+    if reverted:
+        # `superseded_by` is cleared with `superseded_at`, never separately: it
+        # names the row that REPLACED this one, and this one is no longer replaced.
+        # Leaving it would point the current row at its own predecessor's successor
+        # and turn the supersession chain into a cycle. `created_at` and
+        # `source_run_id` are left alone: the row was written then, by that run, and
+        # this pass did not re-decide it.
+        revived = sorted(row_id for _item, row_id in reverted)
+        conn.execute(
+            "UPDATE score_versions SET superseded_at=NULL, superseded_by=NULL "
+            f"WHERE score_version_id IN ({','.join('?' * len(revived))})",
+            revived,
+        )
 
     if replaced:
-        new_by_version = {row[2]: row[0] for row in inserts}
+        new_by_version = {item.posting_version_id: row_id for item, row_id in landing}
         conn.executemany(
             "UPDATE score_versions SET superseded_by=? WHERE score_version_id=?",
             [(new_by_version[version_id], old_id)
@@ -499,7 +694,8 @@ def persist_scores(
         reused=reused,
         superseded=len(replaced),
         blocked=blocked,
-        score_version_ids=tuple(row[0] for row in inserts),
+        recurrent=len(reverted),
+        score_version_ids=tuple(row_id for _item, row_id in landing),
     )
 
 
@@ -537,6 +733,7 @@ class ScoreWork:
                     "selected": len(self.items),
                     "scored": outcome.scored,
                     "reused": outcome.reused,
+                    "recurrent": outcome.recurrent,
                     "superseded": outcome.superseded,
                     "blocked": outcome.blocked,
                 },

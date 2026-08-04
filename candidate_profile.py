@@ -134,11 +134,47 @@ REQUIRED_SCORE_ROW_FEATURES = frozenset(
     | {SCORE_ROW_BLOCKER_FEATURE}
 )
 
+#: The other half of the contract: which keys a stored vector must ACTUALLY CARRY.
+#: The closed set above says which keys MAY appear; on its own it accepts the empty
+#: dict, and an empty dict makes `rubric.reconstruct_tier` raise `KeyError` on
+#: replay -- the same un-replayable score the closed set exists to keep out of the
+#: database, arriving through the other door.
+#:
+#: Exactly the two keys `rubric._score_row_core` emits UNCONDITIONALLY on a scored
+#: row, which are also exactly the two `reconstruct_tier` cannot do without:
+#:
+#:   raw_score       indexed directly (`max(1, min(5, features["raw_score"]))`), so
+#:                   its absence is a KeyError rather than a wrong answer.
+#:   function_match  the score's starting value, so its absence silently breaks
+#:                   `sum(contributions) == raw_score` -- the invariant that makes
+#:                   the stored total auditable rather than merely asserted.
+#:
+#: Every OTHER key is conditional by construction and must stay optional: the
+#: weighted rules fire or do not, `staff_cap_delta` is emitted only when the staff
+#: clamp fires, and `reconstruct_tier` reads each cap through `if cap in features`
+#: precisely because a cap that did not fire has nothing to say. Requiring any of
+#: them would reject correct vectors.
+REQUIRED_PRESENT_SCORE_ROW_FEATURES = frozenset({"function_match", "raw_score"})
+
+#: A BLOCKED row is the other vector shape, and it is closed in both directions:
+#: `rubric._score_row_core`'s `blocked()` returns literally `{"blocker": <code>}`.
+#: The row never reached a score, so there is no total to reconstruct and no cap to
+#: apply -- `reconstruct_tier` returns 0 on the key's mere presence. A vector that
+#: carried a blocker AND contributions would be describing two different things.
+BLOCKED_SCORE_ROW_FEATURES = frozenset({SCORE_ROW_BLOCKER_FEATURE})
+
 #: The closed key set for a stored `hireability` vector. Every rule the odds axis
 #: scores has a weight, so this is exactly the weight table's key set -- and
 #: `sum(features.values()) == score` holds unconditionally there, because
 #: hireability has no clamp, no cap, and no blocker.
 REQUIRED_HIREABILITY_FEATURES = frozenset(REQUIRED_HIREABILITY_WEIGHTS)
+
+#: EMPTY, and deliberately so rather than by omission. The odds vector replays as a
+#: plain `sum(features.values())`, so a row on which no odds rule fired is the
+#: honest empty vector scoring 0 -- there is no starting value and no scalar to
+#: index. Stated as a constant so the persist path names the same contract for both
+#: vector kinds instead of special-casing one of them at the call site.
+REQUIRED_PRESENT_HIREABILITY_FEATURES = frozenset()
 
 #: Every blocker code `rubric._score_row_core` may emit. Membership is asserted
 #: AT EMISSION (see `rubric._score_row_core`'s `blocked()`), not merely checked

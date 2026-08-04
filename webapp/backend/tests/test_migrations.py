@@ -30,6 +30,13 @@ CANONICAL_TABLES_BY_VERSION = {
     9: {"score_versions", "llm_reviews", "recommendations", "recommendation_events"},
     10: {"run_postings"},
     12: {"legacy_artifact_imports"},
+    # 19 creates no table: it adds `score_versions` columns and the two supersession
+    # indexes. Named anyway, and named as empty, because this map is what the parity
+    # check reads -- an absent version reads as "nothing to check here" whether that
+    # is true or an oversight. The indexes ARE covered: `_canonical_structure`
+    # matches on `tbl_name`, which for them is `score_versions` (version 9).
+    19: set(),
+    20: {"score_passes", "score_invalidations"},
 }
 CANONICAL_VIEWS = {"compat_jobs", "compat_runs", "compat_job_history"}
 

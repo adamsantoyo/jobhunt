@@ -597,10 +597,15 @@ def bridge_legacy_url_aliases(
                      for the survivor (its canonical version can now change, so its
                      stored tier is no longer trustworthy).
 
-    Idempotent: the bridge insert is guarded by the same active-alias lookup that
-    decides the branch, evidence is content-hashed with `INSERT OR IGNORE`, and
-    redirects are primary-keyed on the loser. Running it every day is free after
-    the first time.
+    Idempotent, and idempotent in the REPORT as well as in the tables: the bridge
+    insert is guarded by the same active-alias lookup that decides the branch,
+    evidence is content-hashed with `INSERT OR IGNORE`, and the canonical-match
+    branch is gated on `record_redirect` returning True -- i.e. on this run being
+    the one that actually made the merge. A settled collision therefore writes
+    nothing and counts as `already_matched` rather than as a fresh
+    `canonical_matches`. Without that gate the survivor would be re-invalidated
+    every run (`emit_invalidation`'s id mixes in `run_uid`) and re-enter the work
+    list daily forever. Running it every day is free after the first time.
     """
     legacy = conn.execute(
         "SELECT alias_id, posting_id, value FROM posting_aliases "
@@ -618,7 +623,7 @@ def bridge_legacy_url_aliases(
             continue
         grouped.setdefault(normalized, {})[row["posting_id"]] = row["value"]
 
-    bridged = ambiguous = matched = noop = 0
+    bridged = ambiguous = matched = noop = settled = 0
     invalidated: list[str] = []
     for normalized in sorted(grouped):
         postings = grouped[normalized]
@@ -665,10 +670,21 @@ def bridge_legacy_url_aliases(
             continue
 
         survivor, loser = choose_survivor(conn, existing["posting_id"], legacy_posting_id)
-        record_redirect(
+        if not record_redirect(
             conn, from_posting_id=loser, to_posting_id=survivor,
             reason="normalization-bridge", at=at,
-        )
+        ):
+            # The redirect was already on file, so this collision was SETTLED by an
+            # earlier run and there is nothing here to decide. Everything below is
+            # gated on the redirect actually being created, and this branch is why:
+            # `emit_invalidation`'s id mixes in `run_uid`, so re-emitting would queue
+            # the survivor for rescoring every single day, forever, over a merge
+            # nobody made today. The counter is skipped for the same reason -- a
+            # `canonical_matches` that never settles to 0 is a report that cannot be
+            # read. (`resolve_aggregators` gets this for free: `ResolvePass` filters
+            # already-redirected subjects out before they reach it.)
+            settled += 1
+            continue
         _evidence(
             conn,
             posting_id=survivor,
@@ -696,6 +712,12 @@ def bridge_legacy_url_aliases(
         "ambiguous": ambiguous,
         "canonical_matches": matched,
         "already_bridged": noop,
+        # Collisions a PREVIOUS run already merged. Counted apart from
+        # `canonical_matches` rather than folded into it, because the two answer
+        # different questions: "how many duplicates did the cutover find today"
+        # must fall to 0 once the corpus settles, or nobody can tell a quiet day
+        # from a broken one.
+        "already_matched": settled,
         "invalidated": tuple(invalidated),
     }
 

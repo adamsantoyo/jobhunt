@@ -835,6 +835,10 @@ class ScoreGraphPass:
             "selected": len(self.posting_ids),
             "scored": outcome.scored,
             "reused": outcome.reused,
+            # A reverting input re-currents the row it already wrote instead of
+            # minting a second one; reported separately so `selected == scored +
+            # recurrent + reused + skipped` keeps adding up.
+            "recurrent": outcome.recurrent,
             "superseded": outcome.superseded,
             "blocked": outcome.blocked,
             "skipped": len(skipped),
@@ -894,7 +898,7 @@ def run_pass(
     resolve_op = ResolvePass(run_uid=run_uid, at=stamp, category_of=category_of)
     resolve_report = resolve_op.apply(conn)
 
-    totals = {"selected": 0, "scored": 0, "reused": 0, "superseded": 0,
+    totals = {"selected": 0, "scored": 0, "reused": 0, "recurrent": 0, "superseded": 0,
               "blocked": 0, "skipped": 0}
     touched: list[str] = []
     cursor: str | None = None

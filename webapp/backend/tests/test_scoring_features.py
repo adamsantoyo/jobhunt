@@ -8,8 +8,10 @@ is reverted:
     every scored row. Before this, the vector omitted `function_match` on any
     non-top family, the mid-computation staff clamp, the pre-clamp total, and every
     terminal cap -- so a stored score explained a tier it could not produce.
-  THE FEATURE SET IS CLOSED. `scoring.validate_features` refuses to persist a
-    vector carrying a key the replayer has never heard of.
+  THE FEATURE SET IS CLOSED IN BOTH DIRECTIONS. `scoring.validate_features` refuses
+    a vector carrying a key the replayer has never heard of, one MISSING a key the
+    replayer indexes, and one whose value is not a real number. (The write path's
+    enforcement of it is `test_source_scoring.py`'s: this file is pure.)
   BLOCKER CODES ARE A NAMESPACE. `candidate_profile.BLOCKER_CODES` is asserted at
     emission, not merely spot-checked here.
   THE SCORER HAS A SOURCE DIGEST. Editing the pinned scoring surface fails this
@@ -25,6 +27,7 @@ Nothing here touches a database or the network: `rubric` and `candidate_profile`
 are pure given a profile document.
 """
 import copy
+import datetime
 import json
 import os
 import sys
@@ -80,6 +83,11 @@ DESCRIPTIONS = [
     "with hardware validation and semiconductor test equipment preferred.",
 ]
 POSTED = [None, "2026-08-01", "2025-01-01"]   # unknown / fresh / very stale
+
+#: A posting date that is fresh whenever the suite runs. `rubric.posting_age_days`
+#: measures against the real clock, so a row built to isolate ONE rule has to be
+#: dated off the clock too or a literal quietly adds the 30-day penalty to it.
+TODAY = datetime.date.today().isoformat()
 AGGREGATOR = [False, True]
 
 
@@ -148,12 +156,7 @@ def test_every_generated_row_reconstructs_its_own_tier_and_sums_to_its_raw_score
 
 
 def test_the_staff_clamp_is_recorded_as_a_negative_contribution():
-    """The clamp moves the RUNNING TOTAL, so it replays as a contribution.
-
-    Recorded even when it costs nothing: "the rule fired and changed nothing" is a
-    different fact from "the rule did not fire", and only the first one explains why
-    a Principal title scored the same as an IC one.
-    """
+    """The clamp moves the RUNNING TOTAL, so it replays as a contribution."""
     good = ("You will support enterprise customers on Azure and Intune. 2+ years of "
             "experience required. Kubernetes and observability tooling.")
     clamped = rubric.score_row_explained(
@@ -167,6 +170,30 @@ def test_the_staff_clamp_is_recorded_as_a_negative_contribution():
         _row("Support Engineer", "San Francisco, CA", "2026-08-01"), good
     )
     assert "staff_cap_delta" not in plain.features
+
+
+def test_the_staff_clamp_is_recorded_even_when_it_costs_nothing():
+    """PRESENCE, not magnitude, is the contract -- and only this row proves it.
+
+    "The rule fired and changed nothing" is a different fact from "the rule did not
+    fire", and only the first one explains why a Staff title scored the same as an
+    IC one. The distinction is invisible to the test above and to every generated
+    row, because in all of them the clamp binds: emitting the key only when
+    `capped != score` would leave the whole suite green. So this row is built to
+    reach the clamp ALREADY at or below `staff_cap_tier` -- a Staff title whose
+    years penalty has taken the running total down to the cap -- where a
+    conditional emission is the only thing that can drop the key.
+    """
+    at_the_cap = rubric.score_row_explained(
+        _row("Staff Support Engineer", "San Francisco, CA", TODAY),
+        "You will be helping customers with their tickets. 6+ years of experience required.",
+    )
+    assert "level-out" in at_the_cap.flags, "the clamp must actually have fired"
+    assert at_the_cap.features["staff_cap_delta"] == 0, (
+        "a clamp that cost nothing is still a clamp that fired"
+    )
+    assert sum(_contributions(at_the_cap.features).values()) == at_the_cap.features["raw_score"]
+    assert rubric.reconstruct_tier(at_the_cap.features) == at_the_cap.tier
 
 
 def test_function_match_is_emitted_for_every_scored_row(profile_doc, monkeypatch):
@@ -254,23 +281,99 @@ def test_emitting_features_does_not_change_the_tier():
 # --------------------------------------------------------------------------- #
 # 2. The feature set is closed
 # --------------------------------------------------------------------------- #
+def _validate_score_row(features):
+    return scoring.validate_features(
+        features,
+        candidate_profile.REQUIRED_SCORE_ROW_FEATURES,
+        required_present=candidate_profile.REQUIRED_PRESENT_SCORE_ROW_FEATURES,
+    )
+
+
 def test_a_vector_with_an_unknown_key_is_refused_before_it_is_stored():
     """An un-replayable score must never reach the database.
 
     The failure this rules out: somebody adds a scored dimension, the vector grows
     a key `reconstruct_tier` ignores, and every score written from that day forward
     silently disagrees with its own replay.
+
+    `test_source_scoring.py` proves the same refusal on the WRITE PATH, which is
+    the claim that matters -- a pure function nobody calls refuses nothing.
     """
     good = {"function_match": 3, "raw_score": 3}
-    assert scoring.validate_features(
-        good, candidate_profile.REQUIRED_SCORE_ROW_FEATURES
-    ) == good
+    assert _validate_score_row(good) == good
 
     with pytest.raises(scoring.ScoreFeatureError) as excinfo:
-        scoring.validate_features(
-            {**good, "vibes_bonus": 2}, candidate_profile.REQUIRED_SCORE_ROW_FEATURES
-        )
+        _validate_score_row({**good, "vibes_bonus": 2})
     assert "vibes_bonus" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("features,expected", [
+    ({"function_match": 3}, "raw_score"),
+    ({"raw_score": 3}, "function_match"),
+    ({}, "function_match"),
+])
+def test_a_vector_missing_a_key_the_replayer_indexes_is_refused(features, expected):
+    """The other direction, and the one the closed set alone never covered.
+
+    A closed set says which keys MAY appear; on its own it accepts `{}`. The
+    consequence is not a wrong tier, it is `reconstruct_tier` raising `KeyError`
+    years later on a row nothing can re-derive -- asserted below, so the rule is
+    justified by the failure it prevents rather than by its own restatement.
+    """
+    with pytest.raises(scoring.ScoreFeatureError, match=expected):
+        _validate_score_row(features)
+
+    if "raw_score" not in features:
+        with pytest.raises(KeyError):
+            rubric.reconstruct_tier(features)
+
+
+@pytest.mark.parametrize("value", [
+    "not-a-number", None, True, False, float("nan"), float("inf"), float("-inf"), [3],
+])
+def test_a_vector_whose_value_is_not_a_real_number_is_refused(value):
+    """Every stored value is summed, mins'd or compared on replay.
+
+    A string raises, a None raises, a NaN does neither -- it propagates silently
+    through `min` and never equals itself, which is the worst of the three. `bool`
+    is rejected although it is an `int` subclass: `True` where a point value belongs
+    means somebody stored a flag, and it would sum as 1.
+    """
+    with pytest.raises(scoring.ScoreFeatureError):
+        _validate_score_row({"function_match": 3, "raw_score": value})
+
+
+def test_a_blocked_vector_is_closed_in_both_directions():
+    """A blocked row's vector is exactly `{"blocker": <code>}`.
+
+    It never reached a score, so there is no total to reconstruct and no cap to
+    apply -- `reconstruct_tier` returns 0 on the key's presence alone. A vector
+    carrying a blocker AND contributions describes two different things, and the
+    blocker's value is a code string rather than a number, so it is the one value
+    the numeric rule must not be applied to.
+    """
+    blocked = {"blocker": "non_us_location"}
+    assert _validate_score_row(blocked) == blocked
+
+    with pytest.raises(scoring.ScoreFeatureError):
+        _validate_score_row({**blocked, "raw_score": 3})
+    with pytest.raises(scoring.ScoreFeatureError):
+        _validate_score_row({"blocker": 7})
+
+
+def test_the_hireability_vector_may_legitimately_be_empty():
+    """No rule fired is a real answer there: the odds vector replays as a plain sum,
+    so an empty vector scores 0. Requiring a key would reject a correct row.
+    """
+    assert scoring.validate_features(
+        {}, candidate_profile.REQUIRED_HIREABILITY_FEATURES,
+        required_present=candidate_profile.REQUIRED_PRESENT_HIREABILITY_FEATURES,
+    ) == {}
+    with pytest.raises(scoring.ScoreFeatureError):
+        scoring.validate_features(
+            {"senior": -1, "vibes": 1}, candidate_profile.REQUIRED_HIREABILITY_FEATURES,
+            required_present=candidate_profile.REQUIRED_PRESENT_HIREABILITY_FEATURES,
+        )
 
 
 def test_the_contract_covers_exactly_the_weights_plus_the_computed_keys():
@@ -289,6 +392,16 @@ def test_the_contract_covers_exactly_the_weights_plus_the_computed_keys():
     assert candidate_profile.SCORE_ROW_CAP_FEATURES == (
         "cap_func", "cap_no_desc", "cap_stale", "cap_undated_aggregator"
     )
+    # Required-present is a SUBSET of may-appear, and it is exactly the two keys
+    # `_score_row_core` emits unconditionally. Requiring a conditional key (a cap,
+    # or `staff_cap_delta`) would reject correct vectors; requiring neither of these
+    # accepts vectors that cannot replay.
+    assert candidate_profile.REQUIRED_PRESENT_SCORE_ROW_FEATURES == {
+        "function_match", "raw_score"
+    }
+    assert (candidate_profile.REQUIRED_PRESENT_SCORE_ROW_FEATURES
+            <= candidate_profile.REQUIRED_SCORE_ROW_FEATURES)
+    assert candidate_profile.REQUIRED_PRESENT_HIREABILITY_FEATURES == frozenset()
 
 
 # --------------------------------------------------------------------------- #

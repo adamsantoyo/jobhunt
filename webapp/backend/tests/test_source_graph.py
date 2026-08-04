@@ -466,9 +466,15 @@ def test_a_description_arriving_later_supersedes_the_capped_score(conn, profile_
 
     rows = score_rows(conn)
     assert len(rows) == 2
-    old, new = rows
+    # Selected by SUPERSESSION, not by position: both rows carry the same
+    # `created_at` (one pass wrote both), so `score_rows`' tiebreak falls through to
+    # a content-derived uuid5 and which one sorts first is a coin flip that depends
+    # on the description's hash. Unpacking the list would pass or fail on the
+    # fixture text rather than on the behaviour.
+    old = next(r for r in rows if r["superseded_at"] is not None)
+    new = next(r for r in rows if r["superseded_at"] is None)
     assert old["superseded_at"] == AT and old["superseded_by"] == new["score_version_id"]
-    assert new["superseded_at"] is None
+    assert new["superseded_by"] is None
     assert new["input_hash"] != old["input_hash"]
     assert new["posting_version_id"] == old["posting_version_id"], (
         "the SOURCE said nothing new -- this is the same posting version"
