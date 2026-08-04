@@ -37,7 +37,16 @@ DESC = os.path.join(HERE, "results", "descriptions.jsonl")
 # became hermetic (config.json's profile.bay_area / profile.title_exclude moved
 # into profile.json), and the undated-aggregator cap took an explicit
 # `is_aggregator` input instead of sniffing legacy CSV source strings.
-RUBRIC_VERSION = "rubric-2026.08-v2"
+# v3 (Phase 3.5): hireability's label stopped being a score-vs-threshold
+# comparison against profile.json's (removed) hireability_labels and became a
+# deterministic function of the SAME feature vector the score is summed from --
+# match_label (fit quality: level gap, skills overlap) and competition_label
+# (applicant-pool pressure), combined into `label` as "<match> / <competition>".
+# s, the feature vector, and score_row()/tier are byte-identical to v2; only how
+# a label is READ OFF an unchanged vector changed. Honest match/competition
+# vocabulary replaces the probabilistic-sounding Likely/Target/Reach until real
+# outcomes exist to calibrate a prediction against.
+RUBRIC_VERSION = "rubric-2026.08-v3"
 
 _RPROFILE_CACHE = None
 def _rprofile():
@@ -373,6 +382,8 @@ class ScoreResult:
 @_dataclass(frozen=True)
 class OddsResult:
     label: str
+    match_label: str
+    competition_label: str
     score: int
     why: str
     features: dict
@@ -437,9 +448,38 @@ def _hireability_core(r, desc):
         s += W["comp_near_level"]; features["comp_near_level"] = W["comp_near_level"]; why.append("comp near his level")
     if "degree-gated" in flags:
         s += W["degree_gated"]; features["degree_gated"] = W["degree_gated"]; why.append("hard degree gate")
-    label = "Likely" if s >= prof.hireability_labels.likely_threshold \
-        else ("Reach" if s <= prof.hireability_labels.reach_threshold else "Target")
-    return OddsResult(label=label, score=s, why="; ".join(why[:4]), features=features,
+    # Two honest labels, read off the SAME feature vector `s` was summed from --
+    # no new inputs, no score-vs-threshold comparison. This replaced a "Likely /
+    # Target / Reach" prediction the tool had no outcome data to calibrate
+    # (roadmap: "replace user-facing probabilistic labels with honest
+    # match/competition labels until outcomes support calibration").
+    #
+    # match_label: fit quality (level gap, skills overlap), most-decisive rule
+    # first. "Unscored" is not a 5th quality tier -- it is the honest admission
+    # that the len(d) > 400 gate above never ran, so no skills verdict exists to
+    # report (rather than reporting "Moderate match" on missing evidence).
+    if "staff_principal" in features:
+        match_label = "Level stretch"
+    elif "skills_strong" in features or "exact_stack" in features:
+        match_label = "Strong match"
+    elif "skills_thin" in features:
+        match_label = "Weak match"
+    elif len(d) <= 400:
+        match_label = "Unscored"
+    else:
+        match_label = "Moderate match"
+    # competition_label: applicant-pool pressure, independent of fit quality.
+    if "high_competition" in features or "comp_high_bar" in features or "degree_gated" in features:
+        competition_label = "High competition"
+    elif "staffing_w2" in features:
+        competition_label = "Lower bar"
+    else:
+        competition_label = "Standard"
+    # Combined string is the one legacy surfaces keep reading unchanged in shape
+    # (CSV `odds` column, jobs.odds, job_history.odds, score_versions.odds).
+    label = f"{match_label} / {competition_label}"
+    return OddsResult(label=label, match_label=match_label, competition_label=competition_label,
+                       score=s, why="; ".join(why[:4]), features=features,
                        profile_hash=prof.content_hash, rubric_hash=RUBRIC_VERSION)
 
 def hireability(r, desc):
@@ -841,7 +881,7 @@ def scorer_source_digest():
 #: `webapp/backend/tests/test_scoring_features.py`. When that assertion fails,
 #: the scorer changed: update this constant, and decide in the same edit whether
 #: RUBRIC_VERSION moves with it.
-SCORER_SOURCE_DIGEST = "11b7474fb7af53e7bd79e7910d0af71c221ac65da07da3b929e559a413229156"
+SCORER_SOURCE_DIGEST = "eb9073d937869ea2995f49dcf920d48373a53428ad1bf57f919dd9cb4aa94127"
 
 def load_picks():
     """Human picks (picks.json) + LLM-confirmed picks (picks_llm.json, written by

@@ -134,6 +134,8 @@ def test_loaded_profile_matches_the_on_disk_document(profile_doc):
     assert prof.content_hash == candidate_profile.profile_content_hash(profile_doc)
     # Bumped 1 -> 2 by Phase 3.3: four dead Seattle-era location fields removed,
     # and config.json's profile.bay_area / profile.title_exclude folded in as
-    # location.bay_area_cities / exclusions.title_exclude. Pinned deliberately --
-    # a schema bump must be a decision, not a diff nobody noticed.
-    assert prof.schema_version == candidate_profile.SCHEMA_VERSION == 2
+    # location.bay_area_cities / exclusions.title_exclude. Bumped 2 -> 3 by
+    # Phase 3.5: hireability_labels removed (labels are now derived from the
+    # feature vector, not a score-vs-threshold comparison). Pinned deliberately
+    # -- a schema bump must be a decision, not a diff nobody noticed.
+    assert prof.schema_version == candidate_profile.SCHEMA_VERSION == 3

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useChanges, useCompanies, useConfig, useJobs, usePatchState } from "../store/queries";
-import { fmtDate, fmtSalary, oddsRank } from "../lib/format";
+import { fmtDate, fmtSalary, oddsRank, parseOdds } from "../lib/format";
 import { OddsBadge, StatusBadge, TierBadge } from "../components/StatusBadge";
 import { EMPTY_FILTERS, FilterBar, type TableFilters } from "../components/FilterBar";
 import { DEFAULT_STATUSES, statusOf } from "../lib/statuses";
@@ -45,7 +45,11 @@ function cmp(a: JobLight, b: JobLight, key: SortKey): number {
 function matches(job: JobLight, f: TableFilters): boolean {
   if (!f.includeHidden && job.state?.hidden) return false;
   if (f.tiers.length && !f.tiers.includes(job.tier)) return false;
-  if (f.odds.length && !(job.odds && f.odds.includes(job.odds))) return false;
+  if (f.match.length || f.competition.length) {
+    const { match, competition } = parseOdds(job.odds);
+    if (f.match.length && !(match && f.match.includes(match))) return false;
+    if (f.competition.length && !(competition && f.competition.includes(competition))) return false;
+  }
   if (f.sources.length && !(job.source && f.sources.includes(job.source))) return false;
   if (f.statuses.length && !f.statuses.includes(statusOf(job))) return false;
   if (f.remote !== null && job.remote !== f.remote) return false;
@@ -120,11 +124,13 @@ export default function Explore() {
     return diffSets.tierMap.has(job.url_b64);
   };
 
-  // Facet base for MatrixFilter: every current filter EXCEPT tiers/odds,
-  // still intersected with the active diff chip (a diff chip is just another
-  // filter, per the design contract's diff-filtering semantics).
+  // Facet base for MatrixFilter: every current filter EXCEPT tiers/competition
+  // (the matrix's own two axes -- match is a separate FilterBar chip group and
+  // stays applied), still intersected with the active diff chip (a diff chip
+  // is just another filter, per the design contract's diff-filtering
+  // semantics).
   const facetJobs = useMemo(() => {
-    const f: TableFilters = { ...filters, tiers: [], odds: [] };
+    const f: TableFilters = { ...filters, tiers: [], competition: [] };
     return jobs.filter((j) => matches(j, f) && diffMatches(j));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, filters, diff, diffSets]);

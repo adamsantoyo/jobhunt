@@ -68,18 +68,55 @@ export function flagsList(flags: string | null | undefined): string[] {
     .filter(Boolean);
 }
 
-/** Sortable odds rank: Likely (best) < Target < Reach < unknown. */
+/**
+ * The scorer stores `odds` as a combined "<match label> / <competition label>"
+ * string (e.g. "Strong match / High competition") -- honest match/competition
+ * labels, replacing a Likely/Target/Reach prediction the tool had no outcome
+ * data to calibrate. `parseOdds` splits it back into its two halves.
+ *
+ * A legacy single-word value (Likely/Target/Reach, written by a scorer older
+ * than this change and still possible in job_history/jobs until the next
+ * sweep) has no " / " separator, so both halves come back null -- callers
+ * must treat that as "unknown", never throw.
+ */
+export interface ParsedOdds {
+  match: string | null;
+  competition: string | null;
+}
+
+export function parseOdds(odds: string | null | undefined): ParsedOdds {
+  if (!odds) return { match: null, competition: null };
+  const idx = odds.indexOf(" / ");
+  if (idx === -1) return { match: null, competition: null };
+  return { match: odds.slice(0, idx), competition: odds.slice(idx + 3) };
+}
+
+const MATCH_RANK: Record<string, number> = {
+  "Strong match": 0,
+  "Moderate match": 1,
+  "Weak match": 2,
+  "Level stretch": 3,
+  Unscored: 4,
+};
+
+const COMPETITION_RANK: Record<string, number> = {
+  "Lower bar": 0,
+  Standard: 1,
+  "High competition": 2,
+};
+
+/**
+ * Sortable odds rank: match quality first (Strong match best), then
+ * competition (Lower bar ranks better than High competition). A legacy
+ * single-word value or anything else unparseable ranks after every known
+ * match/competition combination -- never throws.
+ */
 export function oddsRank(odds: string | null | undefined): number {
-  switch (odds) {
-    case "Likely":
-      return 0;
-    case "Target":
-      return 1;
-    case "Reach":
-      return 2;
-    default:
-      return 3;
-  }
+  const { match, competition } = parseOdds(odds);
+  if (match == null || competition == null) return 1000;
+  const m = MATCH_RANK[match] ?? MATCH_RANK.Unscored + 1;
+  const c = COMPETITION_RANK[competition] ?? COMPETITION_RANK["High competition"] + 1;
+  return m * 10 + c;
 }
 
 /**

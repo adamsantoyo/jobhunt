@@ -587,11 +587,14 @@ def test_a_version_1_profile_is_rejected_rather_than_up_converted(profile_doc):
 # --------------------------------------------------------------------------- #
 def test_hireability_vectors_sum_to_their_score_and_compose_to_their_label(profile_doc):
     """The odds axis has no clamp, no cap, and no blocker, so its vector is a plain
-    sum -- and its label is a pure function of that sum against two thresholds.
+    sum. Its label is no longer a score-vs-threshold comparison (profile.json's
+    hireability_labels is gone as of schema_version 3): match_label and
+    competition_label are pure functions of WHICH named features fired, and
+    `label` is their " / "-joined combination -- so this test recomputes the
+    same decision the scorer makes, from the same vector, independently of
+    `rubric._hireability_core`'s internals.
     """
-    prof = candidate_profile.build_profile(profile_doc)
-    likely = prof.hireability_labels.likely_threshold
-    reach = prof.hireability_labels.reach_threshold
+    candidate_profile.build_profile(profile_doc)  # profile.json itself must still validate
     seen_labels = set()
     for title, location, desc, posted, _aggregator in _generated():
         row = _row(title, location, posted)
@@ -599,9 +602,27 @@ def test_hireability_vectors_sum_to_their_score_and_compose_to_their_label(profi
         label = (title, desc, result.features)
         assert set(result.features) <= candidate_profile.REQUIRED_HIREABILITY_FEATURES, label
         assert sum(result.features.values()) == result.score, label
-        expected = "Likely" if result.score >= likely else (
-            "Reach" if result.score <= reach else "Target"
-        )
-        assert result.label == expected, label
+
+        d = (desc or "").lower()
+        if "staff_principal" in result.features:
+            expected_match = "Level stretch"
+        elif "skills_strong" in result.features or "exact_stack" in result.features:
+            expected_match = "Strong match"
+        elif "skills_thin" in result.features:
+            expected_match = "Weak match"
+        elif len(d) <= 400:
+            expected_match = "Unscored"
+        else:
+            expected_match = "Moderate match"
+        if any(k in result.features for k in ("high_competition", "comp_high_bar", "degree_gated")):
+            expected_competition = "High competition"
+        elif "staffing_w2" in result.features:
+            expected_competition = "Lower bar"
+        else:
+            expected_competition = "Standard"
+
+        assert result.match_label == expected_match, label
+        assert result.competition_label == expected_competition, label
+        assert result.label == f"{expected_match} / {expected_competition}", label
         seen_labels.add(result.label)
     assert len(seen_labels) > 1, "the generated rows never varied the odds label"

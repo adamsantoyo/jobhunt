@@ -11,7 +11,25 @@ from ..sweeprunner import runner
 
 router = APIRouter()
 
-_ODDS = ["Likely", "Target", "Reach"]
+#: The competition axis (Phase 3.5): jobs.odds/job_history.odds now stores the
+#: combined "<match> / <competition>" string rubric.hireability() emits (see
+#: rubric._hireability_core). Analytics breaks it down by the competition half
+#: only -- the axis this dashboard has always charted as 3 columns -- rather
+#: than by the full combined string, which would fragment into up to 15
+#: match x competition cells.
+_COMPETITION = ["High competition", "Standard", "Lower bar"]
+
+
+def _competition_of(odds: str | None) -> str | None:
+    """Extract the competition-axis component from a stored odds value.
+
+    Legacy single-word values (Likely/Target/Reach, written by a scorer older
+    than Phase 3.5 and still present in jobs/job_history until the next sweep)
+    have no " / " separator and return None -- excluded from the competition
+    breakdown rather than mis-bucketed under a guessed column."""
+    if not odds or " / " not in odds:
+        return None
+    return odds.split(" / ", 1)[1]
 
 
 def _comp_band(conn: sqlite3.Connection) -> list[int]:
@@ -49,15 +67,23 @@ def analytics(conn: sqlite3.Connection = Depends(get_db)):
     tiers = {str(r["tier"]): r["c"] for r in conn.execute(
         "SELECT tier, COUNT(*) AS c FROM jobs WHERE present=1 GROUP BY tier").fetchall()}
 
-    odds = {r["odds"]: r["c"] for r in conn.execute(
-        "SELECT odds, COUNT(*) AS c FROM jobs WHERE present=1 AND odds IS NOT NULL GROUP BY odds").fetchall()}
+    # Distribution over the competition axis only, accumulated (not assigned):
+    # several distinct combined odds values ("Strong match / Standard",
+    # "Weak match / Standard", ...) share one competition bucket.
+    odds = {o: 0 for o in _COMPETITION}
+    for r in conn.execute(
+        "SELECT odds, COUNT(*) AS c FROM jobs WHERE present=1 AND odds IS NOT NULL GROUP BY odds").fetchall():
+        comp = _competition_of(r["odds"])
+        if comp in odds:
+            odds[comp] += r["c"]
 
-    matrix = {str(t): {o: 0 for o in _ODDS} for t in range(5, 0, -1)}
+    matrix = {str(t): {o: 0 for o in _COMPETITION} for t in range(5, 0, -1)}
     for r in conn.execute(
         "SELECT tier, odds, COUNT(*) AS c FROM jobs WHERE present=1 GROUP BY tier, odds").fetchall():
         tkey = str(r["tier"])
-        if tkey in matrix and r["odds"] in matrix[tkey]:
-            matrix[tkey][r["odds"]] = r["c"]
+        comp = _competition_of(r["odds"])
+        if tkey in matrix and comp in matrix[tkey]:
+            matrix[tkey][comp] += r["c"]
 
     by_source = [
         {"source": r["source"], "kept": r["kept"], "with_desc": r["with_desc"]}

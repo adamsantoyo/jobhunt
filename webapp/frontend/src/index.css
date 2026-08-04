@@ -507,15 +507,21 @@ textarea.input {
   background: var(--bg-2);
   color: var(--fg-mute);
 }
-.badge.odds[data-odds="Likely"] {
+/* Colored by the competition axis (Phase 3.5): jobs.odds stores a combined
+   "<match> / <competition>" string; data-competition carries the parsed
+   competition half. A legacy Likely/Target/Reach value or anything else
+   unparseable renders with data-competition="unknown" -- no rule below
+   matches it, so it falls back to the plain, unstyled .badge look instead of
+   being miscolored. */
+.badge.odds[data-competition="Lower bar"] {
   color: var(--green);
   border: 1px solid var(--green);
 }
-.badge.odds[data-odds="Target"] {
+.badge.odds[data-competition="Standard"] {
   color: var(--amber);
   border: 1px solid var(--amber);
 }
-.badge.odds[data-odds="Reach"] {
+.badge.odds[data-competition="High competition"] {
   color: var(--red);
   border: 1px solid var(--red);
 }

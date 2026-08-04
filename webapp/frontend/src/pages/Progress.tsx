@@ -20,7 +20,7 @@ import { useAnalytics, useActivity, useConfig, useFunnel } from "../store/querie
 import { ChartCard, StatCard } from "../components/progress/panels";
 import { ChartTooltip } from "../components/progress/ChartTooltip";
 import { HeatMatrix } from "../components/progress/HeatMatrix";
-import { kfmt, nfmt, ODDS_COLORS, TICK, TIER_COLORS, VIZ } from "../components/progress/theme";
+import { COMPETITION_COLORS, kfmt, nfmt, TICK, TIER_COLORS, VIZ } from "../components/progress/theme";
 import { fmtDate } from "../lib/format";
 import type { FunnelTotals, StageConversion, TimeInStage } from "../api/types";
 
@@ -41,7 +41,11 @@ const STATUS_ORDER = [
   "Rejected",
   "Passed",
 ];
-const ODDS_ORDER = ["Likely", "Target", "Reach"];
+// /api/analytics buckets `odds` by the competition axis only (Phase 3.5's
+// combined "<match> / <competition>" label, collapsed server-side by
+// analytics._competition_of) -- 3 columns, not the 15-cell match x
+// competition cross product.
+const COMPETITION_ORDER = ["High competition", "Standard", "Lower bar"];
 
 const gridProps = { stroke: VIZ.grid, strokeWidth: 1 } as const;
 const axisLine = { stroke: VIZ.axis } as const;
@@ -342,7 +346,7 @@ function MarketTab() {
   );
 
   const odds = useMemo(
-    () => ODDS_ORDER.map((o) => ({ odds: o, count: data?.odds?.[o] ?? 0 })),
+    () => COMPETITION_ORDER.map((c) => ({ odds: c, count: data?.odds?.[c] ?? 0 })),
     [data],
   );
 
@@ -475,8 +479,8 @@ function MarketTab() {
           </ResponsiveContainer>
         </ChartCard>
 
-        {/* Odds distribution — columns, odds semantic colors */}
-        <ChartCard title="Odds distribution" subtitle="Likely / Target / Reach">
+        {/* Competition distribution: columns, competition semantic colors */}
+        <ChartCard title="Competition distribution" subtitle="High competition / Standard / Lower bar">
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={odds} margin={{ top: 18, right: 8, bottom: 4, left: 0 }}>
               <CartesianGrid {...gridProps} vertical={false} />
@@ -488,7 +492,7 @@ function MarketTab() {
               />
               <Bar isAnimationActive={false} dataKey="count" name="Roles" radius={[4, 4, 0, 0]} maxBarSize={56}>
                 {odds.map((o) => (
-                  <Cell key={o.odds} fill={ODDS_COLORS[o.odds] ?? VIZ.mute} />
+                  <Cell key={o.odds} fill={COMPETITION_COLORS[o.odds] ?? VIZ.mute} />
                 ))}
                 <LabelList dataKey="count" position="top" fill={VIZ.dim} fontSize={11} />
               </Bar>
@@ -496,8 +500,8 @@ function MarketTab() {
           </ResponsiveContainer>
         </ChartCard>
 
-        {/* Tier x Odds heat counts */}
-        <ChartCard title="Tier × odds" subtitle="kept roles by cell" height={220}>
+        {/* Tier x Competition heat counts */}
+        <ChartCard title="Tier × competition" subtitle="kept roles by cell" height={220}>
           <HeatMatrix matrix={data.matrix ?? {}} />
         </ChartCard>
 

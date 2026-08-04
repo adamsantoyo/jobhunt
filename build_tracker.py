@@ -80,17 +80,30 @@ ARIAL = Font(name="Arial")
 hfill = PatternFill("solid", fgColor="1F3864")
 t5fill = PatternFill("solid", fgColor="C6EFCE")
 t4fill = PatternFill("solid", fgColor="E2EFDA")
-# odds axis (orthogonal to fit tier): green=Likely, amber=Target, red=Reach
-ODDS_FILL = {"Likely": PatternFill("solid", fgColor="92D050"),
-             "Target": PatternFill("solid", fgColor="FFE699"),
-             "Reach":  PatternFill("solid", fgColor="F4B7B7")}
-ODDS_RANK = {"Likely": 0, "Target": 1, "Reach": 2}
+# odds axis (orthogonal to fit tier): the stored `odds` string is
+# "<match> / <competition>" (Phase 3.5's honest match/competition labels,
+# replacing the probabilistic-sounding Likely/Target/Reach). The tracker
+# colors/sorts on the competition half only: green=Lower bar (easiest bar),
+# amber=Standard, red=High competition (hardest). A legacy Likely/Target/Reach
+# value (written by a scorer older than Phase 3.5, possible until the next
+# sweep) has no " / " separator and falls back to the neutral "Standard"
+# bucket rather than crashing or being miscolored.
+def _competition_of(odds):
+    odds = odds or ""
+    if " / " not in odds:
+        return "Standard"
+    return odds.split(" / ", 1)[1]
+
+ODDS_FILL = {"Lower bar": PatternFill("solid", fgColor="92D050"),
+             "Standard": PatternFill("solid", fgColor="FFE699"),
+             "High competition": PatternFill("solid", fgColor="F4B7B7")}
+ODDS_RANK = {"Lower bar": 0, "Standard": 1, "High competition": 2}
 
 def odds_sort_key(r):
     # most-winnable first; break ties by numeric odds_score then company
     try: sc = int(r.get("odds_score") or 0)
     except (TypeError, ValueError): sc = 0
-    return (ODDS_RANK.get(r.get("odds", "Target"), 1), -sc, r["company"], r["title"])
+    return (ODDS_RANK.get(_competition_of(r.get("odds")), 1), -sc, r["company"], r["title"])
 
 def style_header(ws):
     for c in ws[1]:
@@ -127,7 +140,7 @@ for r in sorted([r for r in rows if r["tier"] == "5"], key=odds_sort_key):
             tp.cell(row=i, column=col).font = ARIAL
             tp.cell(row=i, column=col).alignment = Alignment(wrap_text=(col in (7, 8)), vertical="top")
         tp.cell(row=i, column=col).fill = t5fill
-    tp.cell(row=i, column=1).fill = ODDS_FILL.get(r.get("odds", "Target"), t5fill)  # odds cell overrides
+    tp.cell(row=i, column=1).fill = ODDS_FILL.get(_competition_of(r.get("odds")), t5fill)  # odds cell overrides
 for i, w in enumerate([9, 6, 44, 17, 24, 20, 50, 34, 15, 10, 13], 1):
     tp.column_dimensions[get_column_letter(i)].width = w
 tp.freeze_panes = "A2"
@@ -157,7 +170,7 @@ for r in rows:
     for col in range(1, 19):
         if col != LINK_C: ws.cell(row=i, column=col).font = ARIAL
         if fill: ws.cell(row=i, column=col).fill = fill
-    ws.cell(row=i, column=2).fill = ODDS_FILL.get(r.get("odds", "Target"), fill or PatternFill())  # odds cell
+    ws.cell(row=i, column=2).fill = ODDS_FILL.get(_competition_of(r.get("odds")), fill or PatternFill())  # odds cell
 for i, w in enumerate([6, 8, 6, 46, 20, 26, 18, 11, 11, 8, 14, 20, 34, 10, 12, 13, 22, 30], 1):
     ws.column_dimensions[get_column_letter(i)].width = w
 ws.freeze_panes = "A2"; ws.auto_filter.ref = f"A1:R{ws.max_row}"

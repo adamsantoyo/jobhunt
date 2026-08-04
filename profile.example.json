@@ -1,5 +1,5 @@
 {
- "schema_version": 2,
+ "schema_version": 3,
  "location": {
   "non_us_patterns": [
    "\\bexamplestan\\b",
@@ -149,10 +149,6 @@
   "stale_cap_days": 90,
   "stale_cap_tier": 3,
   "undated_aggregator_cap_tier": 3
- },
- "hireability_labels": {
-  "likely_threshold": 3,
-  "reach_threshold": -2
  },
  "weights": {
   "hireability": {

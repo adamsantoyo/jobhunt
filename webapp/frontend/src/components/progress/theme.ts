@@ -32,10 +32,13 @@ export const TIER_COLORS: Record<number, string> = {
   1: "#3c454f",
 };
 
-export const ODDS_COLORS: Record<string, string> = {
-  Likely: VIZ.green,
-  Target: VIZ.amber,
-  Reach: VIZ.red,
+// Competition axis (Phase 3.5): jobs.odds now stores a combined "<match> /
+// <competition>" string; charts key colors off the competition half only.
+// Lower bar (easiest) = green, Standard = amber, High competition = red.
+export const COMPETITION_COLORS: Record<string, string> = {
+  "Lower bar": VIZ.green,
+  Standard: VIZ.amber,
+  "High competition": VIZ.red,
 };
 
 /** Compact dollar label, e.g. 100000 -> "$100k". */

@@ -3,7 +3,12 @@
 
 export interface TableFilters {
   tiers: number[];
-  odds: string[];
+  // The stored odds string is "<match label> / <competition label>" (Phase
+  // 3.5); these two arrays filter on the parsed halves independently rather
+  // than on the combined string, so "Strong match, any competition" is
+  // expressible without enumerating every combination.
+  match: string[];
+  competition: string[];
   sources: string[];
   statuses: string[];
   remote: boolean | null; // null = any
@@ -16,7 +21,8 @@ export interface TableFilters {
 
 export const EMPTY_FILTERS: TableFilters = {
   tiers: [],
-  odds: [],
+  match: [],
+  competition: [],
   sources: [],
   statuses: [],
   remote: null,
@@ -28,7 +34,8 @@ export const EMPTY_FILTERS: TableFilters = {
 };
 
 const ALL_TIERS = [5, 4, 3, 2, 1];
-const ALL_ODDS = ["Likely", "Target", "Reach"];
+const ALL_MATCH = ["Strong match", "Moderate match", "Weak match", "Level stretch", "Unscored"];
+const ALL_COMPETITION = ["Lower bar", "Standard", "High competition"];
 
 function toggle<T>(arr: T[], value: T): T[] {
   return arr.includes(value) ? arr.filter((v) => v !== value) : [...arr, value];
@@ -75,16 +82,31 @@ export function FilterBar({
       </div>
 
       <div className="filter-group">
-        <span className="filter-label">Odds</span>
-        {ALL_ODDS.map((o) => (
+        <span className="filter-label">Match</span>
+        {ALL_MATCH.map((m) => (
           <button
-            key={o}
+            key={m}
             type="button"
             className="chip-toggle"
-            data-on={filters.odds.includes(o) ? "1" : "0"}
-            onClick={() => set({ odds: toggle(filters.odds, o) })}
+            data-on={filters.match.includes(m) ? "1" : "0"}
+            onClick={() => set({ match: toggle(filters.match, m) })}
           >
-            {o}
+            {m}
+          </button>
+        ))}
+      </div>
+
+      <div className="filter-group">
+        <span className="filter-label">Competition</span>
+        {ALL_COMPETITION.map((c) => (
+          <button
+            key={c}
+            type="button"
+            className="chip-toggle"
+            data-on={filters.competition.includes(c) ? "1" : "0"}
+            onClick={() => set({ competition: toggle(filters.competition, c) })}
+          >
+            {c}
           </button>
         ))}
       </div>

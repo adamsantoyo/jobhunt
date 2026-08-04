@@ -43,8 +43,12 @@ DEFAULT_PROFILE_PATH = os.path.join(HERE, "profile.json")
 
 #: The only `profile.json` shape this loader accepts. Bumped 1 -> 2 by Phase 3.3
 #: (dead location fields removed; `config.json`'s `profile.bay_area` and
-#: `profile.title_exclude` folded in) -- see `build_profile`.
-SCHEMA_VERSION = 2
+#: `profile.title_exclude` folded in). Bumped 2 -> 3 by Phase 3.5 (`hireability_labels`
+#: removed: the probabilistic-sounding Likely/Target/Reach thresholds it held are
+#: dead -- hireability's match_label/competition_label are now derived deterministically
+#: from the feature vector that already fired, not from a score-vs-threshold
+#: comparison) -- see `build_profile`.
+SCHEMA_VERSION = 3
 
 # The exact feature/weight names rubric.score_row / rubric.hireability emit.
 # profile.json's weights.score_row / weights.hireability tables are validated
@@ -197,7 +201,7 @@ BLOCKER_CODES = frozenset({
 _TOP_LEVEL_KEYS = frozenset({
     "schema_version", "location", "families", "domain", "skills", "targets",
     "competition", "employers", "exclusions", "level", "comp", "experience",
-    "tier_rules", "hireability_labels", "weights",
+    "tier_rules", "weights",
 })
 
 
@@ -435,12 +439,6 @@ class TierRulesProfile:
 
 
 @dataclass(frozen=True, slots=True)
-class HireabilityLabelsProfile:
-    likely_threshold: int
-    reach_threshold: int
-
-
-@dataclass(frozen=True, slots=True)
 class WeightsProfile:
     hireability: Mapping[str, int]
     score_row: Mapping[str, int]
@@ -465,7 +463,6 @@ class Profile:
     comp: CompProfile
     experience: ExperienceProfile
     tier_rules: TierRulesProfile
-    hireability_labels: HireabilityLabelsProfile
     weights: WeightsProfile
     raw: Mapping
 
@@ -667,15 +664,6 @@ def _build_tier_rules(doc, path) -> TierRulesProfile:
     )
 
 
-def _build_hireability_labels(doc, path) -> HireabilityLabelsProfile:
-    d = _expect_object(doc, path)
-    _expect_keys(d, frozenset({"likely_threshold", "reach_threshold"}), path)
-    return HireabilityLabelsProfile(
-        likely_threshold=_int(d["likely_threshold"], f"{path}.likely_threshold"),
-        reach_threshold=_int(d["reach_threshold"], f"{path}.reach_threshold"),
-    )
-
-
 def _build_weights(doc, path) -> WeightsProfile:
     d = _expect_object(doc, path)
     _expect_keys(d, frozenset({"hireability", "score_row"}), path)
@@ -696,10 +684,14 @@ def build_profile(doc) -> Profile:
     # Forward-only, like the database's. Version 2 removed four dead location
     # fields and folded `config.json`'s `profile.bay_area` /
     # `profile.title_exclude` in as `location.bay_area_cities` /
-    # `exclusions.title_exclude`. A version-1 document is REJECTED rather than
-    # up-converted: it is missing rules the scorer now requires, and inventing
-    # defaults for them is exactly the silent-fallback behaviour this loader
-    # exists to prevent.
+    # `exclusions.title_exclude`. Version 3 removed `hireability_labels`: the
+    # Likely/Target/Reach thresholds it held are dead now that hireability's
+    # labels are derived from the feature vector instead of a score-vs-threshold
+    # comparison (see `rubric._hireability_core`). An older document is REJECTED
+    # rather than up-converted: it is missing rules the scorer now requires (or
+    # carries a section the scorer no longer reads), and inventing defaults for
+    # either is exactly the silent-fallback behaviour this loader exists to
+    # prevent.
     _require(schema_version == SCHEMA_VERSION, "profile.schema_version",
              f"unsupported schema_version {schema_version} (only {SCHEMA_VERSION} is known)")
     return Profile(
@@ -716,7 +708,6 @@ def build_profile(doc) -> Profile:
         comp=_build_comp(d["comp"], "profile.comp"),
         experience=_build_experience(d["experience"], "profile.experience"),
         tier_rules=_build_tier_rules(d["tier_rules"], "profile.tier_rules"),
-        hireability_labels=_build_hireability_labels(d["hireability_labels"], "profile.hireability_labels"),
         weights=_build_weights(d["weights"], "profile.weights"),
         raw=MappingProxyType(json.loads(json.dumps(d))),  # deep, JSON-only copy
     )

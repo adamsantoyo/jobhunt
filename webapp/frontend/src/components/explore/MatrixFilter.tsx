@@ -1,30 +1,36 @@
 import { useState } from "react";
-import { OddsBadge, TierBadge } from "../StatusBadge";
+import { CompetitionBadge, TierBadge } from "../StatusBadge";
 import type { TableFilters } from "../FilterBar";
 import type { JobLight } from "../../api/types";
+import { parseOdds } from "../../lib/format";
 
-// Fit x Odds heat map, doubling as a filter widget. Cell counts come from
-// `facetJobs` (the caller has already applied every filter EXCEPT tiers/odds,
-// so a cell shows "how many jobs would match if you picked this tier+odds").
-// Clicking a cell / header mutates the SAME filters object FilterBar reads, so
-// the two stay in sync for free (one state object, per the design contract).
+// Fit x Competition heat map, doubling as a filter widget. Cell counts come
+// from `facetJobs` (the caller has already applied every filter EXCEPT
+// tiers/competition, so a cell shows "how many jobs would match if you picked
+// this tier+competition"). Clicking a cell / header mutates the SAME filters
+// object FilterBar reads, so the two stay in sync for free (one state object,
+// per the design contract). The match axis is a separate FilterBar chip
+// group, not a matrix column -- 5 match labels x 3 competition labels would
+// make a 15-cell grid unreadable.
 
 const TIERS = [5, 4, 3, 2, 1] as const;
-const ODDS = ["Likely", "Target", "Reach"] as const;
+const COMPETITION = ["High competition", "Standard", "Lower bar"] as const;
 
-// Corner labels per contract: tier5xLikely = apply today, tier5xReach = aspirational.
-function cornerLabel(tier: number, odds: string): string | undefined {
-  if (tier === 5 && odds === "Likely") return "apply today";
-  if (tier === 5 && odds === "Reach") return "aspirational";
+// Corner labels per contract: tier5xLower-bar = strongest cell (apply today),
+// tier5xHigh-competition = aspirational.
+function cornerLabel(tier: number, competition: string): string | undefined {
+  if (tier === 5 && competition === "Lower bar") return "apply today";
+  if (tier === 5 && competition === "High competition") return "aspirational";
   return undefined;
 }
 
 function countBuckets(jobs: JobLight[]): Map<string, number> {
   const m = new Map<string, number>();
-  for (const t of TIERS) for (const o of ODDS) m.set(`${t}|${o}`, 0);
+  for (const t of TIERS) for (const c of COMPETITION) m.set(`${t}|${c}`, 0);
   for (const j of jobs) {
-    if (!j.odds || !(ODDS as readonly string[]).includes(j.odds)) continue;
-    const key = `${j.tier}|${j.odds}`;
+    const competition = parseOdds(j.odds).competition;
+    if (!competition || !(COMPETITION as readonly string[]).includes(competition)) continue;
+    const key = `${j.tier}|${competition}`;
     m.set(key, (m.get(key) ?? 0) + 1);
   }
   return m;
@@ -44,18 +50,19 @@ export function MatrixFilter({
   const maxCount = Math.max(1, ...counts.values());
 
   const isTierActive = (t: number) => filters.tiers.length === 1 && filters.tiers[0] === t;
-  const isOddsActive = (o: string) => filters.odds.length === 1 && filters.odds[0] === o;
-  const isCellActive = (t: number, o: string) => isTierActive(t) && isOddsActive(o);
+  const isCompetitionActive = (c: string) =>
+    filters.competition.length === 1 && filters.competition[0] === c;
+  const isCellActive = (t: number, c: string) => isTierActive(t) && isCompetitionActive(c);
 
   const onTierHeaderClick = (t: number) =>
     onChange({ ...filters, tiers: isTierActive(t) ? [] : [t] });
-  const onOddsHeaderClick = (o: string) =>
-    onChange({ ...filters, odds: isOddsActive(o) ? [] : [o] });
-  const onCellClick = (t: number, o: string) =>
+  const onCompetitionHeaderClick = (c: string) =>
+    onChange({ ...filters, competition: isCompetitionActive(c) ? [] : [c] });
+  const onCellClick = (t: number, c: string) =>
     onChange(
-      isCellActive(t, o)
-        ? { ...filters, tiers: [], odds: [] }
-        : { ...filters, tiers: [t], odds: [o] },
+      isCellActive(t, c)
+        ? { ...filters, tiers: [], competition: [] }
+        : { ...filters, tiers: [t], competition: [c] },
     );
 
   const cellBg = (count: number) => {
@@ -71,23 +78,23 @@ export function MatrixFilter({
           Matrix {expanded ? "▾" : "▸"}
         </button>
         {!expanded && (
-          <span className="muted-sm">Fit (tier) x Odds heat map. Click to expand.</span>
+          <span className="muted-sm">Fit (tier) x competition heat map. Click to expand.</span>
         )}
       </div>
 
       {expanded && (
         <div className="explore-matrix-grid">
           <div />
-          {ODDS.map((o) => (
+          {COMPETITION.map((c) => (
             <button
-              key={`h-${o}`}
+              key={`h-${c}`}
               type="button"
               className="explore-matrix-colhead"
-              data-active={isOddsActive(o) ? "1" : "0"}
-              onClick={() => onOddsHeaderClick(o)}
-              title={`Toggle odds = ${o}`}
+              data-active={isCompetitionActive(c) ? "1" : "0"}
+              onClick={() => onCompetitionHeaderClick(c)}
+              title={`Toggle competition = ${c}`}
             >
-              <OddsBadge odds={o} />
+              <CompetitionBadge competition={c} />
             </button>
           ))}
 
@@ -121,8 +128,8 @@ function FilterRow({
   tier: number;
   isTierActive: boolean;
   onTierHeaderClick: (t: number) => void;
-  isCellActive: (t: number, o: string) => boolean;
-  onCellClick: (t: number, o: string) => void;
+  isCellActive: (t: number, c: string) => boolean;
+  onCellClick: (t: number, c: string) => void;
   counts: Map<string, number>;
   cellBg: (count: number) => string;
 }) {
@@ -137,18 +144,18 @@ function FilterRow({
       >
         <TierBadge tier={tier} />
       </button>
-      {ODDS.map((o) => {
-        const count = counts.get(`${tier}|${o}`) ?? 0;
-        const label = cornerLabel(tier, o);
+      {COMPETITION.map((c) => {
+        const count = counts.get(`${tier}|${c}`) ?? 0;
+        const label = cornerLabel(tier, c);
         return (
           <button
-            key={`${tier}-${o}`}
+            key={`${tier}-${c}`}
             type="button"
             className="explore-matrix-cell"
-            data-active={isCellActive(tier, o) ? "1" : "0"}
+            data-active={isCellActive(tier, c) ? "1" : "0"}
             style={{ background: cellBg(count) }}
-            onClick={() => onCellClick(tier, o)}
-            title={`Tier ${tier} x ${o}: ${count} job${count === 1 ? "" : "s"}`}
+            onClick={() => onCellClick(tier, c)}
+            title={`Tier ${tier} x ${c}: ${count} job${count === 1 ? "" : "s"}`}
           >
             <span className="explore-matrix-cell-count">{count}</span>
             {label && <span className="explore-matrix-cell-corner">{label}</span>}

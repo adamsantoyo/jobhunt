@@ -165,21 +165,34 @@ check("Support Engineer survives", t > 0, (t, f))
 t, _, f = score_row(row("Hardware Validation Engineer", loc="San Jose, CA"), "Validate firmware and BIOS on servers. 2 years.")
 check("Hardware validation survives", t > 0, (t, f))
 
-print("== hireability (odds axis) ==")
-from rubric import hireability
+print("== hireability (match/competition axis) ==")
+from rubric import hireability, hireability_explained
 r_ = row("IT Support Specialist II", company="Acme Co"); r_["salary_max"]="80000"; r_["flags"]=""
 lab, sc, _ = hireability(r_, "Support Windows endpoints with Intune and Entra ID, Active Directory, M365, ServiceNow tickets. 2+ years.")
-check("exact-stack junior scores Likely", lab == "Likely" and sc >= 3, (lab, sc))
+check("junior/near-level, short JD scores Unscored / Standard", lab == "Unscored / Standard" and sc >= 3, (lab, sc))
 r_ = row("Senior Support Engineer", company="Anthropic"); r_["salary_max"]="250000"; r_["flags"]=""
 lab, sc, _ = hireability(r_, "Dedicated enterprise support for our API. 5+ years experience.")
-check("elite+senior+highcomp scores Reach", lab == "Reach" and sc <= -2, (lab, sc))
+check("elite+senior+highcomp scores Unscored / High competition", lab == "Unscored / High competition" and sc <= -2, (lab, sc))
 r_ = row("Support Engineer", company="MidCo"); r_["salary_max"]="120000"; r_["flags"]=""
 lab, _, _ = hireability(r_, "Provide product support and troubleshoot SaaS REST API issues. 3 years.")
-check("mid role scores Target", lab == "Target", lab)
+check("mid role (no rule fires) scores Unscored / Standard", lab == "Unscored / Standard", lab)
 # word-boundary: an elite-company substring must not tag an unrelated employer
 r_ = row("Support Engineer", company="Metabase"); r_["salary_max"]="120000"; r_["flags"]=""
-_, _, why_ = hireability(r_, "short")
-check("Metabase not flagged as Meta", "high-competition" not in why_, why_)
+res_ = hireability_explained(r_, "short")
+check("Metabase not flagged as Meta", res_.competition_label != "High competition" and "high-competition" not in res_.why, (res_.competition_label, res_.why))
+# staff/principal titles are a level stretch regardless of skills evidence
+r_ = row("Staff Support Engineer", company="Acme Co")
+res_ = hireability_explained(r_, "Support customers with their tickets.")
+check("staff title scores Level stretch / Standard", res_.label == "Level stretch / Standard", res_.label)
+# a long JD hitting his exact daily stack is a strong match, independent of competition
+LONG_STACK_DESC = ("You will provide technical support and troubleshoot issues for enterprise "
+    "customers. Manage Intune and Entra ID device policies, Active Directory, Microsoft 365, "
+    "ServiceNow tickets, escalation handling, incident response, PowerShell automation, SSO "
+    "configuration, and endpoint management across the fleet. REST API integration and SaaS "
+    "platform support round out the role. 2+ years of experience required.")
+r_ = row("Support Engineer", company="Acme Co")
+res_ = hireability_explained(r_, LONG_STACK_DESC)
+check("exact-stack long JD scores Strong match / Standard", res_.label == "Strong match / Standard", res_.label)
 
 print("== resolver ==")
 from rubric import _title_sim, build_registry
@@ -304,7 +317,7 @@ hire_r = row("IT Support Specialist II", company="Acme Co"); hire_r["salary_max"
 hres = hireability_explained(hire_r, "Support Windows endpoints with Intune and Entra ID, Active Directory, M365, ServiceNow tickets. 2+ years.")
 check("hireability_explained: hand-computed features", hres.features == {"junior": 2, "comp_near_level": 1}, hres.features)
 check("hireability_explained: features sum to score", sum(hres.features.values()) == hres.score, (hres.features, hres.score))
-check("hireability_explained: score composes to label", hres.label == "Likely" and hres.score >= 3, (hres.label, hres.score))
+check("hireability_explained: score composes to match/competition label", hres.label == "Unscored / Standard" and hres.score >= 3, (hres.label, hres.score))
 
 print()
 print(f"{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILURES: ' + ', '.join(FAILS)}")
