@@ -5,37 +5,46 @@ allowed to differ.
 THE TWO PATHS.
 
   LEGACY    `rubric.score_row(r, desc)` then `rubric.hireability(r2, desc)` with
-            `r2["flags"]` set from `score_row`'s OWN output flags before
-            `hireability` reads it -- exactly the two lines `rubric.cmd_score()`
-            runs (`sweep.py` invokes `python rubric.py score`, i.e. this
-            function, on every sweep).
+            `r2` carrying BOTH of the things `score_row` produced -- the pay band
+            it wrote back onto `r`, and its output flags joined into
+            `r2["flags"]` -- before `hireability` reads them. Exactly the lines
+            `rubric.cmd_score()` runs (`sweep.py` invokes `python rubric.py
+            score`, i.e. this function, on every sweep).
   CANONICAL `scoring.persist_scores`, reached here through `graph.run_pass` over
             a `postings`/`posting_versions`/`score_versions` schema seeded with
-            the SAME rows via `runstore.write_records` -- the path
-            `webapp/backend/sources/scoring.py` documents as calling
-            `rubric.score_row_explained(dict(item.row), ...)` and
-            `rubric.hireability_explained(dict(item.row), ...)` on two SEPARATE
-            copies of `item.row`, which always carries `flags=""`.
+            the SAME rows via `runstore.write_records` -- which chains the same
+            two things through the same single row (`scoring._score_one`).
 
 THE ALLOWLIST. `ALLOWLIST` below is a set of case names permitted to differ. It
 is EMPTY, and additions require orchestrator signoff -- do not add a name here
-to make a failing case pass; that defeats the point of the differential. Two
-confirmed, real divergences between the two paths are demonstrated in their own
-functions further down (`test_confirmed_divergence_*`), NOT folded into the main
-corpus or the allowlist, because they are not "acceptable differences" to wave
-through silently -- they are bugs, reported and left for the orchestrator/a human
-to decide whether the wave-2 legacy path or the canonical path (or neither) is
-correct.
+to make a failing case pass; that defeats the point of the differential.
 
-WHY THE MAIN CORPUS AVOIDS THEM. Both divergences are real and reproducible (see
-their tests), but folding rows that trigger them into the "must be identical"
-loop would force EITHER a same-day unreviewed allowlist entry (against this
-file's own rule) OR a corpus that can never assert 0 diffs. The main corpus
-below is built to exercise everything else the roadmap line asks for --
-representative tiers, labels, blockers, comp bands, staleness -- while staying
-on the SAFE side of both known asymmetries (DIRECT-category postings only, no
-`Staffing/W2`/`degree-gated` flags), which is what lets it make the strong claim
-"identical for every posting" instead of "identical modulo known bugs".
+WHAT THIS FILE FOUND AND WHAT WAS DONE ABOUT IT. The first version of this
+differential (commit 75e46f3) pinned TWO confirmed divergences as
+characterizations rather than fixing them:
+
+  1. The flags-gated `hireability` contributions (`staffing_w2`, `degree_gated`)
+     were live under legacy and DEAD canonically, because the canonical path
+     called `score_row_explained` and `hireability_explained` on two SEPARATE
+     copies of a row whose `flags` was always `""`. FIXED in `scoring.py`
+     (`_score_one`): legacy was ruled correct, the canonical path now chains.
+     The rows that prove it (`staffing_agency_lower_bar`,
+     `degree_gated_high_competition`) are in the MAIN CORPUS below, where they
+     have to keep agreeing, and `test_the_corpus_covers_...` asserts the "Lower
+     bar" label is actually reached by both paths.
+  2. The undated-aggregator cap, which legacy decides by sniffing a legacy CSV
+     source-string prefix and the canonical path decides from an explicit flag.
+     NOT fixed: the canonical path is the correct one there, so this is legacy
+     being wrong, and it stays pinned in
+     `test_confirmed_divergence_undated_aggregator_source_string_sniff` (which
+     is why the main corpus is DIRECT-category only).
+
+The same audit surfaced a third asymmetry at the fixed site, closed by the same
+fix: `score_row` MUTATES the row with a pay band recovered from the description,
+and only a chained row carries that into the odds pass. `score_legacy` below
+therefore scores IN PLACE, as `cmd_score` does -- an earlier version of this
+helper scored a throwaway copy, which quietly made the legacy side of this
+differential blind to the same thing.
 """
 from __future__ import annotations
 
@@ -198,6 +207,24 @@ CORPUS = [
     Posting("hireability_junior_level_gap", title="Junior Example Title One",
             description=DESC_RICH),
     Posting("hireability_weak_match_no_skills", description=DESC_NO_SKILLS_LONG),
+    # The two rows the flags-chaining bug used to break. Both are ORDINARY
+    # postings, not edge cases: a staffing-agency employer and a hard degree gate.
+    # `staffing_w2` and `degree_gated` are flags-gated inside
+    # `rubric._hireability_core`, so before `scoring._score_one` chained the fit
+    # pass's flags into the odds pass these two disagreed across the paths -- and
+    # "Lower bar" was unreachable canonically for every posting ever scored.
+    Posting("staffing_agency_lower_bar", company="Example Staffing Agency",
+            description=DESC_RICH),
+    Posting("degree_gated_high_competition",
+            description="A bachelors degree required for this example title one "
+                        "role, no exceptions. " + DESC_RICH),
+    # The other half of the chaining: a pay band stated ONLY in the description.
+    # `score_row` writes the recovered band back onto the row, and the odds pass
+    # reads `salary_max` -- so this row's `comp_high_bar` contribution exists on
+    # either path only if that path scored ONE row rather than two copies.
+    Posting("pay_band_recovered_from_description",
+            description="The base pay range for this role is $160,000 - $180,000 "
+                        "per year. " + DESC_RICH),
     Posting("hireability_moderate_match", description=DESC_MODERATE_MATCH),
     Posting("no_description_cap", salary="$90,000 - $100,000", description=None),
     Posting("blocked_non_us_location", location="Examplestan", description=DESC_RICH),
@@ -225,9 +252,16 @@ assert {p.name for p in CORPUS} & ALLOWLIST == set(), (
 # The two scoring paths
 # --------------------------------------------------------------------------- #
 def score_legacy(posting: Posting) -> dict:
-    """Exactly `rubric.cmd_score`'s two scoring lines."""
+    """Exactly `rubric.cmd_score`'s two scoring lines.
+
+    `score_row` is called on `row` ITSELF, not on a copy, because `cmd_score`
+    calls it on the record it goes on to build `r2` from -- and `score_row`
+    mutates that record with any pay band it recovered from the description. A
+    copy here would silently drop that from the legacy side and make this
+    differential agree for the wrong reason.
+    """
     row = posting.legacy_row()
-    tier, why, flags = rubric.score_row(dict(row), posting.description)
+    tier, why, flags = rubric.score_row(row, posting.description)
     row2 = dict(row)
     row2["tier"] = tier
     row2["why"] = why
@@ -306,17 +340,69 @@ def test_the_corpus_covers_a_representative_tier_and_label_spread():
     path (which the canonical path was just proven identical to, above)."""
     tiers = set()
     match_labels = set()
+    competition_labels = set()
     for p in CORPUS:
         result = score_legacy(p)
         tiers.add(result["tier"])
-        # match_label is the part before " / " in the combined label.
-        match_labels.add(result["odds_label"].split(" / ")[0])
+        # The combined label is "<match> / <competition>".
+        match, _, competition = result["odds_label"].partition(" / ")
+        match_labels.add(match)
+        competition_labels.add(competition)
     assert tiers >= {0, 1, 2, 3, 4, 5}, tiers
     assert match_labels >= {"Strong match", "Weak match", "Moderate match", "Unscored"}, match_labels
+    # "Lower bar" is here because it was the label the flags-chaining bug made
+    # unreachable on the canonical path: a corpus that never produces it cannot
+    # notice the bug coming back.
+    assert competition_labels >= {"Standard", "High competition", "Lower bar"}, competition_labels
 
 
 # --------------------------------------------------------------------------- #
-# Confirmed divergences -- NOT allowlisted, NOT silently fixed, reported here.
+# The fixed divergence, now asserted as parity from the other direction.
+# --------------------------------------------------------------------------- #
+def test_the_flags_gated_odds_contributions_fire_on_both_paths(conn, profile_doc):
+    """Was `test_confirmed_divergence_hireability_flags_dependent_features_are_dead_canonically`.
+
+    FIXED, so the pin is inverted rather than deleted. `rubric._hireability_core`
+    gates `staffing_w2` and `degree_gated` on `r.get("flags")`, which no input to
+    the odds pass supplies -- only the fit pass's OUTPUT does, chained onto the row
+    by `rubric.cmd_score` (legacy) and now by `scoring._score_one` (canonical).
+
+    The corpus test above already requires these two rows to AGREE. This one
+    requires them to agree at the right VALUE: label equality alone would also be
+    satisfied by the contribution going dead on both paths at once, which is the
+    exact regression this file exists to catch. So it asserts the stored canonical
+    feature vector literally contains the contribution, which is the fact the two
+    labels are supposed to be reporting.
+    """
+    rows = [p for p in CORPUS
+            if p.name in {"staffing_agency_lower_bar", "degree_gated_high_competition"}]
+    assert len(rows) == 2, "both rows belong in the main corpus, not only in this test"
+
+    legacy = {p.name: score_legacy(p) for p in rows}
+    canonical = score_canonical(conn, profile_doc, rows)
+
+    assert legacy["staffing_agency_lower_bar"]["odds_label"] == "Strong match / Lower bar"
+    assert legacy["staffing_agency_lower_bar"]["odds_score"] == 4
+    assert canonical["staffing_agency_lower_bar"] == legacy["staffing_agency_lower_bar"]
+
+    assert legacy["degree_gated_high_competition"]["odds_label"].endswith("/ High competition")
+    assert canonical["degree_gated_high_competition"] == legacy["degree_gated_high_competition"]
+
+    stored = {}
+    for row in conn.execute(
+        "SELECT a.value AS req_id, s.features_json AS features_json "
+        "FROM score_versions s JOIN posting_aliases a ON a.posting_id = s.posting_id "
+        "WHERE s.superseded_at IS NULL AND a.alias_kind='source_req' AND a.valid_to IS NULL"
+    ):
+        stored[row["req_id"]] = json.loads(row["features_json"])["hireability"]
+
+    assert stored["staffing_agency_lower_bar"].get("staffing_w2") == 2, stored
+    assert stored["degree_gated_high_competition"].get("degree_gated") == -1, stored
+
+
+# --------------------------------------------------------------------------- #
+# The remaining confirmed divergence -- NOT allowlisted, NOT silently fixed --
+# followed by the counterfactual for the one that WAS fixed.
 # --------------------------------------------------------------------------- #
 def test_confirmed_divergence_undated_aggregator_source_string_sniff(conn, profile_doc):
     """PRE-EXISTING, ALREADY-DOCUMENTED divergence (Phase 3.3;
@@ -380,56 +466,27 @@ def test_confirmed_divergence_undated_aggregator_source_string_sniff(conn, profi
     assert canonical_tier < legacy_tier, "the canonical path is the one that caps correctly"
 
 
-def test_confirmed_divergence_hireability_flags_dependent_features_are_dead_canonically():
-    """NEWLY FOUND by this differential, NOT fixed here -- reported to the
-    orchestrator.
+def test_the_unchained_odds_row_is_what_the_bug_was():
+    """The fixed bug, kept as a demonstration of WHY the chaining is load-bearing.
 
-    `rubric._hireability_core` reads `r.get("flags", "")` to decide TWO
-    contributions: `staffing_w2` (`"Staffing/W2" in flags`) and `degree_gated`
-    (`"degree-gated" in flags`). Neither is derived from the description or any
-    other input `hireability_explained` is given directly -- both depend entirely
-    on the CALLER having already put those exact strings into the row's `flags`
-    field.
-
-    `rubric.cmd_score()` (legacy) does this on purpose: it scores with
-    `score_row` first, writes the OUTPUT flags onto the row (`r2["flags"] = ",
-    ".join(flags)`), and only then calls `hireability(r2, desc)` -- so a
-    staffing-agency company or a degree-gated posting gets its odds axis
-    penalized/labeled accordingly.
-
-    `scoring.persist_scores` (canonical) does NOT do this: it calls
-    `rubric.score_row_explained(dict(item.row), ...)` and
-    `rubric.hireability_explained(dict(item.row), ...)` on two INDEPENDENT
-    copies of `item.row` (`webapp/backend/sources/scoring.py`), and
-    `item.row` comes from `row_from_version`, which always sets `"flags": ""`
-    (`webapp/backend/sources/scoring.py`'s `row_from_version` docstring: a
-    FRESH dict every time). So under the canonical path, `staffing_w2` and
-    `degree_gated` can NEVER fire -- they are dead code on that path, silently,
-    for every posting ever scored canonically.
-
-    This is a real behavioral difference between the two paths on ordinary
-    staffing-agency and degree-gated postings, not a synthetic edge case. Per
-    this task's constraints, it is pinned here rather than fixed (fixing it
-    means deciding whether `scoring.py` should chain score's flags into the
-    odds call, which is a `scoring.py` change out of this task's scope) and
-    reported in the implementer's summary for the orchestrator to route.
+    Not a divergence pin any more (see
+    `test_the_flags_gated_odds_contributions_fire_on_both_paths`) -- this holds
+    the counterfactual: score the same staffing-agency posting the way the
+    canonical path used to, on a row whose `flags` stayed `""`, and the odds axis
+    silently loses `staffing_w2` and reports "Standard" instead of "Lower bar".
+    That is what every canonically scored posting used to get, and it is why the
+    fix invalidates cached canonical scores (`scoring.composition_digest`).
     """
-    posting = Posting("staffing_agency_lower_bar", company="Example Staffing Agency",
-                       description=DESC_RICH)
-    legacy = score_legacy(posting)
-    assert legacy["odds_label"] == "Strong match / Lower bar"
-    assert legacy["odds_score"] == 4
+    posting = next(p for p in CORPUS if p.name == "staffing_agency_lower_bar")
+    chained = score_legacy(posting)
 
-    # The canonical call pattern, reproduced directly (no database needed to show
-    # the dead branch: it is a property of how the two functions are CALLED).
-    canonical_row = posting.legacy_row()  # flags="" -- what row_from_version always sets
-    canonical_odds = rubric.hireability_explained(dict(canonical_row), posting.description)
+    unchained_row = posting.legacy_row()  # flags="" -- the pre-fix canonical row
+    unchained = rubric.hireability_explained(unchained_row, posting.description)
 
-    assert canonical_odds.label != legacy["odds_label"], (
-        "if this now matches, scoring.py started chaining score flags into the "
-        "odds call -- update this test, do not delete it"
+    assert chained["odds_label"] == "Strong match / Lower bar"
+    assert unchained.competition_label == "Standard"
+    assert unchained.label != chained["odds_label"]
+    assert unchained.score == chained["odds_score"] - 2, (
+        "the missing contribution is exactly weights.hireability.staffing_w2"
     )
-    assert canonical_odds.competition_label == "Standard", (
-        "canonically, staffing_w2 never fires: 'Lower bar' is unreachable"
-    )
-    assert canonical_odds.score != legacy["odds_score"]
+    assert "staffing_w2" not in unchained.features

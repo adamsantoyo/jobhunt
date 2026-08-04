@@ -484,6 +484,34 @@ def test_scorer_hash_carries_both_the_version_and_the_digest(monkeypatch):
     assert moved_version.scorer_hash != baseline.scorer_hash
 
 
+def test_scorer_hash_carries_the_composition_digest_as_well(monkeypatch):
+    """The rubric is only half the scorer; the other half is what it is fed.
+
+    `rubric.scorer_source_digest()` cannot see a change to how `scoring.py` builds
+    the row or threads the fit pass's output into the odds pass -- and Phase 3.7's
+    differential found a real bug of exactly that shape (the odds pass reading
+    `flags=""`, so `staffing_w2`/`degree_gated` were dead canonically). Fixing it
+    changed stored scores with `rubric.py` byte-identical, which the anti-join
+    would have happily ignored had `scorer_hash` not covered the composition.
+    """
+    baseline = scoring.scorer_identity()
+    assert baseline.composition_digest == scoring.composition_digest()
+
+    monkeypatch.setattr(scoring, "composition_digest", lambda: "deadbeef")
+    assert scoring.scorer_identity().scorer_hash != baseline.scorer_hash
+
+
+def test_the_composition_digest_moves_when_the_composition_moves(monkeypatch):
+    """Otherwise that half of the identity is decoration, exactly as above."""
+    before = scoring.composition_digest()
+
+    def replacement(version_row):  # a different body for a pinned member
+        return {}
+
+    monkeypatch.setattr(scoring, "row_from_version", replacement)
+    assert scoring.composition_digest() != before
+
+
 # --------------------------------------------------------------------------- #
 # 5 + 6. Dead fields gone; config.json's scoring inputs folded in
 # --------------------------------------------------------------------------- #

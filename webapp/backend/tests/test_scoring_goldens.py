@@ -31,21 +31,18 @@ this file's rows were originally produced), and re-pin both the hash/version
 constants and the affected golden rows in the same change -- not to silence the
 failure.
 
-THE INDEPENDENT-CALL PATTERN. Every case below calls `score_row_explained` and
-`hireability_explained` on SEPARATE copies of the same row, exactly as
-`scoring.persist_scores` does (`webapp/backend/sources/scoring.py`:
-`rubric.score_row_explained(dict(item.row), ...)` then
-`rubric.hireability_explained(dict(item.row), ...)`, both from the SAME
-`item.row`, which always carries `flags=""`). This is deliberately NOT the
-legacy `rubric.cmd_score()` pattern, which chains `score_row`'s OUTPUT flags
-into the row it then hands to `hireability` -- so `hireability`'s
-`staffing_w2`/`degree_gated` contributions (both gated on `"...` in flags`) are
-LIVE under legacy and DEAD under the canonical scoring path. Two cases below
-(`LOWER_BAR_VIA_LEGACY_FLAGS`, `DEGREE_GATED_HIREABILITY_VIA_LEGACY_FLAGS`)
-exercise that flags-dependent behavior directly, to cover the "Lower bar"
-competition label and the desc-independent `degree_gated` odds contribution at
-all -- see `test_legacy_new_differential.py` for the divergence this asymmetry
-produces between the two call patterns on a real posting.
+TWO CALL PATTERNS, BOTH PINNED. `GOLDEN_CASES` calls `score_row_explained` and
+`hireability_explained` on SEPARATE copies of one row -- the two functions scored
+in ISOLATION, which is what makes each expected value attributable to the rubric
+alone. `GOLDEN_CHAINED_CASES` scores the way both real callers do, through
+`scoring._score_one`: one row, threaded from the fit pass into the odds pass so
+that the flags and the recovered pay band `score_row` produced are what
+`hireability` reads. Phase 3.7 found the canonical path NOT doing that (two
+independent copies of a row whose `flags` was always `""`), which killed
+`hireability`'s `staffing_w2` and `degree_gated` contributions canonically and
+made "Lower bar" unreachable for every canonically scored posting; the chained
+cases are the goldens for the fix, and the two `..._via_explicit_flags` tests at
+the bottom stay because they pin the PURE gate the chaining feeds.
 """
 from __future__ import annotations
 
@@ -61,6 +58,8 @@ if _REPO_ROOT not in sys.path:
 
 import candidate_profile  # noqa: E402  (path insert must precede these)
 import rubric  # noqa: E402
+
+from backend.sources import scoring  # noqa: E402
 
 PROFILE_PATH = os.path.join(_REPO_ROOT, "profile.example.json")
 
@@ -392,6 +391,62 @@ def test_golden_row(name, row, desc, kwargs, expected_score, expected_odds):
     assert odds.rubric_hash == PINNED_RUBRIC_VERSION, name
 
 
+#: >400 chars and a hard degree gate, with none of `degree_equivalent_exception`
+#: ("equivalent") anywhere in it -- so `score_row` emits the `degree-gated` flag
+#: that the odds pass's `degree_gated` contribution is gated on.
+DESC_DEGREE_GATED = (
+    "A bachelors degree required for this example title one role, no exceptions. " + DESC_RICH
+)
+
+#: A pay band stated ONLY in the description. `score_row` recovers it and writes
+#: it back onto the row (`salary`, `salary_min`, `salary_max`), which is the other
+#: thing the chained pattern carries into the odds pass -- here it is what makes
+#: `comp_high_bar` fire.
+DESC_PAY_BAND_IN_TEXT = (
+    "The base pay range for this role is $160,000 - $180,000 per year. " + DESC_RICH
+)
+
+#: The chained corpus: same shape as `GOLDEN_CASES`, scored through
+#: `scoring._score_one` instead of two isolated calls. Every case here is one
+#: whose ODDS depend on something `score_row` produced, which is why none of them
+#: could be expressed in `GOLDEN_CASES` above.
+GOLDEN_CHAINED_CASES = [
+    (
+        "staffing_w2_lower_bar",
+        _row("Example Title One", company="Example Staffing Agency"),
+        DESC_RICH, {},
+        dict(tier=4, why="core function match; domain: exampletool,example platform name; Bay Area",
+             flags=["Staffing/W2"],
+             features={"function_match": 3, "domain_tier2": 2, "staffing_w2": -1, "raw_score": 4}),
+        dict(label="Strong match / Lower bar", match_label="Strong match",
+             competition_label="Lower bar", score=4,
+             features={"staffing_w2": 2, "skills_moderate": 1, "exact_stack": 1}),
+    ),
+    (
+        "degree_gated_high_competition",
+        _row("Example Title One"),
+        DESC_DEGREE_GATED, {},
+        dict(tier=4, why="core function match; domain: exampletool,example platform name; Bay Area",
+             flags=["degree-gated"],
+             features={"function_match": 3, "domain_tier2": 2, "degree_gated": -1, "raw_score": 4}),
+        dict(label="Strong match / High competition", match_label="Strong match",
+             competition_label="High competition", score=1,
+             features={"skills_moderate": 1, "exact_stack": 1, "degree_gated": -1}),
+    ),
+    (
+        "pay_band_recovered_from_description",
+        _row("Example Title One"),
+        DESC_PAY_BAND_IN_TEXT, {},
+        dict(tier=5, why="core function match; domain: exampletool,example platform name; Bay Area",
+             flags=["salary-from-desc"],
+             features={"function_match": 3, "domain_tier2": 2, "raw_score": 5}),
+        dict(label="Strong match / High competition", match_label="Strong match",
+             competition_label="High competition", score=1,
+             features={"skills_moderate": 1, "exact_stack": 1, "comp_high_bar": -1}),
+    ),
+]
+
+
 @pytest.mark.parametrize("code,row,desc", GOLDEN_BLOCKERS,
                           ids=[f"{c}-{i}" for i, (c, _r, _d) in enumerate(GOLDEN_BLOCKERS)])
 def test_golden_blocker(code, row, desc):
@@ -401,17 +456,51 @@ def test_golden_blocker(code, row, desc):
     assert rubric.reconstruct_tier(score.features) == 0
 
 
+@pytest.mark.parametrize("name,row,desc,kwargs,expected_score,expected_odds",
+                          GOLDEN_CHAINED_CASES, ids=[c[0] for c in GOLDEN_CHAINED_CASES])
+def test_golden_chained_row(name, row, desc, kwargs, expected_score, expected_odds):
+    """The goldens for the CHAINED call pattern -- what both real callers run.
+
+    `scoring._score_one` is used rather than re-implementing the chaining here, so
+    that a regression in the wiring fails these goldens instead of leaving them
+    describing a call shape nothing performs.
+    """
+    scored_row = dict(row)
+    score, odds = scoring._score_one(
+        scored_row, desc, is_aggregator=kwargs.get("is_aggregator", False)
+    )
+
+    assert score.tier == expected_score["tier"], name
+    assert score.why == expected_score["why"], name
+    assert score.flags == expected_score["flags"], name
+    assert score.features == expected_score["features"], name
+    assert rubric.reconstruct_tier(score.features) == score.tier, name
+
+    assert odds.label == expected_odds["label"], name
+    assert odds.match_label == expected_odds["match_label"], name
+    assert odds.competition_label == expected_odds["competition_label"], name
+    assert odds.score == expected_odds["score"], name
+    assert odds.features == expected_odds["features"], name
+
+    # The chaining itself, pinned as the mechanism rather than assumed from the
+    # numbers: the odds pass read a row carrying the fit pass's output flags.
+    assert scored_row["flags"] == ", ".join(score.flags), name
+
+    # And every case here EARNS its place: scored the isolated way `GOLDEN_CASES`
+    # scores, the same row produces different odds. A case that does not is a case
+    # that belongs in `GOLDEN_CASES`, not in this list.
+    isolated = rubric.hireability_explained(dict(row), desc)
+    assert isolated.features != odds.features, name
+
+
 # --------------------------------------------------------------------------- #
-# "Lower bar" and the desc-independent `degree_gated` odds contribution
+# "Lower bar" and the desc-independent `degree_gated` odds contribution, at the
+# level of the PURE function.
 #
-# Both are gated on `"...` in flags` inside `_hireability_core`, and the row's
-# `flags` field is only ever populated by the LEGACY `rubric.cmd_score()` call
-# pattern (score_row's OUTPUT flags, chained into the row `hireability` then
-# reads) -- never by the canonical `scoring.persist_scores` pattern (see the
-# module docstring). These two cases pin that these labels/contributions are
-# still reachable through the PURE function when a caller supplies the flags
-# directly, which is what completes the label vocabulary coverage this file
-# claims: "Lower bar" is otherwise absent from every case above.
+# Both are gated on `"...` in flags` inside `_hireability_core`. The chained
+# goldens above pin that the real call paths populate those flags; these two pin
+# the gate itself, given the flags directly -- so a regression can be localized
+# to the wiring or to the rule rather than only to "the label moved".
 # --------------------------------------------------------------------------- #
 def test_golden_lower_bar_competition_label_via_explicit_flags():
     row = _row("Example Title One", flags="Staffing/W2")
@@ -443,7 +532,10 @@ def test_the_golden_corpus_covers_every_tier_and_label():
         "Level stretch", "Strong match", "Moderate match", "Weak match", "Unscored",
     }, match_labels
 
-    competition_labels = {c[5]["competition_label"] for c in GOLDEN_CASES} | {"Lower bar"}
+    # "Lower bar" is no longer contributed by a hand-written literal here: a
+    # chained golden reaches it the way a real posting does.
+    competition_labels = {c[5]["competition_label"] for c in GOLDEN_CASES}
+    competition_labels |= {c[5]["competition_label"] for c in GOLDEN_CHAINED_CASES}
     assert competition_labels == {"High competition", "Standard", "Lower bar"}, competition_labels
 
     blocker_codes = {c[0] for c in GOLDEN_BLOCKERS}

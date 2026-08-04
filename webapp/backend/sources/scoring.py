@@ -12,8 +12,14 @@ WHAT IDENTIFIES A STORED SCORE
   scorer_hash          the CODE. `rubric.RUBRIC_VERSION` (a deliberate human
                        statement) mixed with `rubric.scorer_source_digest()` (the
                        automatic one, over the pinned scoring surface's source
-                       text). Mixing both is what makes a forgotten version bump
-                       harmless: the digest moves whether or not the string does.
+                       text) and `composition_digest()` (this module's own, over
+                       the code that decides WHAT the scorer reads). Mixing the
+                       first two is what makes a forgotten version bump harmless:
+                       the digest moves whether or not the string does. The third
+                       is there because the scorer's inputs are assembled HERE,
+                       and assembling them differently is a different scorer even
+                       when `rubric.py` is byte-identical (see
+                       `composition_digest`).
   input_hash           everything else the scorer read -- the scored version's
                        `version_hash`, the description's content identity, and
                        `is_aggregator`.
@@ -50,6 +56,7 @@ so Phase 4 wires it with `writer.submit` and no scheduler or writer edit.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -82,6 +89,7 @@ __all__ = [
     "ScorerIdentity",
     "ScoreWork",
     "WorkRow",
+    "composition_digest",
     "current_score_inputs",
     "description_for",
     "input_hash",
@@ -119,25 +127,72 @@ class ScorerIdentity:
     rubric_version: str
     source_digest: str
     scorer_hash: str
+    #: Defaulted so a test (or any caller) can name an identity by its hash alone.
+    #: `scorer_identity()` always fills it in.
+    composition_digest: str = ""
+
+
+#: The functions that decide WHAT the scorer reads, in declared order. Labels are
+#: hashed alongside the source text for `rubric._scorer_surface`'s two reasons:
+#: renaming a member is a change even when its body is not, and two identical
+#: bodies cannot cancel out.
+_COMPOSITION_SURFACE_NAMES = ("row_from_version", "_score_one")
+
+
+def composition_digest() -> str:
+    """sha256 over the source of THIS module's scorer composition.
+
+    `rubric.scorer_source_digest()` covers the scoring FUNCTIONS. It cannot cover
+    how they are called, and how they are called is a scoring decision: the row
+    `row_from_version` builds is the scorer's whole world, and `_score_one`
+    decides what the odds axis sees of the fit pass's output. Phase 3.7's
+    legacy/new differential found exactly that gap -- the odds call was reading a
+    row with `flags=""`, so two `hireability` contributions were dead canonically
+    and live under `rubric.cmd_score`, with `rubric.py` byte-identical on both
+    sides. Fixing the composition changed every staffing/degree-gated canonical
+    score without moving `scorer_hash`, which would have left the anti-join
+    reusing scores the fixed code would not produce. So the composition is part of
+    the scorer's identity, and it is hashed from source for the same reason the
+    rubric surface is: nobody has to remember.
+
+    No hand-maintained twin constant here, deliberately. `RUBRIC_VERSION` earns
+    its keep as a human statement about the RUBRIC's meaning ("this is v3, the
+    labels changed"); there is no equivalent statement to make about wiring, so a
+    pinned digest would be maintenance with no decision attached to it.
+    """
+    payload = [
+        [f"scoring.{name}", inspect.getsource(globals()[name])]
+        for name in _COMPOSITION_SURFACE_NAMES
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def scorer_identity() -> ScorerIdentity:
-    """The running scorer's identity: the declared version AND the source digest.
+    """The running scorer's identity: the declared version AND the two digests.
 
-    Both, not either. `RUBRIC_VERSION` alone is a hand-maintained string, and a
-    forgotten bump silently lets the anti-join reuse scores the new code would not
-    have produced. The digest alone would churn the whole corpus on a comment. So
-    the digest provides automatic invalidation and the string provides the human
+    All three, not any one. `RUBRIC_VERSION` alone is a hand-maintained string, and
+    a forgotten bump silently lets the anti-join reuse scores the new code would
+    not have produced. The digest alone would churn the whole corpus on a comment.
+    So the digest provides automatic invalidation and the string provides the human
     statement of intent, and `rubric.SCORER_SOURCE_DIGEST` (asserted by a test)
-    forces that statement to be made.
+    forces that statement to be made. `composition_digest()` closes the third gap:
+    the same rubric wired to different inputs is a different scorer.
     """
     digest = rubric.scorer_source_digest()
+    composition = composition_digest()
     return ScorerIdentity(
         rubric_version=rubric.RUBRIC_VERSION,
         source_digest=digest,
+        composition_digest=composition,
         scorer_hash=hashlib.sha256(
             runstore.canonical_json(
-                {"rubric_version": rubric.RUBRIC_VERSION, "source_digest": digest}
+                {
+                    "rubric_version": rubric.RUBRIC_VERSION,
+                    "source_digest": digest,
+                    "composition_digest": composition,
+                }
             ).encode("utf-8")
         ).hexdigest(),
     )
@@ -254,6 +309,11 @@ def row_from_version(version_row: Mapping[str, object]) -> dict[str, object]:
     carries the NormalizedPosting NAMESPACE ("greenhouse:acme"), not a legacy CSV
     source string. That is exactly why `is_aggregator` is passed to the scorer
     explicitly rather than sniffed from this field.
+
+    `flags` starts EMPTY because there is nothing observed to put in it -- flags
+    are scorer OUTPUT, not source data. `_score_one` fills it from `score_row`'s
+    output before the odds pass reads it, which is the whole reason this dict must
+    stay mutable and per-posting.
     """
     return {
         "title": version_row["title"] or "",
@@ -268,6 +328,45 @@ def row_from_version(version_row: Mapping[str, object]) -> dict[str, object]:
         "req_id": version_row["req_id"] or "",
         "flags": "",
     }
+
+
+def _score_one(row: dict, description: str | None, *, is_aggregator: bool):
+    """Both passes over ONE row, chained exactly as `rubric.cmd_score` chains them.
+
+    Returns `(ScoreResult, OddsResult)`. The single shared, MUTABLE `row` is the
+    whole point, and it carries two things from the fit pass into the odds pass
+    that a second independent copy of the row would drop on the floor:
+
+      FLAGS. `rubric._hireability_core` reads `r.get("flags")` to gate two
+        contributions -- `staffing_w2` (`"Staffing/W2" in flags`) and
+        `degree_gated` (`"degree-gated" in flags`). Neither is derived from the
+        description or from any other input the odds pass is handed, so they fire
+        only if the CALLER puts `score_row`'s output flags on the row first.
+        `cmd_score` does (`r2["flags"] = ", ".join(flags)`); this module used not
+        to, which made both contributions dead canonically and the "Lower bar"
+        competition label unreachable for every canonically scored posting. The
+        join is `", "` and the parse is a substring test, so the joined STRING is
+        what is written here -- `_hireability_core` accepts a list too, but only
+        the string is what legacy hands it, and the two paths must be the same
+        path.
+      THE RECOVERED PAY BAND. `score_row` MUTATES the row when it extracts a
+        salary range from the description (`r["salary"]`, `r["salary_min"]`,
+        `r["salary_max"]`), and the odds pass reads `r["salary_max"]` for its
+        `comp_high_bar`/`comp_near_level` contributions. `cmd_score` scores `r`
+        in place and then hands `dict(r)` to `hireability`, so legacy odds see
+        the recovered band; two independent copies see the pre-scoring row and a
+        posting whose comp is only stated in its description scores as though it
+        stated no comp at all. Canonically that is every priced posting, since
+        `posting_versions.salary_min`/`salary_max` are never populated
+        (`runstore._link_source_version`) and the band exists only in the text.
+
+    The caller owns the row and must pass a FRESH dict per posting -- it comes back
+    mutated, and `WorkRow.row` is shared, read-only input.
+    """
+    result = rubric.score_row_explained(row, description, is_aggregator=is_aggregator)
+    row["flags"] = ", ".join(result.flags)
+    odds = rubric.hireability_explained(row, description)
+    return result, odds
 
 
 def description_for(
@@ -608,10 +707,9 @@ def persist_scores(
     inserts: list[tuple] = []
     blocked = 0
     for item, digest, score_version_id in fresh:
-        result = rubric.score_row_explained(
+        result, odds = _score_one(
             dict(item.row), item.description, is_aggregator=item.is_aggregator
         )
-        odds = rubric.hireability_explained(dict(item.row), item.description)
         features = validate_features(
             result.features,
             candidate_profile.REQUIRED_SCORE_ROW_FEATURES,
@@ -642,6 +740,7 @@ def persist_scores(
                 "odds_why": odds.why,
                 "rubric_version": scorer.rubric_version,
                 "scorer_source_digest": scorer.source_digest,
+                "scorer_composition_digest": scorer.composition_digest,
                 "namespace": item.namespace,
                 "is_aggregator": item.is_aggregator,
                 "has_description": item.description is not None,
