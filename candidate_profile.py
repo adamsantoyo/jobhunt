@@ -41,6 +41,11 @@ from typing import Mapping
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PROFILE_PATH = os.path.join(HERE, "profile.json")
 
+#: The only `profile.json` shape this loader accepts. Bumped 1 -> 2 by Phase 3.3
+#: (dead location fields removed; `config.json`'s `profile.bay_area` and
+#: `profile.title_exclude` folded in) -- see `build_profile`.
+SCHEMA_VERSION = 2
+
 # The exact feature/weight names rubric.score_row / rubric.hireability emit.
 # profile.json's weights.score_row / weights.hireability tables are validated
 # against these sets EXACTLY (see _validate_weight_table). Changing what
@@ -57,6 +62,100 @@ REQUIRED_HIREABILITY_WEIGHTS = frozenset({
     "high_competition", "staffing_w2", "skills_strong", "skills_moderate",
     "skills_thin", "exact_stack", "comp_high_bar", "comp_near_level",
     "degree_gated",
+})
+
+# --------------------------------------------------------------------------- #
+# The stored-feature-vector contract (Phase 3.3)
+#
+# `weights.score_row` above answers "which named rules may carry a point value".
+# The sets below answer the different question Phase 3.3's persistence layer has
+# to answer before it writes a vector into `score_versions.features_json`: which
+# KEYS may appear in a stored vector at all. They are not the same question,
+# because a stored vector also carries entries that are not weighted rules --
+# the two contributions whose value is computed rather than looked up, the raw
+# pre-clamp total, the terminal caps, and the blocker code.
+#
+# The set is CLOSED, and that is the point. `rubric.reconstruct_tier(features)`
+# recomputes the tier from the vector alone; a key the replayer does not know
+# about is either a contribution it will not add or a cap it will not apply, and
+# in both cases the replayed tier silently disagrees with the stored one. So
+# `scoring.py` refuses to persist a vector containing any key outside
+# `REQUIRED_SCORE_ROW_FEATURES`, which turns "somebody added a dimension to the
+# scorer and forgot the replayer" into a loud write failure instead of a corpus
+# of scores that cannot be re-derived.
+# --------------------------------------------------------------------------- #
+
+#: Contributions that are summed into the score but have no entry in
+#: `weights.score_row`, because their value is computed rather than configured:
+#:
+#:   function_match   the family's own function weight (`families.function_weight`),
+#:                    which IS the score's starting value. Emitted on every scored
+#:                    row, not only when the family is the top-weighted one -- a
+#:                    vector that omitted it could not reconstruct the total.
+#:   staff_cap_delta  the NEGATIVE delta applied by the mid-computation
+#:                    `min(score, tier_rules.staff_cap_tier)` for Principal/Staff
+#:                    titles. It is a clamp on the running total, not a terminal
+#:                    cap on the tier, so it has to be replayed as a contribution
+#:                    (it changes the raw total) rather than as a cap.
+NON_WEIGHTED_SCORE_ROW_CONTRIBUTIONS = frozenset({"function_match", "staff_cap_delta"})
+
+#: Every key whose value is added into the raw score. `sum(contributions) ==
+#: features["raw_score"]` is a property test in `test_scoring_features.py`.
+SCORE_ROW_CONTRIBUTIONS = REQUIRED_SCORE_ROW_WEIGHTS | NON_WEIGHTED_SCORE_ROW_CONTRIBUTIONS
+
+#: Scalars that describe the computation without contributing to it.
+#: `raw_score` is the total BEFORE the structural `max(1, min(5, ...))` clamp,
+#: which is the only value from which the clamp can be replayed: two rows that
+#: clamp to the same tier from 7 and from 5 are not the same row, and a vector
+#: that stored only the tier could not tell them apart or re-derive either.
+SCORE_ROW_SCALAR_FEATURES = frozenset({"raw_score"})
+
+#: The terminal tier caps, IN THE ORDER THE SCORER APPLIES THEM. This tuple is a
+#: contract, not a convenience: `reconstruct_tier` mins them in exactly this
+#: order, and while `min` happens to be commutative today, the order is what
+#: makes a future non-commutative rule (a cap that raises a floor, say) a
+#: deliberate edit here rather than an invisible reordering.
+#:
+#: Each entry holds THE TIER ITS RULE FORCED -- `cap_no_desc: 3` means "the
+#: no-description rule capped this row at 3" -- so a stored vector records the
+#: rule's decision rather than merely the fact that it fired.
+SCORE_ROW_CAP_FEATURES = ("cap_func", "cap_no_desc", "cap_stale", "cap_undated_aggregator")
+
+#: The single key a BLOCKED row carries. A blocked row's vector is exactly
+#: `{"blocker": <code>}` and nothing else: the row never reached a score, so
+#: there is no total to reconstruct and no cap to apply -- the tier is 0.
+SCORE_ROW_BLOCKER_FEATURE = "blocker"
+
+#: The closed key set `scoring.py` validates a stored `score_row` vector against.
+REQUIRED_SCORE_ROW_FEATURES = frozenset(
+    SCORE_ROW_CONTRIBUTIONS
+    | SCORE_ROW_SCALAR_FEATURES
+    | set(SCORE_ROW_CAP_FEATURES)
+    | {SCORE_ROW_BLOCKER_FEATURE}
+)
+
+#: The closed key set for a stored `hireability` vector. Every rule the odds axis
+#: scores has a weight, so this is exactly the weight table's key set -- and
+#: `sum(features.values()) == score` holds unconditionally there, because
+#: hireability has no clamp, no cap, and no blocker.
+REQUIRED_HIREABILITY_FEATURES = frozenset(REQUIRED_HIREABILITY_WEIGHTS)
+
+#: Every blocker code `rubric._score_row_core` may emit. Membership is asserted
+#: AT EMISSION (see `rubric._score_row_core`'s `blocked()`), not merely checked
+#: by a test, because a blocker code is a stored, queryable namespace: Phase 4
+#: groups the run report's `blocked` counts by it, and a typo'd code would create
+#: a new silent category that nothing has ever heard of. Adding a blocker means
+#: adding it here in the same change.
+BLOCKER_CODES = frozenset({
+    "non_us_location",
+    "off_target_location",
+    "active_clearance",
+    "specialist_skill_or_title",
+    "people_management",
+    "years_required_too_high",
+    "senior_design_verification",
+    "no_role_family_match",
+    "off_focus_role",
 })
 
 _TOP_LEVEL_KEYS = frozenset({
@@ -143,7 +242,10 @@ def _word_boundary_list(values, path: str) -> tuple:
     """Plain literal strings, each compiled with a `\\bword\\b`-style wrap
     (mirrors the pre-refactor call-time `re.search(r"\\b" + re.escape(c) +
     r"\\b", ...)` idiom, precompiled once at load instead of once per call)."""
-    _require(isinstance(values, list), path, f"expected a list of strings, got {type(values).__name__}")
+    # list or tuple: callers that need a non-empty guard run `_str_tuple` first
+    # (which type-checks the elements and returns a tuple) and compile the result.
+    _require(isinstance(values, (list, tuple)), path,
+             f"expected a list of strings, got {type(values).__name__}")
     out = []
     for i, v in enumerate(values):
         _require(isinstance(v, str), f"{path}[{i}]", f"expected a string, got {type(v).__name__}")
@@ -173,11 +275,25 @@ def _validate_weight_table(table, required: frozenset, path: str) -> Mapping[str
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True, slots=True)
 class LocationProfile:
+    """The location gate, and nothing else.
+
+    schema_version 2 removed four Seattle-era fields (`other_state_pattern`,
+    `socal_cities`, `far_wa_cities`, `dc_pattern`) that no code path read: the
+    2026-07-18 "bay area and remote only" directive replaced the metro/other-state
+    ladder with a two-way gate, and the fields survived as data nobody consulted.
+    Dead profile data is worse than no data -- it reads as a live rule, it lands
+    in `profile_versions.profile_json` as if it were one, and editing it changes
+    `profile_version_id` (and therefore invalidates every stored score) while
+    changing no score at all.
+
+    `bay_area_cities` arrived in the same version, moved out of `config.json`'s
+    `profile.bay_area` (see `exclusions.title_exclude` for why).
+    """
+
     non_us_patterns: tuple
-    other_state_pattern: re.Pattern
-    socal_cities: tuple
-    far_wa_cities: tuple
-    dc_pattern: re.Pattern
+    #: Word-boundary-compiled city names. A match counts as Bay Area only when a
+    #: CA marker is also present -- the scorer's rule, not this loader's.
+    bay_area_cities: tuple
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +334,17 @@ class EmployersProfile:
 @dataclass(frozen=True, slots=True)
 class ExclusionsProfile:
     disqualifying_skills: tuple
+    #: Word-boundary-compiled title terms that block a row outright. Moved here
+    #: from `config.json`'s `profile.title_exclude` in schema_version 2, together
+    #: with `location.bay_area_cities`, because the scorer read both from
+    #: `config.json` and NOTHING hashed `config.json` into `profile_version_id`.
+    #: Editing either one silently changed every tier the scorer produced while
+    #: leaving the profile version -- the identity a stored score is filed
+    #: under -- byte-identical, so the corpus was never re-scored and the change
+    #: was invisible to every audit. Folding them into `profile.json` makes the
+    #: scorer hermetic: its only inputs are the record, the description, and this
+    #: document, and the document's content hash IS the profile version.
+    title_exclude: tuple
     clearance_required_pattern: re.Pattern
     clearance_condition_pattern: re.Pattern
     clearance_exception_pattern: re.Pattern
@@ -313,14 +440,17 @@ class Profile:
 
 def _build_location(doc, path) -> LocationProfile:
     d = _expect_object(doc, path)
-    _expect_keys(d, frozenset({"non_us_patterns", "other_state_pattern", "socal_cities",
-                                "far_wa_cities", "dc_pattern"}), path)
+    _expect_keys(d, frozenset({"non_us_patterns", "bay_area_cities"}), path)
     return LocationProfile(
         non_us_patterns=_nonempty(_compile_list(d["non_us_patterns"], f"{path}.non_us_patterns"), f"{path}.non_us_patterns"),
-        other_state_pattern=_compile(d["other_state_pattern"], f"{path}.other_state_pattern"),
-        socal_cities=_str_tuple(d["socal_cities"], f"{path}.socal_cities"),
-        far_wa_cities=_str_tuple(d["far_wa_cities"], f"{path}.far_wa_cities"),
-        dc_pattern=_compile(d["dc_pattern"], f"{path}.dc_pattern"),
+        # Non-empty guard: an emptied list would not "disable the Bay Area rule",
+        # it would make `bay_area` false for every posting and reduce the whole
+        # location gate to "US-remote only" -- silently, and for every row.
+        bay_area_cities=_word_boundary_list(
+            _nonempty(_str_tuple(d["bay_area_cities"], f"{path}.bay_area_cities"),
+                      f"{path}.bay_area_cities"),
+            f"{path}.bay_area_cities",
+        ),
     )
 
 
@@ -407,13 +537,21 @@ def _build_employers(doc, path) -> EmployersProfile:
 def _build_exclusions(doc, path) -> ExclusionsProfile:
     d = _expect_object(doc, path)
     _expect_keys(d, frozenset({
-        "disqualifying_skills", "clearance_required_pattern", "clearance_condition_pattern",
+        "disqualifying_skills", "title_exclude", "clearance_required_pattern",
+        "clearance_condition_pattern",
         "clearance_exception_pattern", "people_management_pattern", "ic_manager_titles",
         "degree_required_pattern", "degree_equivalent_exception",
     }), path)
     ic_titles = _nonempty(_str_tuple(d["ic_manager_titles"], f"{path}.ic_manager_titles"), f"{path}.ic_manager_titles")
     return ExclusionsProfile(
         disqualifying_skills=_str_tuple(d["disqualifying_skills"], f"{path}.disqualifying_skills"),
+        # Non-empty guard, for the same reason as `location.bay_area_cities`: an
+        # emptied list silently disables a blocker rather than declaring "no rule".
+        title_exclude=_word_boundary_list(
+            _nonempty(_str_tuple(d["title_exclude"], f"{path}.title_exclude"),
+                      f"{path}.title_exclude"),
+            f"{path}.title_exclude",
+        ),
         clearance_required_pattern=_compile(d["clearance_required_pattern"], f"{path}.clearance_required_pattern"),
         clearance_condition_pattern=_compile(d["clearance_condition_pattern"], f"{path}.clearance_condition_pattern"),
         clearance_exception_pattern=_compile(d["clearance_exception_pattern"], f"{path}.clearance_exception_pattern"),
@@ -519,7 +657,15 @@ def build_profile(doc) -> Profile:
     d = _expect_object(doc, "profile")
     _expect_keys(d, _TOP_LEVEL_KEYS, "profile")
     schema_version = _int(d["schema_version"], "profile.schema_version")
-    _require(schema_version == 1, "profile.schema_version", f"unsupported schema_version {schema_version} (only 1 is known)")
+    # Forward-only, like the database's. Version 2 removed four dead location
+    # fields and folded `config.json`'s `profile.bay_area` /
+    # `profile.title_exclude` in as `location.bay_area_cities` /
+    # `exclusions.title_exclude`. A version-1 document is REJECTED rather than
+    # up-converted: it is missing rules the scorer now requires, and inventing
+    # defaults for them is exactly the silent-fallback behaviour this loader
+    # exists to prevent.
+    _require(schema_version == SCHEMA_VERSION, "profile.schema_version",
+             f"unsupported schema_version {schema_version} (only {SCHEMA_VERSION} is known)")
     return Profile(
         schema_version=schema_version,
         location=_build_location(d["location"], "profile.location"),

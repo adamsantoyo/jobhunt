@@ -7,7 +7,7 @@ Usage:
 Descriptions cache: results/descriptions.jsonl  {url, desc}
 Output: results/jobs_scored_<date>.csv with tier, why, flags
 """
-import argparse, csv, datetime, glob, html as htmlmod, json, os, re, sys, time
+import argparse, csv, datetime, glob, hashlib, html as htmlmod, json, os, re, sys, time
 from dataclasses import dataclass as _dataclass
 import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,7 +31,13 @@ DESC = os.path.join(HERE, "results", "descriptions.jsonl")
 # exact scoring code that produced it even when the profile and the posting
 # are both unchanged. Mirrors CANONICAL_HASH_FIELDS' bump discipline in
 # webapp/backend/sources/contract.py.
-RUBRIC_VERSION = "rubric-2026.08-v1"
+#
+# v2 (Phase 3.3): the feature vector became replayable (function_match always
+# emitted, staff_cap_delta, raw_score, the four terminal caps), the scorer
+# became hermetic (config.json's profile.bay_area / profile.title_exclude moved
+# into profile.json), and the undated-aggregator cap took an explicit
+# `is_aggregator` input instead of sniffing legacy CSV source strings.
+RUBRIC_VERSION = "rubric-2026.08-v2"
 
 _RPROFILE_CACHE = None
 def _rprofile():
@@ -451,25 +457,22 @@ def hireability_explained(r, desc):
     return _hireability_core(r, desc)
 
 # ---------------- scoring ----------------
-# config-driven (single source of truth: config.json profile), memoized
-_P = _METRO_C = _BAY_C = _EXCL_C = None
-def _profile():
-    global _P
-    if _P is None: _P = load_cfg()["profile"]
-    return _P
-def _metro():
-    global _METRO_C
-    if _METRO_C is None: _METRO_C = [m.lower() for m in _profile()["seattle_metro"]]
-    return _METRO_C
-def _bay():
-    global _BAY_C
-    if _BAY_C is None: _BAY_C = [m.lower() for m in _profile().get("bay_area", [])]
-    return _BAY_C
-def _title_excl():
-    global _EXCL_C
-    if _EXCL_C is None:
-        _EXCL_C = [re.compile(r"\b" + re.escape(x.strip()) + r"\b") for x in _profile().get("title_exclude", [])]
-    return _EXCL_C
+# THE SCORER IS HERMETIC. Its only inputs are the record, the description, and
+# profile.json (via `_rprofile()`). It reads config.json nowhere.
+#
+# It used to. `_bay()` and `_title_excl()` pulled `profile.bay_area` and
+# `profile.title_exclude` out of config.json, and nothing hashed config.json into
+# `profile_version_id` -- so editing either list silently changed the location
+# gate and a whole class of title blockers for every posting while leaving the
+# profile version a stored score is filed under byte-identical. The corpus was
+# never re-scored and no audit could see the change. Both lists now live in
+# profile.json as `location.bay_area_cities` and `exclusions.title_exclude`
+# (schema_version 2), where the content hash covers them. config.json itself is
+# untouched -- other consumers may still read those keys; the scorer does not.
+#
+# `_metro()`/`seattle_metro` went with them: the 2026-07-18 "bay area and remote
+# only" directive left that path unreachable, and unreachable code that reads
+# configuration reads as a live rule.
 
 def posting_age_days(posted):
     """Days since posting, from ISO dates or 'Posted 30+ Days Ago' strings. None if unknown."""
@@ -513,7 +516,7 @@ def salary_from_desc(d):
             return lo, hi
     return None, None
 
-def _score_row_core(r, desc):
+def _score_row_core(r, desc, *, is_aggregator=None):
     """Shared implementation behind score_row() and score_row_explained().
     Returns (tier, why, flags, features) -- the 3-tuple callers already know,
     plus a features dict of {named_rule: point_contribution} for every rule
@@ -524,7 +527,40 @@ def _score_row_core(r, desc):
     profile.json via `prof` -- rubric.py only supplies the shape of the
     algorithm. The final `max(1, min(5, score))` clamp is the one exception:
     the 1-5 output scale is the rubric's structural contract (consumers like
-    the tracker key off it), not a candidate preference, so it stays literal."""
+    the tracker key off it), not a candidate preference, so it stays literal.
+
+    THE FEATURE VECTOR IS REPLAYABLE (Phase 3.3). `reconstruct_tier(features)`
+    re-derives this function's `tier` from the vector alone, and
+    `sum(contributions) == features["raw_score"]` holds for every scored row.
+    That is what makes a stored score auditable rather than merely annotated: a
+    tier that cannot be re-derived from what was recorded is a number with a
+    story attached, not evidence. Three additions bought it:
+
+      * `function_match` is emitted ALWAYS, not only when the family is the
+        top-weighted one. It is the score's STARTING VALUE, so a vector that
+        omitted it on a lower-weighted family could not sum to the total.
+      * `staff_cap_delta` records the negative delta of the mid-computation
+        `min(score, staff_cap_tier)` clamp. It moves the running total, so it
+        replays as a contribution rather than as a terminal cap.
+      * `raw_score` records the total BEFORE `max(1, min(5, ...))`, and each of
+        the four terminal caps records THE TIER ITS RULE FORCED, at exactly the
+        point its `flags` entry is appended.
+
+    Emitting features must never change the tier: `score_row()` throws the
+    vector away and must return what it always returned.
+
+    `is_aggregator` is an EXPLICIT INPUT, and that is a correctness fix, not
+    ergonomics. The undated-ghost-listing cap used to gate on
+    `r["source"].startswith(AGG_SOURCES)`, where AGG_SOURCES is a tuple of legacy
+    CSV source strings ("jobspy-", "mcp-", "builtin", "yc-jobs"). Canonical
+    `posting_versions.source` carries the NormalizedPosting NAMESPACE instead
+    ("jobspy:indeed", "yc", "manual:dice"), which matches none of them -- so for
+    every canonically-scored row the cap silently never fired and undated
+    aggregator postings were free to reach tier 4/5. The caller now states the
+    fact it knows (Phase 3.3 reads it from the source registry's
+    `SourceCategory`); passing None keeps the legacy string sniff for the CSV
+    path, which is the only caller that still has legacy source strings.
+    """
     prof = _rprofile()
     W = prof.weights.score_row
     t = (r["title"] or "").lower()
@@ -532,8 +568,14 @@ def _score_row_core(r, desc):
     company = (r["company"] or "").lower()
     loc = (r["location"] or "").lower()
     why, flags, features = [], [], {}
+    if is_aggregator is None:
+        is_aggregator = (r.get("source") or "").startswith(AGG_SOURCES)
 
     def blocked(reason, flags_, code):
+        # Asserted AT EMISSION, not in a test: the blocker code is a stored,
+        # queryable namespace (Phase 4 groups run reports by it), and a typo
+        # would quietly create a category nothing has ever heard of.
+        assert code in candidate_profile.BLOCKER_CODES, f"unknown blocker code {code!r}"
         return 0, reason, flags_, {"blocker": code}
 
     # location gate — Bay Area or US-remote ONLY (2026-07-18 directive: "bay area and remote only")
@@ -542,7 +584,7 @@ def _score_row_core(r, desc):
     # A Bay Area city name counts as local only when a CA marker is also present. This both
     # rejects cross-state collisions ("Fremont, NE") AND keeps multi-location postings that
     # list SF alongside other cities ("San Francisco, CA | New York City, NY | Seattle, WA").
-    has_bay_city = any(re.search(r"\b" + re.escape(c) + r"\b", loc) for c in _bay())
+    has_bay_city = any(p.search(loc) for p in prof.location.bay_area_cities)
     ca_marker = bool(re.search(r",\s*ca\b|\bcalif", loc)) or "bay area" in loc
     bay_area = has_bay_city and ca_marker
     is_remote = str(r.get("remote", "")).strip().lower() == "true" \
@@ -561,9 +603,10 @@ def _score_row_core(r, desc):
             if prof.exclusions.clearance_condition_pattern.search(sent) \
                and not prof.exclusions.clearance_exception_pattern.search(sent):
                 return blocked("requires active clearance", ["blocker"], "active_clearance")
-    # title excludes are word-boundary matches from config.json profile.title_exclude
-    # ("intern" no longer swallows "Internal"/"International")
-    if any(k in d for k in prof.exclusions.disqualifying_skills) or any(p.search(t) for p in _title_excl()):
+    # title excludes are word-boundary matches from profile.json
+    # exclusions.title_exclude ("intern" no longer swallows "Internal"/"International")
+    if any(k in d for k in prof.exclusions.disqualifying_skills) \
+       or any(p.search(t) for p in prof.exclusions.title_exclude):
         return blocked("specialist/level blocker", ["blocker"], "specialist_skill_or_title")
     # people-management: any "Manager"/"Supervisor" in the title once IC manager
     # phrases (Program/Project/Product/Account/... Manager) are removed
@@ -573,8 +616,14 @@ def _score_row_core(r, desc):
     if yrs_req and yrs_req >= prof.experience.blocker_years_min:
         return blocked(f"requires {yrs_req}+ years", ["blocker"], "years_required_too_high")
     score = func
+    # Emitted unconditionally: `func` IS the score's starting value, so a vector
+    # that recorded it only for the top-weighted family could not sum to the
+    # total for any other family. The `why` line stays conditional -- it is the
+    # human-facing claim "this is a core function match", which a weight of 1 is
+    # not.
+    features["function_match"] = func
     if func == top_func:
-        why.append("core function match"); features["function_match"] = func
+        why.append("core function match")
     # level
     senior = bool(prof.level.score_senior_pattern.search(t))
     if fam == "tpm" and senior:
@@ -617,7 +666,15 @@ def _score_row_core(r, desc):
         features["target_co"] = W["target_co"]
     why.append("Bay Area" if bay_area else "US-remote")
     if prof.level.staff_cap_pattern.search(t):
-        score = min(score, prof.tier_rules.staff_cap_tier); flags.append("level-out")  # Principal/Staff: "Out (cap at 2)"
+        # Principal/Staff: "Out (cap at 2)". Recorded as the DELTA it applied to
+        # the running total (<= 0), not as a terminal cap: everything after this
+        # line still adds to `score`, so the clamp is a contribution and has to
+        # replay as one. Emitted even when it is 0 -- "the rule fired and cost
+        # nothing" is a different fact from "the rule did not fire".
+        capped = min(score, prof.tier_rules.staff_cap_tier)
+        features["staff_cap_delta"] = capped - score
+        score = capped
+        flags.append("level-out")
     # logistics: posting age (>30d = -1 per RUBRIC dimension 6)
     age = posting_age_days(r.get("posted"))
     if age is not None and age > prof.tier_rules.stale_penalty_days:
@@ -649,35 +706,142 @@ def _score_row_core(r, desc):
         flags.append("desc-unavailable")
     if prof.exclusions.degree_required_pattern.search(d) and prof.exclusions.degree_equivalent_exception not in d:
         score += W["degree_gated"]; flags.append("degree-gated"); features["degree_gated"] = W["degree_gated"]
+    # The raw total, recorded before the structural clamp. Two rows that clamp to
+    # the same tier from 7 and from 5 are not the same row, and a vector that kept
+    # only the tier could re-derive neither.
+    features["raw_score"] = score
     tier = max(1, min(5, score))  # structural: the rubric's 1-5 output scale, not a preference
     # RUBRIC tier mapping enforced: 5 requires Function 3 (fam is None already excluded above)
+    #
+    # Each cap below records THE TIER IT FORCED, at exactly the point its `flags`
+    # entry is appended, and `reconstruct_tier` mins them back in the declared
+    # order (candidate_profile.SCORE_ROW_CAP_FEATURES).
     if func < prof.tier_rules.func_cap_min_func and tier > prof.tier_rules.func_cap_tier:
-        tier = prof.tier_rules.func_cap_tier; flags.append("func-cap")
+        tier = prof.tier_rules.func_cap_tier
+        features["cap_func"] = tier; flags.append("func-cap")
     if not desc and tier > prof.tier_rules.no_desc_cap_tier:
-        tier = prof.tier_rules.no_desc_cap_tier; flags.append("needs-desc")  # rule zero: no 4/5 without a read description
+        tier = prof.tier_rules.no_desc_cap_tier  # rule zero: no 4/5 without a read description
+        features["cap_no_desc"] = tier; flags.append("needs-desc")
     # ghost-listing guards: very old or undated aggregator postings can't be 4/5
     if age is not None and age > prof.tier_rules.stale_cap_days:
-        tier = min(tier, prof.tier_rules.stale_cap_tier); flags.append("stale-90d+")
-    elif age is None and (r.get("source") or "").startswith(AGG_SOURCES):
+        tier = min(tier, prof.tier_rules.stale_cap_tier)
+        features["cap_stale"] = prof.tier_rules.stale_cap_tier; flags.append("stale-90d+")
+    elif age is None and is_aggregator:
         if tier > prof.tier_rules.undated_aggregator_cap_tier:
-            tier = prof.tier_rules.undated_aggregator_cap_tier; flags.append("undated-aggregator")
+            tier = prof.tier_rules.undated_aggregator_cap_tier
+            features["cap_undated_aggregator"] = tier; flags.append("undated-aggregator")
     return tier, "; ".join(why[:6]), flags, features
 
-def score_row(r, desc):
+
+def reconstruct_tier(features):
+    """Re-derive `_score_row_core`'s tier from a stored feature vector alone.
+
+    PURE, and deliberately ignorant of profile.json: every number it needs was
+    recorded by the scorer at the instant it decided. That is what makes it a
+    replay rather than a re-run -- a profile edit changes future scores, not the
+    reconstruction of a score already stored under an older profile version.
+
+    The three steps mirror the scorer exactly: a blocked row is tier 0 and has no
+    total; otherwise the raw total is clamped to the structural 1-5 scale and then
+    each terminal cap that fired is applied, in `SCORE_ROW_CAP_FEATURES` order.
+    `min` is used rather than assignment because a cap only ever lowers -- the
+    scorer's `tier = cap` forms are already guarded by `tier > cap`.
+    """
+    if candidate_profile.SCORE_ROW_BLOCKER_FEATURE in features:
+        return 0
+    tier = max(1, min(5, features["raw_score"]))
+    for cap in candidate_profile.SCORE_ROW_CAP_FEATURES:
+        if cap in features:
+            tier = min(tier, features[cap])
+    return tier
+
+def score_row(r, desc, *, is_aggregator=None):
     """Rubric scoring per RUBRIC.md. Mutates r's salary fields when a band is
     recovered from the description (WA pay-transparency extraction)."""
-    tier, why, flags, _features = _score_row_core(r, desc)
+    tier, why, flags, _features = _score_row_core(r, desc, is_aggregator=is_aggregator)
     return tier, why, flags
 
-def score_row_explained(r, desc):
+def score_row_explained(r, desc, *, is_aggregator=None):
     """Same computation as score_row(), plus the feature vector that fired
     (or the blocker name) and the profile/rubric hashes -- what Phase 3.3's
     persistence layer stores alongside a score so a tier is reproducible and
     auditable after profile.json or RUBRIC_VERSION later change."""
-    tier, why, flags, features = _score_row_core(r, desc)
+    tier, why, flags, features = _score_row_core(r, desc, is_aggregator=is_aggregator)
     prof = _rprofile()
     return ScoreResult(tier=tier, why=why, flags=flags, features=features,
                         profile_hash=prof.content_hash, rubric_hash=RUBRIC_VERSION)
+
+
+# ---------------- scorer identity: the RUBRIC_VERSION tripwire ----------------
+# RUBRIC_VERSION is a hand-maintained string, and a hand-maintained string is
+# exactly as reliable as the person editing it remembers to be. The failure it
+# guards against is silent and expensive: change a clamp, forget the bump, and
+# every stored score keeps claiming it was produced by a scorer that no longer
+# exists -- while the "score exactly once" anti-join happily reuses rows the new
+# code would not have produced.
+#
+# So the scorer's IDENTITY is derived from its SOURCE TEXT, over a pinned surface
+# named below, and used two ways:
+#
+#   AUTOMATIC. Phase 3.3's `scorer_hash` mixes in the COMPUTED digest, so any
+#     edit to the pinned surface invalidates every stored score whether or not
+#     RUBRIC_VERSION moved. Correctness does not depend on anyone remembering.
+#   DELIBERATE. `SCORER_SOURCE_DIGEST` below pins the digest as a constant, and a
+#     test asserts the computed value still equals it. Editing the scorer
+#     therefore FAILS THE SUITE until a human updates the pin -- and updating the
+#     pin is the moment to decide whether RUBRIC_VERSION should move too.
+#
+# The surface is pinned by NAME rather than by module scan: a digest over the
+# whole module would churn on a docstring in a description fetcher and cost a
+# full corpus re-score for nothing.
+_SCORER_SURFACE_NAMES = (
+    "ScoreResult",
+    "OddsResult",
+    "_hireability_core",
+    "hireability",
+    "hireability_explained",
+    "posting_age_days",
+    "years_required",
+    "salary_from_desc",
+    "_score_row_core",
+    "reconstruct_tier",
+    "score_row",
+    "score_row_explained",
+)
+
+
+def _scorer_surface():
+    """(label, object) for every pinned member, in declared order.
+
+    `scraper.parse_salary` is included because the scorer CALLS it to turn a
+    salary string into a band, so a change there changes tiers exactly as a
+    change here would. Reading its source is all this does -- scraper.py itself
+    is not modified.
+    """
+    import scraper as _scraper_mod
+    members = [(f"rubric.{name}", globals()[name]) for name in _SCORER_SURFACE_NAMES]
+    members.append(("scraper.parse_salary", _scraper_mod.parse_salary))
+    return members
+
+
+def scorer_source_digest():
+    """sha256 over the source text of the pinned scoring surface.
+
+    Labels are hashed alongside the text so that renaming a function is a change
+    even when its body is untouched, and so that two members with identical
+    bodies cannot cancel out.
+    """
+    import inspect
+    payload = [[label, inspect.getsource(obj)] for label, obj in _scorer_surface()]
+    blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+#: The pinned value of `scorer_source_digest()`. Asserted by
+#: `webapp/backend/tests/test_scoring_features.py`. When that assertion fails,
+#: the scorer changed: update this constant, and decide in the same edit whether
+#: RUBRIC_VERSION moves with it.
+SCORER_SOURCE_DIGEST = "11b7474fb7af53e7bd79e7910d0af71c221ac65da07da3b929e559a413229156"
 
 def load_picks():
     """Human picks (picks.json) + LLM-confirmed picks (picks_llm.json, written by

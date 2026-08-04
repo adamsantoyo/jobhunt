@@ -197,6 +197,7 @@ check("registry: starbucks eightfold", reg.get(canon_company("Starbucks"), ("",)
 
 print("== profile.py: validation, hashing, feature vectors (Phase 3.4) ==")
 import candidate_profile as _prof_mod
+import rubric as _rubric_mod
 from rubric import score_row_explained, hireability_explained, RUBRIC_VERSION
 
 _PROFILE_DOC = _json.load(open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "profile.json")))
@@ -281,8 +282,18 @@ check("version row id/hash idempotent across calls", row_ver["profile_version_id
 
 # -- feature-vector correctness (hand-computed) --
 res = score_row_explained(row("Support Engineer"), "General duties. 5 years experience needed for this role.")
-check("score_row_explained: plain-family-only row features == {function_match: 3}", res.features == {"function_match": 3}, res.features)
-check("score_row_explained: features sum to tier when no cap engaged", sum(res.features.values()) == res.tier, (res.features, res.tier))
+# Phase 3.3 widened the vector so it can be REPLAYED (rubric.reconstruct_tier):
+# it now also carries `raw_score` and, when they fire, the terminal caps. So the
+# two assertions below moved onto the CONTRIBUTIONS SUBSET -- the keys that are
+# summed into the score -- instead of onto the whole dict. Same claim about the
+# same row, stated against the part of the vector that is a sum.
+_contribs = {k: v for k, v in res.features.items() if k in _prof_mod.SCORE_ROW_CONTRIBUTIONS}
+check("score_row_explained: plain-family-only row contributions == {function_match: 3}", _contribs == {"function_match": 3}, res.features)
+check("score_row_explained: contributions sum to raw_score", sum(_contribs.values()) == res.features["raw_score"], res.features)
+check("score_row_explained: contributions sum to tier when no clamp or cap engaged", sum(_contribs.values()) == res.tier, (res.features, res.tier))
+check("score_row_explained: vector reconstructs its own tier", _rubric_mod.reconstruct_tier(res.features) == res.tier, (res.features, res.tier))
+check("score_row_explained: vector keys are inside the stored-feature contract",
+      set(res.features) <= _prof_mod.REQUIRED_SCORE_ROW_FEATURES, sorted(set(res.features) - _prof_mod.REQUIRED_SCORE_ROW_FEATURES))
 check("score_row_explained: carries profile_hash + rubric_hash", res.profile_hash == h1 and res.rubric_hash == RUBRIC_VERSION)
 
 blocked_res = score_row_explained(row("Manager, Technical Support Engineer", "CoreWeave", "San Jose, CA"), GOOD_DESC)

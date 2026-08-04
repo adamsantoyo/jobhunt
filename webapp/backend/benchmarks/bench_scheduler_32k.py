@@ -340,7 +340,93 @@ async def run_once(connect, plan) -> tuple[RunResult, float]:
     return result, elapsed
 
 
-async def run_benchmark(*, keep_db: bool) -> dict:
+# --------------------------------------------------------------------------- #
+# Phase 3.3: the scoring graph over the same corpus
+#
+# Optional (`--graph`), because it measures a DIFFERENT thing from the ingest
+# baselines above and mixing them would make the ingest numbers incomparable
+# run-over-run. The graph pass runs AFTER an ingest run has committed, on the same
+# temporary database, and answers the two questions the roadmap asks of this phase:
+#
+#   FULL          how long does scoring the whole 33.5k-row corpus take, once?
+#   INCREMENTAL   how much work does the NEXT pass do when nothing changed? The
+#                 answer has to be approximately zero -- that is the entire point of
+#                 dirty emission plus the score-once anti-join, and a number that
+#                 is not near zero means the daily run re-scores the corpus nightly.
+#
+# The ingest write path is untouched by Phase 3.3, so the two ingest runs above
+# should show no regression at all; that is the third thing this measures.
+# --------------------------------------------------------------------------- #
+_REPO_ROOT = _WEBAPP_ROOT.parent
+
+
+def corpus_category_of():
+    """`category_of` built from the CORPUS declarations.
+
+    The benchmark's sources are fakes, so `graph.registry_category` would read every
+    one of them as AGGREGATOR (its conservative default for an unregistered source
+    key) and the direct-inventory index would be empty. Feeding it the corpus's own
+    declared categories is what makes the aggregator-resolution stage do real work:
+    two of the fifteen sources are aggregators, 1,700 rows between them.
+    """
+    table = {c.source_key: c.category for c in CORPUS}
+
+    def _category(namespace: str) -> SourceCategory:
+        return table.get(namespace.split(":", 1)[0], SourceCategory.AGGREGATOR)
+
+    return _category
+
+
+def run_graph_pass(connect, run_uid: str) -> dict:
+    """One scoring pass over a committed run, timed, on its own connection."""
+    from backend.sources import graph  # noqa: PLC0415 - optional path, keeps import cost off the default run
+
+    with open(_REPO_ROOT / "profile.json") as handle:
+        profile_doc = json.load(handle)
+
+    conn = connect()
+    try:
+        started = time.perf_counter()
+        report = graph.run_pass(
+            conn, run_uid=run_uid, profile_doc=profile_doc,
+            category_of=corpus_category_of(),
+        )
+        conn.commit()
+        elapsed = time.perf_counter() - started
+        scored = int(report["scored"])
+        return {
+            "wall_seconds": round(elapsed, 3),
+            "mode": report["mode"],
+            "reasons": report["reasons"],
+            "selected": report["selected"],
+            "scored": scored,
+            "reused": report["reused"],
+            "superseded": report["superseded"],
+            "blocked": report["blocked"],
+            "skipped": report["skipped"],
+            "resolved": report["resolved"],
+            "resolve_ambiguous": report["resolve_ambiguous"],
+            "invalidations_consumed": report.get("invalidations_consumed", 0),
+            "rows_per_second": round(scored / elapsed, 1) if elapsed > 0 else None,
+            "current_score_rows": conn.execute(
+                "SELECT COUNT(*) FROM score_versions WHERE superseded_at IS NULL"
+            ).fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+
+def dirty_count(connect, run_uid: str) -> int:
+    conn = connect()
+    try:
+        from backend.sources import runstore  # noqa: PLC0415
+
+        return len(runstore.dirty_posting_ids(conn, run_uid))
+    finally:
+        conn.close()
+
+
+async def run_benchmark(*, keep_db: bool, graph_pass: bool = False) -> dict:
     tmp_dir = Path(tempfile.mkdtemp(prefix="jobhunt-bench-scheduler-"))
     try:
         connect = make_connect(tmp_dir, name="bench.db")
@@ -350,9 +436,24 @@ async def run_benchmark(*, keep_db: bool) -> dict:
         run1_report = fetch_report(connect, run1_result.run_uid)
         rss_after_run1 = peak_rss_mb()
 
+        graph_full = graph_incremental = None
+        if graph_pass:
+            graph_full = {
+                "dirty_postings": dirty_count(connect, run1_result.run_uid),
+                **run_graph_pass(connect, run1_result.run_uid),
+            }
+            graph_full["peak_rss_mb_after"] = peak_rss_mb()
+
         run2_result, run2_elapsed = await run_once(connect, plan)
         run2_report = fetch_report(connect, run2_result.run_uid)
         rss_after_run2 = peak_rss_mb()
+
+        if graph_pass:
+            graph_incremental = {
+                "dirty_postings": dirty_count(connect, run2_result.run_uid),
+                **run_graph_pass(connect, run2_result.run_uid),
+            }
+            graph_incremental["peak_rss_mb_after"] = peak_rss_mb()
 
         return {
             "benchmark": "bench_scheduler_32k",
@@ -383,6 +484,10 @@ async def run_benchmark(*, keep_db: bool) -> dict:
             "peak_rss_mb_growth_run2_vs_run1": round(rss_after_run2 - rss_after_run1, 2),
             "full_corpus_run": summarize_run(run1_result, run1_elapsed, run1_report),
             "incremental_shaped_run": summarize_run(run2_result, run2_elapsed, run2_report),
+            #: Phase 3.3, present only with --graph. `graph_full_pass.scored` is the
+            #: whole corpus; `graph_incremental_pass.scored` must be ~0.
+            "graph_full_pass": graph_full,
+            "graph_incremental_pass": graph_incremental,
         }
     finally:
         if keep_db:
@@ -402,9 +507,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--keep-db", action="store_true", help="do not delete the temp database; print its path to stderr"
     )
+    parser.add_argument(
+        "--graph", action="store_true",
+        help="also time Phase 3.3's scoring pass (FULL after run 1, INCREMENTAL after run 2)",
+    )
     args = parser.parse_args(argv)
 
-    metrics = asyncio.run(run_benchmark(keep_db=args.keep_db))
+    metrics = asyncio.run(run_benchmark(keep_db=args.keep_db, graph_pass=args.graph))
     payload = json.dumps(metrics, indent=2, sort_keys=False)
 
     if args.out:

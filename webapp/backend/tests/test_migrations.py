@@ -299,7 +299,7 @@ def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
     upgraded_path = tmp_path / "upgraded_equivalent.db"
     build_v4_db(upgraded_path)
     upgraded = connect(upgraded_path)
-    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 19))
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 21))
 
     assert _canonical_structure(upgraded) == _canonical_structure(fresh)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -837,6 +837,8 @@ def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
         (16, "posting_version_source_run_index"),
         (17, "compat_jobs_legacy_only"),
         (18, "run_posting_source_state"),
+        (19, "score_version_supersession"),
+        (20, "score_graph"),
     ]
 
     for table in ("job_state", "state_events"):
@@ -874,6 +876,8 @@ def test_v11_upgrade_matches_fresh_legacy_import_ledger(tmp_path):
         (16, "posting_version_source_run_index"),
         (17, "compat_jobs_legacy_only"),
         (18, "run_posting_source_state"),
+        (19, "score_version_supersession"),
+        (20, "score_graph"),
     ]
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(legacy_artifact_imports)")] == [
         tuple(r) for r in fresh.execute("PRAGMA table_info(legacy_artifact_imports)")
@@ -921,6 +925,8 @@ def test_v12_upgrade_classifies_current_only_membership_and_fixes_history_view(t
         (16, "posting_version_source_run_index"),
         (17, "compat_jobs_legacy_only"),
         (18, "run_posting_source_state"),
+        (19, "score_version_supersession"),
+        (20, "score_graph"),
     ]
     assert conn.execute(
         "SELECT membership_kind FROM run_postings"
@@ -959,6 +965,8 @@ def test_v14_upgrade_matches_fresh_posting_presence_structure(tmp_path):
         (16, "posting_version_source_run_index"),
         (17, "compat_jobs_legacy_only"),
         (18, "run_posting_source_state"),
+        (19, "score_version_supersession"),
+        (20, "score_graph"),
     ]
 
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(postings)")] == [
@@ -1018,6 +1026,8 @@ def test_migration_16_indexes_posting_versions_by_source_run(tmp_path):
         (16, "posting_version_source_run_index"),
         (17, "compat_jobs_legacy_only"),
         (18, "run_posting_source_state"),
+        (19, "score_version_supersession"),
+        (20, "score_graph"),
     ]
 
     upgraded_sql = upgraded.execute(
@@ -1083,6 +1093,8 @@ def test_migration_17_narrows_compat_jobs_to_legacy_versions(tmp_path):
     assert run_migrations(upgraded, str(path)) == [
         (17, "compat_jobs_legacy_only"),
         (18, "run_posting_source_state"),
+        (19, "score_version_supersession"),
+        (20, "score_graph"),
     ]
 
     assert upgraded.execute("SELECT COUNT(*) FROM compat_jobs").fetchone()[0] == 0
@@ -1135,7 +1147,11 @@ def test_migration_18_adds_the_source_state_column_without_backfilling_it(tmp_pa
     )
     upgraded.commit()
 
-    assert run_migrations(upgraded, str(path)) == [(18, "run_posting_source_state")]
+    assert run_migrations(upgraded, str(path)) == [
+        (18, "run_posting_source_state"),
+        (19, "score_version_supersession"),
+        (20, "score_graph"),
+    ]
 
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(run_postings)")] == [
         tuple(r) for r in fresh.execute("PRAGMA table_info(run_postings)")
@@ -1156,6 +1172,176 @@ def test_migration_18_adds_the_source_state_column_without_backfilling_it(tmp_pa
     ).fetchone()[0] is None, "no backfill: a pre-3.1 row genuinely recorded no state"
     # Idempotent under the direct re-invocation the migration tests make.
     migrations_mod._migration_18_run_posting_source_state(upgraded)
+    assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
+    upgraded.close()
+    fresh.close()
+
+
+def test_migration_19_adds_the_score_supersession_columns_and_indexes(tmp_path):
+    """Migration 19 adds `score_versions`' five Phase 3.3 columns and two partial
+    indexes, and an upgraded database ends up structurally identical to a fresh one.
+
+    `uq_score_versions_current` is the load-bearing one: it is the literal "score
+    exactly once per (posting version, profile version, scorer)" guarantee, enforced
+    by the database rather than by the code that happens to write it.
+
+    No backfill, and specifically not of `posting_id` on migration 11's legacy score
+    rows: deriving it would claim Phase 3.3's scorer produced them.
+    """
+    import backend.migrations as migrations_mod
+
+    fresh = connect(tmp_path / "fresh_v19.db")
+    init_db(fresh)
+
+    path = tmp_path / "v18_no_supersession.db"
+    upgraded = connect(path)
+    init_db(upgraded)
+    upgraded.execute("DROP INDEX uq_score_versions_current")
+    upgraded.execute("DROP INDEX idx_score_versions_posting_current")
+    for column in migrations_mod.SCORE_VERSION_COLUMNS:
+        upgraded.execute(f"ALTER TABLE score_versions DROP COLUMN {column}")
+    upgraded.execute("DELETE FROM schema_version WHERE version >= 19")
+    upgraded.execute(
+        "INSERT INTO profile_versions (profile_version_id, content_hash, profile_json, "
+        "created_at) VALUES ('pv','hash','{}','t0')"
+    )
+    upgraded.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at) "
+        "VALUES ('p','active','t0','t0')"
+    )
+    upgraded.execute(
+        "INSERT INTO posting_versions (posting_version_id, posting_id, version_kind, "
+        "version_hash, observed_at, payload_json) VALUES ('v','p','legacy-current','h','t0','{}')"
+    )
+    upgraded.execute(
+        "INSERT INTO score_versions (score_version_id, posting_version_id, "
+        "profile_version_id, score_hash, scorer_hash, tier, created_at) "
+        "VALUES ('s','v','pv','sh','legacy-import',3,'t0')"
+    )
+    upgraded.commit()
+
+    assert run_migrations(upgraded, str(path)) == [
+        (19, "score_version_supersession"),
+        (20, "score_graph"),
+    ]
+
+    assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(score_versions)")] == [
+        tuple(r) for r in fresh.execute("PRAGMA table_info(score_versions)")
+    ]
+    assert upgraded.execute(
+        "SELECT sql FROM sqlite_master WHERE name='score_versions'"
+    ).fetchone()[0] == fresh.execute(
+        "SELECT sql FROM sqlite_master WHERE name='score_versions'"
+    ).fetchone()[0]
+    for index in ("uq_score_versions_current", "idx_score_versions_posting_current"):
+        upgraded_sql = upgraded.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index,)
+        ).fetchone()
+        fresh_sql = fresh.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index,)
+        ).fetchone()
+        assert upgraded_sql is not None and upgraded_sql[0] == fresh_sql[0]
+
+    # All five columns are nullable with no default: a legacy import genuinely has
+    # no input hash, no feature vector, and no supersession.
+    added = {
+        r["name"]: (r["notnull"], r["dflt_value"])
+        for r in upgraded.execute("PRAGMA table_info(score_versions)")
+        if r["name"] in migrations_mod.SCORE_VERSION_COLUMNS
+    }
+    assert added == {name: (0, None) for name in migrations_mod.SCORE_VERSION_COLUMNS}
+    assert upgraded.execute(
+        "SELECT posting_id, input_hash, features_json, superseded_at, superseded_by "
+        "FROM score_versions"
+    ).fetchone()[:] == (None, None, None, None, None)
+
+    # The uniqueness the whole phase rests on, enforced by the database.
+    with pytest.raises(sqlite3.IntegrityError):
+        upgraded.execute(
+            "INSERT INTO score_versions (score_version_id, posting_version_id, "
+            "profile_version_id, score_hash, scorer_hash, tier, created_at) "
+            "VALUES ('s2','v','pv','other','legacy-import',4,'t0')"
+        )
+    upgraded.rollback()
+
+    # Idempotent under the direct re-invocation the migration tests make.
+    migrations_mod._migration_19_score_version_supersession(upgraded)
+    assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
+    upgraded.close()
+    fresh.close()
+
+
+def test_migration_20_creates_the_score_graph_tables(tmp_path):
+    """Migration 20 creates `score_passes` and `score_invalidations`.
+
+    `score_passes.status` is a LICENCE, not a label: only a COMPLETED row licenses
+    the next run to score incrementally, which is what makes a pass that died redo
+    its work instead of being silently skipped. `score_invalidations` is
+    single-posting and restart-safe -- consumed only when a pass completes.
+    """
+    import backend.migrations as migrations_mod
+
+    fresh = connect(tmp_path / "fresh_v20.db")
+    init_db(fresh)
+
+    path = tmp_path / "v19_no_graph.db"
+    upgraded = connect(path)
+    init_db(upgraded)
+    upgraded.execute("DROP TABLE score_passes")
+    upgraded.execute("DROP TABLE score_invalidations")
+    upgraded.execute("DROP INDEX IF EXISTS idx_posting_redirects_to")
+    upgraded.execute("DELETE FROM schema_version WHERE version >= 20")
+    upgraded.commit()
+
+    assert run_migrations(upgraded, str(path)) == [(20, "score_graph")]
+
+    for table in ("score_passes", "score_invalidations"):
+        assert upgraded.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()[0] == fresh.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()[0]
+    for index in ("idx_score_passes_status", "idx_score_invalidations_open",
+                  "idx_posting_redirects_to"):
+        assert upgraded.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index,)
+        ).fetchone()[0] == fresh.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index,)
+        ).fetchone()[0]
+
+    # One pass per (run, profile, scorer): re-entering a run under the same identity
+    # resumes one pass rather than forking a second.
+    upgraded.execute(
+        "INSERT INTO profile_versions (profile_version_id, content_hash, profile_json, "
+        "created_at) VALUES ('pv','hash','{}','t0')"
+    )
+    upgraded.execute(
+        "INSERT INTO pipeline_runs (run_uid,kind,status,requested_at) "
+        "VALUES ('r','daily','succeeded','t0')"
+    )
+    upgraded.commit()  # so the rollbacks below undo only the failed INSERTs
+    upgraded.execute(
+        "INSERT INTO score_passes (pass_id, run_uid, profile_version_id, scorer_hash, "
+        "mode, status, started_at) VALUES ('p1','r','pv','sh','full','running','t0')"
+    )
+    upgraded.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        upgraded.execute(
+            "INSERT INTO score_passes (pass_id, run_uid, profile_version_id, scorer_hash, "
+            "mode, status, started_at) VALUES ('p2','r','pv','sh','full','running','t0')"
+        )
+    upgraded.rollback()
+    # And `mode` is a closed vocabulary, because a third value would mean a pass
+    # nothing downstream knows how to interpret.
+    with pytest.raises(sqlite3.IntegrityError):
+        upgraded.execute(
+            "INSERT INTO score_passes (pass_id, run_uid, profile_version_id, scorer_hash, "
+            "mode, status, started_at) VALUES ('p3','r','pv','sh2','sideways','running','t0')"
+        )
+    upgraded.rollback()
+
+    # Idempotent under the direct re-invocation the migration tests make.
+    migrations_mod._migration_20_score_graph(upgraded)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
     upgraded.close()
     fresh.close()
@@ -1752,7 +1938,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == set(range(1, 19))
+    assert versions == set(range(1, 21))
     conn.close()
 
 

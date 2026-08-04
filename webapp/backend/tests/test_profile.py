@@ -132,4 +132,8 @@ def test_loaded_profile_matches_the_on_disk_document(profile_doc):
     the raw document directly."""
     prof = candidate_profile.load_profile(os.path.join(_REPO_ROOT, "profile.json"))
     assert prof.content_hash == candidate_profile.profile_content_hash(profile_doc)
-    assert prof.schema_version == 1
+    # Bumped 1 -> 2 by Phase 3.3: four dead Seattle-era location fields removed,
+    # and config.json's profile.bay_area / profile.title_exclude folded in as
+    # location.bay_area_cities / exclusions.title_exclude. Pinned deliberately --
+    # a schema bump must be a decision, not a diff nobody noticed.
+    assert prof.schema_version == candidate_profile.SCHEMA_VERSION == 2

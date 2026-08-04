@@ -587,6 +587,137 @@ POSTING_PRESENCE_COLUMN_DDL = {
 
 POSTING_PRESENCE_COLUMNS_DDL = "".join(POSTING_PRESENCE_COLUMN_DDL.values())
 
+# Five nullable columns and two partial indexes on `score_versions` (migration 19).
+# This is what turns "a score exists" into "a score exists exactly once, for a known
+# input, and its predecessor is still on file".
+#
+#   posting_id
+#       the posting a score is ABOUT. `score_versions` reached it only through
+#       `posting_version_id`, so "what is this posting's current score" was a join
+#       through a table whose row count grows with every content change. Phase 4
+#       reads scores by posting; the column plus its partial index make that a seek.
+#   input_hash
+#       a digest of everything that fed the scorer other than the profile and the
+#       scorer itself: the scored version's `version_hash`, the description's content
+#       identity, and `is_aggregator`. It is what closes the hole where a posting
+#       scored BEFORE its description arrived stayed capped at `no_desc_cap_tier`
+#       forever -- same (version, profile, scorer) triple, different input, therefore
+#       a new row, with the old one superseded rather than overwritten.
+#   features_json
+#       the replayable feature vector (`rubric.reconstruct_tier`). Validated against
+#       `candidate_profile.REQUIRED_SCORE_ROW_FEATURES` before it is written.
+#   superseded_at / superseded_by
+#       supersession, not deletion. A score that stops being current keeps its row,
+#       its rationale, and a pointer to the row that replaced it, so "why did this
+#       posting's tier move on the 4th" is answerable from evidence.
+#
+# `score_hash` (already NOT NULL from migration 9) is now the FULL KEY DIGEST
+# sha256({"input": input_hash, "scorer": scorer_hash}), which is what makes migration
+# 9's `UNIQUE (posting_version_id, profile_version_id, score_hash)` mean "one row per
+# (version, profile, scorer, input)". The two alternatives both collide: hashing the
+# OUTPUT would let a late-arriving description land on the old row (same tier, same
+# rationale, different reason for it), and hashing the input ALONE would collide two
+# scorer versions scoring one input.
+#
+# `uq_score_versions_current` is the literal "scores exactly once" guarantee: at most
+# one un-superseded row per (posting_version, profile, scorer). Its leading column is
+# `posting_version_id` because that is what the selection anti-join probes with.
+#
+# ALTER TABLE ADD COLUMN with a REFERENCES clause is legal here because the added
+# columns default to NULL (SQLite's stated condition when foreign keys are enabled).
+# Column DDL text is shared verbatim by CANONICAL_DDL and migration 19, for the
+# sqlite_master text-equality reason spelled out above migration 14's columns.
+SCORE_VERSION_COLUMNS = (
+    "posting_id", "input_hash", "features_json", "superseded_at", "superseded_by",
+)
+
+SCORE_VERSION_COLUMN_DDL = {
+    "posting_id":
+        "ALTER TABLE score_versions ADD COLUMN posting_id TEXT "
+        "REFERENCES postings(posting_id) ON DELETE RESTRICT;\n",
+    "input_hash": "ALTER TABLE score_versions ADD COLUMN input_hash TEXT;\n",
+    "features_json": "ALTER TABLE score_versions ADD COLUMN features_json TEXT;\n",
+    "superseded_at": "ALTER TABLE score_versions ADD COLUMN superseded_at TEXT;\n",
+    "superseded_by":
+        "ALTER TABLE score_versions ADD COLUMN superseded_by TEXT "
+        "REFERENCES score_versions(score_version_id) ON DELETE RESTRICT;\n",
+}
+
+SCORE_VERSION_COLUMNS_DDL = "".join(SCORE_VERSION_COLUMN_DDL.values())
+
+SCORE_VERSION_INDEXES_DDL = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_score_versions_current
+    ON score_versions(posting_version_id, profile_version_id, scorer_hash)
+    WHERE superseded_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_score_versions_posting_current
+    ON score_versions(posting_id) WHERE superseded_at IS NULL;
+"""
+
+SCORE_VERSION_SUPERSESSION_DDL = SCORE_VERSION_COLUMNS_DDL + SCORE_VERSION_INDEXES_DDL
+
+# The scoring graph's own evidence (migration 20). Two tables, both append-mostly.
+#
+# score_passes
+#     One row per (run, profile version, scorer) scoring pass: which mode it ran in
+#     and why, what it selected, scored, reused, and skipped, and whether it
+#     COMPLETED. That last field is a licence, not a status label: the next pass may
+#     run INCREMENTAL only if the run its dirty set is measured against carries a
+#     COMPLETED pass here. A pass that died leaves no licence, so the next one redoes
+#     its work -- the same self-healing rule `runstore._CONSUMED_RUN_STATUSES`
+#     applies to dirty emission, applied one layer up.
+#     UNIQUE(run_uid, profile_version_id, scorer_hash) so re-entering a run under the
+#     same identity resumes one pass rather than forking a second.
+# score_invalidations
+#     "This posting's stored score is no longer trustworthy, for this reason." Emitted
+#     by the resolver when a canonical match changes which version is canonical for a
+#     posting -- one row for ONE posting, never a corpus-wide sweep. Consumed only
+#     when a pass COMPLETES, so a crash mid-pass leaves the work still queued. The
+#     partial index is the open-work query; consumed rows stay as evidence and cost
+#     the index nothing.
+#
+# The third index is on a table migration 7 already created: `posting_redirects`
+# was reachable only by `from_posting_id` (its primary key), and the graph asks the
+# OTHER direction -- "which postings redirect INTO this survivor" -- once per work
+# page, because a survivor's canonical version selection has to see the state maps
+# of everything merged into it. Without it that lookup is a scan of every merge the
+# system has ever made, on every page of every pass.
+SCORE_GRAPH_DDL = """
+CREATE TABLE IF NOT EXISTS score_passes (
+    pass_id TEXT PRIMARY KEY,
+    run_uid TEXT NOT NULL REFERENCES pipeline_runs(run_uid) ON DELETE CASCADE,
+    profile_version_id TEXT NOT NULL REFERENCES profile_versions(profile_version_id) ON DELETE RESTRICT,
+    scorer_hash TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+    status TEXT NOT NULL,
+    selected INTEGER NOT NULL DEFAULT 0,
+    scored INTEGER NOT NULL DEFAULT 0,
+    reused INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    report_json TEXT,
+    UNIQUE (run_uid, profile_version_id, scorer_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_score_passes_status
+    ON score_passes(status, started_at);
+
+CREATE TABLE IF NOT EXISTS score_invalidations (
+    invalidation_id TEXT PRIMARY KEY,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    reason TEXT NOT NULL,
+    evidence_json TEXT,
+    created_at TEXT NOT NULL,
+    created_run_uid TEXT REFERENCES pipeline_runs(run_uid) ON DELETE RESTRICT,
+    consumed_at TEXT,
+    consumed_run_uid TEXT REFERENCES pipeline_runs(run_uid) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_score_invalidations_open
+    ON score_invalidations(posting_id) WHERE consumed_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_posting_redirects_to
+    ON posting_redirects(to_posting_id);
+"""
+
 CANONICAL_DDL = "\n".join((
         PROFILE_VERSIONS_DDL,
         RUNS_DDL,
@@ -600,6 +731,8 @@ CANONICAL_DDL = "\n".join((
         SCHEDULER_PERSISTENCE_COLUMNS_DDL,
         POSTING_PRESENCE_COLUMNS_DDL,
         RUN_POSTING_SOURCE_STATE_COLUMN_DDL,
+        SCORE_VERSION_SUPERSESSION_DDL,
+        SCORE_GRAPH_DDL,
 ))
 
 
@@ -1460,6 +1593,38 @@ def _migration_18_run_posting_source_state(conn: sqlite3.Connection) -> None:
         _execute_ddl(conn, RUN_POSTING_SOURCE_STATE_COLUMN_DDL)
 
 
+def _migration_19_score_version_supersession(conn: sqlite3.Connection) -> None:
+    """Add Phase 3.3's five `score_versions` columns and its two partial indexes.
+
+    Per-column PRAGMA guards rather than a bare ALTER, matching migrations 4 and
+    13-15: a fresh database already has all five from CANONICAL_DDL, and the
+    migration tests re-invoke this function directly against one. The indexes are
+    `IF NOT EXISTS` and therefore need no guard of their own.
+
+    No backfill, and specifically not of `posting_id`. Migration 11's legacy score
+    rows could have theirs derived through `posting_versions`, but doing so would
+    claim that Phase 3.3's scorer produced them; they were imported from the legacy
+    `jobs` table under `scorer_hash='legacy-import'` and are not scores this graph
+    can reason about. `uq_score_versions_current` is nonetheless satisfiable on such
+    a database: migration 11 writes at most one score row per posting version.
+    """
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(score_versions)")}
+    for name, ddl in SCORE_VERSION_COLUMN_DDL.items():
+        if name not in columns:
+            _execute_ddl(conn, ddl)
+    _execute_ddl(conn, SCORE_VERSION_INDEXES_DDL)
+
+
+def _migration_20_score_graph(conn: sqlite3.Connection) -> None:
+    """Create `score_passes` and `score_invalidations` — the scoring graph's evidence.
+
+    Table-only and `IF NOT EXISTS` throughout, so this is idempotent by construction
+    on a fresh database (CANONICAL_DDL already created both) and under the direct
+    re-invocation the migration tests make.
+    """
+    _execute_ddl(conn, SCORE_GRAPH_DDL)
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
@@ -1480,6 +1645,8 @@ MIGRATIONS = [
     (16, "posting_version_source_run_index", _migration_16_posting_version_source_run_index),
     (17, "compat_jobs_legacy_only", _migration_17_compat_jobs_legacy_only),
     (18, "run_posting_source_state", _migration_18_run_posting_source_state),
+    (19, "score_version_supersession", _migration_19_score_version_supersession),
+    (20, "score_graph", _migration_20_score_graph),
 ]
 
 
