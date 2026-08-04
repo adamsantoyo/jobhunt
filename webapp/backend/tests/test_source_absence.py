@@ -666,6 +666,280 @@ def test_an_interrupted_run_leaves_presence_untouched_until_it_is_resumed(tmp_pa
     )
 
 
+def test_only_a_fetch_attempt_can_licence_absence(tmp_path):
+    """`source_runs` is shared with other steps — `unattempted` today, describe/score
+    when Phase 3 lands — and a licence is a statement about an ENUMERATION.
+
+    The status filter alone is not the guard people assume it is: a succeeded row of
+    some other step, carrying `inventory_scope='complete'` because it was copied from
+    the target, would licence marking without anything ever having been enumerated.
+    Only `step='fetch'` says "this row is a fetch of the whole inventory".
+    """
+    connect = make_connect(tmp_path)
+    seeded = run(
+        scheduler(connect).run(
+            kind=RunKind.FULL_DIRECT,
+            plan=plan_of(FakeAdapter("board", instances=("acme",), body=fast(3))),
+        )
+    )
+    assert absent_requisitions(connect) == set()
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        runstore.create_pipeline_run(
+            conn,
+            run_uid="later",
+            kind=str(RunKind.FULL_DIRECT),
+            requested_at="2026-08-04T00:00:00+00:00",
+            started_at="2026-08-04T00:00:00+00:00",
+        )
+        # A SUCCEEDED, COMPLETE-scope row for the same source instance that is not a
+        # fetch: it enumerated nothing, and delivered nothing.
+        runstore.create_source_run(
+            conn,
+            source_run_id="score-1",
+            run_uid="later",
+            source="board:acme",
+            attempt=1,
+            step="score",
+            requested_at="2026-08-04T00:00:00+00:00",
+            started_at="2026-08-04T00:00:00+00:00",
+            inventory_scope="complete",
+        )
+        runstore.finish_source_run(
+            conn,
+            source_run_id="score-1",
+            status="succeeded",
+            finished_at="2026-08-04T00:00:01+00:00",
+        )
+        conn.commit()
+        scopes = runstore.successful_source_scopes(conn, "later")
+        conn.execute("BEGIN IMMEDIATE")
+        report = runstore.apply_run_presence(
+            conn, run_uid="later", at="2026-08-04T00:00:02+00:00"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert scopes == [], "a non-fetch attempt was offered as an absence licence"
+    assert report["licensed_sources"] == 0
+    assert report["marked_absent"] == 0
+    assert absent_requisitions(connect) == set(), (
+        "postings were retired by a run that never enumerated anything"
+    )
+    assert all(
+        row["last_seen_run_uid"] == seeded.run_uid
+        for row in presence_by_requisition(connect).values()
+    )
+
+
+def test_the_latest_succeeded_attempt_of_a_source_is_the_one_that_licenses(tmp_path):
+    """Last attempt wins, not first — the difference is a whole inventory.
+
+    Two succeeded attempts for one source can only come from a resume. The earlier
+    one's `run_postings` rows have been re-pointed at the attempt that finished, so
+    honouring it would licence marking against an inventory it no longer owns: every
+    posting the later attempt delivered would read as unseen and be retired.
+    """
+    connect = make_connect(tmp_path)
+    seeded = run(
+        scheduler(connect).run(
+            kind=RunKind.FULL_DIRECT,
+            plan=plan_of(FakeAdapter("board", instances=("acme",), body=fast(3))),
+        )
+    )
+    live = set(presence_by_requisition(connect))
+    assert len(live) == 3
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        runstore.create_pipeline_run(
+            conn,
+            run_uid="resumed",
+            kind=str(RunKind.FULL_DIRECT),
+            requested_at="2026-08-04T00:00:00+00:00",
+            started_at="2026-08-04T00:00:00+00:00",
+        )
+        # Attempt 1 succeeded having delivered NOTHING (it is the stale one).
+        # Attempt 2 succeeded and owns the run's membership rows.
+        for attempt, source_run_id in ((1, "empty-1"), (2, "full-2")):
+            runstore.create_source_run(
+                conn,
+                source_run_id=source_run_id,
+                run_uid="resumed",
+                source="board:acme",
+                attempt=attempt,
+                requested_at="2026-08-04T00:00:00+00:00",
+                started_at="2026-08-04T00:00:00+00:00",
+                inventory_scope="complete",
+            )
+        posting_ids = [
+            r["posting_id"]
+            for r in rows(connect, "SELECT posting_id FROM run_postings WHERE run_uid=?",
+                          (seeded.run_uid,))
+        ]
+        for posting_id in posting_ids:
+            conn.execute(
+                "INSERT INTO run_postings (run_uid, posting_id, source_run_id, present, "
+                "first_seen_in_run, recorded_at, membership_kind) "
+                "VALUES ('resumed', ?, 'full-2', 1, 0, '2026-08-04T00:00:01+00:00', 'snapshot')",
+                (posting_id,),
+            )
+        for source_run_id in ("empty-1", "full-2"):
+            runstore.finish_source_run(
+                conn,
+                source_run_id=source_run_id,
+                status="succeeded",
+                finished_at="2026-08-04T00:00:02+00:00",
+            )
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        report = runstore.apply_run_presence(
+            conn, run_uid="resumed", at="2026-08-04T00:00:03+00:00"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert report["licensed_sources"] == 1
+    assert [s["source_run_id"] for s in report["sources"]] == ["full-2"], (
+        "an earlier succeeded attempt licensed absence against the later one's inventory"
+    )
+    assert report["marked_absent"] == 0
+    assert absent_requisitions(connect) == set()
+
+
+def test_only_a_settled_run_may_run_the_presence_pass(tmp_path):
+    """The licence set, pinned exactly.
+
+    `succeeded` and `partial` are in it because per-source failure isolation is the
+    whole design: a healthy board must still retire its own closed requisitions on a
+    day another board 404s. Everything else is out, and each for its own reason —
+    `cancelled` stops targets mid-enumeration, `failed` means the report cannot be
+    trusted to describe the run, `interrupted` means a process died holding evidence
+    nobody has read. Adding any of them here is a one-word change that would let a
+    run mark postings absent on evidence it never finished collecting.
+    """
+    from backend.sources.scheduler import PRESENCE_PASS_RUN_STATUSES
+
+    assert set(PRESENCE_PASS_RUN_STATUSES) == {"succeeded", "partial"}
+
+    connect = make_connect(tmp_path)
+    seeded = run(
+        scheduler(connect).run(
+            kind=RunKind.FULL_DIRECT,
+            plan=plan_of(FakeAdapter("board", instances=("acme",), body=fast(3))),
+        )
+    )
+    before = presence_by_requisition(connect)
+
+    # A `failed` run with a HEALTHY writer, which is the only shape that tests the
+    # status rule itself: a dead writer would decline the pass for its own separate
+    # reason and the rule under test would never be consulted. The run below is
+    # failed because the scheduler's own target runner raised — and its other target
+    # is a COMPLETE board that succeeded having delivered nothing, so if the pass
+    # were licensed here it would retire every posting seeded above.
+    original_run_target = Scheduler._run_target
+
+    async def exploding_run_target(self, *, target, **kwargs):
+        if target.source_key == "boom":
+            raise RuntimeError("a bug in the scheduler's own target runner")
+        return await original_run_target(self, target=target, **kwargs)
+
+    Scheduler._run_target = exploding_run_target
+    try:
+        failed = run(
+            scheduler(connect).run(
+                kind=RunKind.FULL_DIRECT,
+                plan=plan_of(
+                    FakeAdapter("board", instances=("acme",), body=fast(0)),
+                    FakeAdapter("boom", instances=("x",), body=fast(1)),
+                ),
+            )
+        )
+    finally:
+        Scheduler._run_target = original_run_target
+
+    assert failed.status == "failed"
+    assert presence_report(connect, failed.run_uid) is None, (
+        "a failed run reached the presence pass"
+    )
+    assert absent_requisitions(connect) == set(), (
+        "a failed run retired postings on evidence it never finished collecting"
+    )
+    after = presence_by_requisition(connect)
+    assert {k: v["last_seen_run_uid"] for k, v in after.items()} == {
+        k: v["last_seen_run_uid"] for k, v in before.items()
+    }
+    assert all(v["last_seen_run_uid"] == seeded.run_uid for v in after.values())
+
+
+def test_a_presence_pass_that_rolled_back_reports_nothing(tmp_path):
+    """`MarkPresence.apply` publishes its counts from INSIDE the transaction.
+
+    That is what lets the run's terminal row carry them, and it is also why the
+    object holds a report whether or not the transaction went on to commit. If the
+    commit then rolls back, returning that report would write a description of
+    markings that are not in the database into the run's own evidence — the one
+    place a later reader is entitled to trust.
+    """
+    import backend.sources.writer as writer_module
+    from backend.sources.scheduler import Scheduler, SchedulerConfig
+
+    connect = make_connect(tmp_path)
+    seeded = run(
+        scheduler(connect).run(
+            kind=RunKind.FULL_DIRECT,
+            plan=plan_of(FakeAdapter("board", instances=("acme",), body=fast(3))),
+        )
+    )
+
+    def apply_then_roll_back(self, batch):
+        """Exactly the shape being defended against: every op applies, then the
+        transaction is undone."""
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for op in batch:
+                op.apply(conn)
+        finally:
+            conn.rollback()
+        raise RuntimeError("commit failed after the ops had already applied")
+
+    original = writer_module.SqliteWriter._commit_once
+
+    async def scenario():
+        writer = writer_module.SqliteWriter(connect)
+        await writer.start()
+        sched = Scheduler(connect, config=SchedulerConfig(**FAST_RETRY))
+        writer_module.SqliteWriter._commit_once = apply_then_roll_back
+        try:
+            report = await sched._settle_presence(
+                writer,
+                run_uid=seeded.run_uid,
+                at="2026-08-04T00:00:00+00:00",
+                run_status="succeeded",
+                timeout=2.0,
+            )
+        finally:
+            writer_module.SqliteWriter._commit_once = original
+            await writer.aclose(drain=False)
+        return report
+
+    report = run(scenario())
+
+    assert report is None, "a rolled-back presence pass reported its markings anyway"
+    # And nothing was actually marked, which is what the report would have claimed.
+    assert absent_requisitions(connect) == set()
+    assert all(
+        row["last_seen_run_uid"] == seeded.run_uid
+        for row in presence_by_requisition(connect).values()
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Idempotency
 # --------------------------------------------------------------------------- #

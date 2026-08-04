@@ -136,11 +136,15 @@ class RecordingTransport:
         self.in_flight = 0
         self.max_in_flight = 0
         self.hosts = []
+        #: When each request reached the inner transport, which is what pacing is a
+        #: statement about (arrivals at the host, not departures from it).
+        self.started_at = []
 
     async def send(self, request):
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         self.hosts.append(request.host)
+        self.started_at.append(asyncio.get_running_loop().time())
         try:
             await asyncio.sleep(0)
             return HttpResponse(status=200, url=request.url)
@@ -190,3 +194,63 @@ def test_paced_transport_applies_the_minimum_interval_per_host():
 
     elapsed = asyncio.run(scenario())
     assert elapsed >= 0.09  # first request is free, the next two each wait
+
+
+def test_interval_pacing_still_spaces_requests_when_the_host_allows_several():
+    """Pacing must not evaporate the moment a host is allowed more than one slot.
+
+    Reading a "last request at" stamp inside the gate is what made it evaporate: four
+    callers admitted at once all read the same stamp, all slept the same remainder,
+    and all hit the host together — an interval that paced nothing, on exactly the
+    sources whose descriptors ask for both concurrency and politeness.
+    """
+    inner = RecordingTransport()
+    paced = PacedTransport(inner, min_interval_seconds=0.05, per_host_concurrency=4)
+
+    async def scenario():
+        await asyncio.gather(
+            *[paced.send(HttpRequest(url=f"https://one.example/{i}")) for i in range(4)]
+        )
+
+    asyncio.run(scenario())
+
+    assert len(inner.started_at) == 4
+    times = sorted(inner.started_at)
+    # Asserted on the SPAN rather than on each gap: a per-gap threshold a hair under
+    # the interval is a 5ms differential away from flaking, while the span over four
+    # requests is ~0.15s paced and ~0s unpaced — a difference no scheduling jitter
+    # can close.
+    span = times[-1] - times[0]
+    assert span >= 0.12, f"concurrent requests were not paced: {times}"
+    assert all(b - a >= 0.04 for a, b in zip(times, times[1:])), f"uneven pacing: {times}"
+
+
+def test_a_request_is_paced_from_when_the_previous_one_started():
+    """The slot is claimed at the start of a request, not stamped at its end, so the
+    interval is the gap between requests arriving at the host rather than a gap
+    appended to however long the host took to answer."""
+
+    class SlowTransport(RecordingTransport):
+        delay = 0.08
+
+        async def send(self, request):
+            await asyncio.sleep(self.delay)
+            return await super().send(request)
+
+    inner = SlowTransport()
+    paced = PacedTransport(inner, min_interval_seconds=0.05, per_host_concurrency=1)
+    inner.delay = 0.08
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        for i in range(3):
+            await paced.send(HttpRequest(url=f"https://one.example/{i}"))
+        return loop.time() - started
+
+    elapsed = asyncio.run(scenario())
+    # Three 0.08s requests dominate; each 0.05s interval is already spent by the time
+    # its request returns, so pacing must add nothing (~0.24s). Stamping at
+    # completion instead would append an interval to each of the last two (~0.34s).
+    # The threshold sits midway, ~50ms clear of either outcome.
+    assert elapsed < 0.29, f"pacing was appended to the response time: {elapsed:.3f}s"

@@ -69,6 +69,7 @@ __all__ = [
     "SOURCE_REQ_ALIAS_KIND",
     "SOURCE_RUN_STEP",
     "TERMINAL_SOURCE_RUN_STATUSES",
+    "UNATTEMPTED_SOURCE_RUN_STEP",
     "append_run_events",
     "apply_run_presence",
     "canonical_json",
@@ -82,6 +83,7 @@ __all__ = [
     "new_uid",
     "next_event_sequence",
     "posting_id_for_claim",
+    "record_unattempted_source_run",
     "recover_orphans",
     "refresh_presence",
     "require_canonical_schema",
@@ -100,6 +102,17 @@ __all__ = [
 #: naming it explicitly keeps the UNIQUE(run_uid, source, step, attempt) key
 #: meaningful if Phase 3 adds `describe`/`score` steps against the same run.
 SOURCE_RUN_STEP = "fetch"
+
+#: `source_runs.step` for a target that reached a terminal state WITHOUT ever
+#: attempting a fetch — cancelled while queued at a gate, or never spawned because
+#: the cancel arrived first. It is a separate step, not a fetch attempt, and that is
+#: the whole point: every fetch-attempt query in this module is bounded to
+#: `step = SOURCE_RUN_STEP`, so a row recorded here can never consume an attempt
+#: number a resume still needs (`max_attempt_by_source`), licence absence
+#: (`successful_source_scopes`), or degrade a source's freshness
+#: (`source_instance_freshness`). The `attempt` column is 1 because the schema
+#: requires `attempt >= 1`; it is a placeholder, never an attempt count.
+UNATTEMPTED_SOURCE_RUN_STEP = "unattempted"
 
 #: The alias kind that carries a source instance's own requisition identity. It is
 #: the ONLY evidence that says "this posting belongs to `greenhouse:anthropic`",
@@ -291,6 +304,55 @@ def create_source_run(
         (source_run_id, run_uid, source, step, attempt, status, deadline_at, requested_at,
          started_at, inventory_scope, _json_or_none(metadata)),
     )
+
+
+def record_unattempted_source_run(
+    conn: sqlite3.Connection,
+    *,
+    source_run_id: str,
+    run_uid: str,
+    source: str,
+    status: str,
+    requested_at: str | None = None,
+    finished_at: str | None = None,
+    inventory_scope: str | None = None,
+    error: object = None,
+    metadata: object = None,
+) -> bool:
+    """Record a planned target that settled without ever attempting a fetch.
+
+    A target cancelled while queued at a gate — or never spawned at all, because the
+    cancel arrived before the run's first tick — has no timing of its own to record,
+    but it is still part of the plan the run claims to describe. Without a row here
+    it exists only in the in-memory run report, and a later reader of `source_runs`
+    cannot tell "this board was never asked" from "this board was never planned".
+
+    The row is terminal on creation (`started_at` stays NULL: nothing started) and is
+    written under `UNATTEMPTED_SOURCE_RUN_STEP`, which is what keeps it out of the
+    fetch-attempt sequence entirely. `attempt` is 1 only because the schema constrains
+    the column to `>= 1`; no query reads it.
+
+    `ON CONFLICT ... DO NOTHING` on the one constraint that may legitimately collide,
+    so a run and a later resume of it that both cancel the same target before it
+    starts keep one row rather than tripping UNIQUE(run_uid, source, step, attempt).
+    The first row is the one kept: it names the earlier instant at which the target
+    was known not to have run. Deliberately NOT `INSERT OR IGNORE`, which would also
+    swallow a NOT NULL or CHECK violation and report it as "already existed" — a
+    schema mismatch has to surface as a writer failure, not as silently missing
+    evidence. Returns True when a row was actually inserted, which the caller needs
+    in order to decide whether an event may reference `source_run_id`.
+    """
+    cursor = conn.execute(
+        "INSERT INTO source_runs "
+        "(source_run_id, run_uid, source, step, attempt, status, requested_at, "
+        "finished_at, inventory_scope, error_json, metadata_json) "
+        "VALUES (?,?,?,?,1,?,?,?,?,?,?) "
+        "ON CONFLICT (run_uid, source, step, attempt) DO NOTHING",
+        (source_run_id, run_uid, source, UNATTEMPTED_SOURCE_RUN_STEP, status,
+         requested_at, finished_at, inventory_scope,
+         _json_or_none(error), _json_or_none(metadata)),
+    )
+    return cursor.rowcount > 0
 
 
 def update_source_run_progress(
@@ -812,20 +874,32 @@ def latest_checkpoint_json(conn: sqlite3.Connection, *, run_uid: str, source: st
     within-run decision.
     """
     row = conn.execute(
+        # `step`-bounded like every other fetch-attempt query here: a cursor describes
+        # progress through an ENUMERATION, and a row of some other step against the
+        # same source is not one, however recent its attempt number looks.
         "SELECT checkpoint_json FROM source_runs "
-        "WHERE run_uid=? AND source=? AND checkpoint_json IS NOT NULL "
+        "WHERE run_uid=? AND source=? AND step=? AND checkpoint_json IS NOT NULL "
         "ORDER BY attempt DESC LIMIT 1",
-        (run_uid, source),
+        (run_uid, source, SOURCE_RUN_STEP),
     ).fetchone()
     return row["checkpoint_json"] if row else None
 
 
 def max_attempt_by_source(conn: sqlite3.Connection, run_uid: str) -> dict[str, int]:
+    """Highest FETCH attempt number each target reached inside one run.
+
+    Bounded to `step = SOURCE_RUN_STEP`, which is what a resume's numbering depends
+    on: rows written under another step — `UNATTEMPTED_SOURCE_RUN_STEP` today, the
+    describe/score steps Phase 3 adds to the same table tomorrow — are not fetch
+    attempts, and counting them would make the next real attempt skip a number and
+    claim an attempt that never happened.
+    """
     return {
         row["source"]: int(row["n"])
         for row in conn.execute(
-            "SELECT source, MAX(attempt) AS n FROM source_runs WHERE run_uid=? GROUP BY source",
-            (run_uid,),
+            "SELECT source, MAX(attempt) AS n FROM source_runs "
+            "WHERE run_uid=? AND step=? GROUP BY source",
+            (run_uid, SOURCE_RUN_STEP),
         )
     }
 
@@ -1188,12 +1262,14 @@ def resumable_runs(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict[st
         for row in conn.execute(
             "SELECT r.run_uid, r.kind, r.status, r.requested_at, r.started_at, "
             "  (SELECT COUNT(*) FROM source_runs s "
-            "     WHERE s.run_uid=r.run_uid AND s.status='interrupted') AS interrupted_attempts, "
+            "     WHERE s.run_uid=r.run_uid AND s.step=? AND s.status='interrupted') "
+            "     AS interrupted_attempts, "
             "  (SELECT COUNT(*) FROM source_runs s "
-            "     WHERE s.run_uid=r.run_uid AND s.status='succeeded') AS succeeded_attempts "
+            "     WHERE s.run_uid=r.run_uid AND s.step=? AND s.status='succeeded') "
+            "     AS succeeded_attempts "
             "FROM pipeline_runs r WHERE r.status='interrupted' "
             "ORDER BY COALESCE(r.started_at, r.requested_at) DESC LIMIT ?",
-            (limit,),
+            (SOURCE_RUN_STEP, SOURCE_RUN_STEP, limit),
         )
     ]
 
@@ -1226,8 +1302,9 @@ def resume_plan(conn: sqlite3.Connection, run_uid: str) -> dict[str, object]:
         row["source"]: row["checkpoint_json"]
         for row in conn.execute(
             "SELECT source, checkpoint_json FROM source_runs "
-            "WHERE run_uid=? AND checkpoint_json IS NOT NULL ORDER BY source, attempt",
-            (run_uid,),
+            "WHERE run_uid=? AND step=? AND checkpoint_json IS NOT NULL "
+            "ORDER BY source, attempt",
+            (run_uid, SOURCE_RUN_STEP),
         )
     }
     return {

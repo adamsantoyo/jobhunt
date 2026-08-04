@@ -217,10 +217,18 @@ class ExecutionMode(StrEnum):
     ASYNC_INPROCESS: cooperative async in the scheduler's event loop. The
         default, and the only mode that may hold the loop.
     SUBPROCESS: the work blocks (JobSpy calls into pandas and blocks for
-        minutes). The scheduler runs it in an isolated cancellable subprocess
-        that streams `NormalizedPosting.to_json_dict()` lines back over stdout;
-        the parent re-hydrates them with `from_json_dict` and yields them. This
-        is why the record type is required to be JSON round-trippable.
+        minutes). The ADAPTER ITSELF must fork an isolated cancellable
+        subprocess that streams `NormalizedPosting.to_json_dict()` lines back
+        over stdout; the parent re-hydrates them with `from_json_dict` and
+        yields them. This is why the record type is required to be JSON
+        round-trippable. The scheduler does NOT provide this isolation — the
+        mode is a declaration the adapter must honor, not a service it
+        receives (deliberate Phase 2 decision, 2026-08-04): an adapter whose
+        fetch body blocks in-process stalls every other source's deadline
+        regardless of what it declares. Any new SUBPROCESS adapter must ship a
+        scheduler-level test proving its child is cancellable and reaped, as
+        JobSpy's does (grep for
+        test_the_real_jobspy_subprocess_adapter_is_cancellable).
     PUSH: no transport at all. Records arrive from outside the scheduler
         (manual MCP import) as `InboundPayload`s on the context.
     """
@@ -716,7 +724,15 @@ class SourceTarget:
     instance_key: str = ""
     label: str = ""
     params: Mapping[str, JSONValue] = field(default_factory=dict, hash=False)
-    inventory_scope: InventoryScope = InventoryScope.COMPLETE
+    #: PARTIAL by default, and that direction is deliberate. COMPLETE is the value
+    #: that licenses Phase 2.4 to mark every posting this instance owns and did not
+    #: deliver as absent, so a target that forgot to declare a scope would fail OPEN:
+    #: one omitted keyword argument, and a search adapter retires a board's whole
+    #: inventory. Defaulting to PARTIAL makes the omission cost a marking that does
+    #: not happen (postings linger, visibly stale) instead of one that should never
+    #: have happened. Every adapter states its scope explicitly regardless — see the
+    #: registry-wide pin in `test_source_contract.py`.
+    inventory_scope: InventoryScope = InventoryScope.PARTIAL
     host: str | None = None
     deadline_seconds: float | None = None
 
@@ -1135,8 +1151,11 @@ class SourceDescriptor:
     #: Whether records arrive with a usable description already attached, so
     #: Phase 3.2 can skip the description fetch.
     description_inline: bool = False
-    #: Default for targets that do not override it. See `InventoryScope`.
-    default_inventory_scope: InventoryScope = InventoryScope.COMPLETE
+    #: Default for targets that do not override it. See `InventoryScope`, and
+    #: `SourceTarget.inventory_scope` for why the default is the scope that licenses
+    #: nothing: a descriptor that omits this must not thereby licence mass absence
+    #: marking for every target it plans.
+    default_inventory_scope: InventoryScope = InventoryScope.PARTIAL
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_key", (self.source_key or "").strip())
@@ -1166,6 +1185,20 @@ class SourceDescriptor:
         if self.max_concurrent_targets is not None and self.max_concurrent_targets < 1:
             raise ConfigError(
                 f"{self.source_key}: max_concurrent_targets must be >= 1 or None",
+                source_key=self.source_key,
+            )
+        if (
+            self.category in (SourceCategory.AGGREGATOR, SourceCategory.MANUAL)
+            and self.default_inventory_scope is InventoryScope.COMPLETE
+        ):
+            # An aggregator answers a query and a manual import is whatever someone
+            # pushed; neither can ever mean "these are all of them", so COMPLETE here
+            # is not a tuning choice that happens to be wrong — it is a category
+            # error, and the only thing it can produce is the mass retirement of
+            # postings the source never claimed to enumerate.
+            raise ConfigError(
+                f"{self.source_key}: a {self.category} source may not declare "
+                "default_inventory_scope=COMPLETE; it cannot enumerate an inventory",
                 source_key=self.source_key,
             )
 

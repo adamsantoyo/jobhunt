@@ -39,7 +39,9 @@ client can never be told about a state transition that a crash would erase.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -50,11 +52,13 @@ from .contract import NormalizedPosting
 
 __all__ = [
     "CreateSourceRun",
+    "absorb_cancel",
     "EmitEvents",
     "FinishRun",
     "FinishSourceRun",
     "MarkPresence",
     "RecordBatch",
+    "RecordUnattemptedSourceRun",
     "RunEvent",
     "SqliteWriter",
     "StartRun",
@@ -66,6 +70,39 @@ __all__ = [
 
 class WriterError(RuntimeError):
     """The writer task died. Every subsequent submit raises this."""
+
+
+@contextlib.contextmanager
+def absorb_cancel():
+    """Swallow whatever the block raises, and un-count it if it was a cancellation.
+
+    `contextlib.suppress(BaseException)` swallows the exception but not asyncio's
+    BOOKKEEPING: a task that consumed a `CancelledError` keeps its `cancelling()`
+    count elevated, and the next `asyncio.timeout` in that task — or an outer one
+    that then sees a cancellation it did not raise — reports a bare `CancelledError`
+    where its caller is catching `TimeoutError`. `uncancel()` is how a deliberate
+    swallow is declared to asyncio.
+
+    Used by every cleanup step that must finish even while its task is being
+    cancelled from outside: the writer's own close, and the run's cleanup path in
+    `scheduler._execute`. Non-cancellation exceptions are suppressed exactly as
+    before, because a cleanup step that fails must not prevent the steps after it.
+
+    `uncancel()` is keyed on CATCHING the `CancelledError`, not on the count moving
+    while the block ran: the cancel is routinely REQUESTED before the block is
+    entered and only DELIVERED inside it, and a before/after comparison sees no
+    change in exactly that case. An `asyncio.timeout` inside the block does its own
+    conversion and its own uncancel, and raises `TimeoutError` — a different type,
+    which lands in the second clause and is not double-counted here.
+    """
+    try:
+        yield
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+    except BaseException:  # noqa: BLE001 - deliberate: see the docstring
+        pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +218,52 @@ class CreateSourceRun:
             inventory_scope=self.inventory_scope,
             metadata=self.metadata,
         )
+
+
+@dataclass(slots=True)
+class RecordUnattemptedSourceRun:
+    """One terminal `source_runs` row for a target that never attempted a fetch.
+
+    Separate from `CreateSourceRun` because it is the opposite kind of row: created
+    already settled, with no timing, under `UNATTEMPTED_SOURCE_RUN_STEP` so that it
+    consumes no fetch attempt number (see `runstore.record_unattempted_source_run`).
+
+    Not frozen, for the same reason `MarkPresence` is not: the insert is an
+    `INSERT OR IGNORE`, and when it is ignored the row this op's events reference
+    belongs to an earlier op, so the events are ASSIGNED away — assignment, never
+    append, so a busy-database rollback that replays the batch cannot double them.
+    Emitting them anyway would point `run_events.source_run_id` at an id no row
+    carries, which the foreign key would refuse and the whole transaction would die
+    on.
+    """
+
+    source_run_id: str
+    run_uid: str
+    source: str
+    status: str
+    requested_at: str | None = None
+    finished_at: str | None = None
+    inventory_scope: str | None = None
+    error: object = None
+    metadata: object = None
+    events: tuple[RunEvent, ...] = ()
+
+    def apply(self, conn: sqlite3.Connection) -> bool:
+        inserted = runstore.record_unattempted_source_run(
+            conn,
+            source_run_id=self.source_run_id,
+            run_uid=self.run_uid,
+            source=self.source,
+            status=self.status,
+            requested_at=self.requested_at,
+            finished_at=self.finished_at,
+            inventory_scope=self.inventory_scope,
+            error=self.error,
+            metadata=self.metadata,
+        )
+        if not inserted:
+            self.events = ()
+        return inserted
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,9 +405,17 @@ class WriterStats:
     max_queue_depth: int = 0
     max_ops_per_transaction: int = 0
     busy_retries: int = 0
-    #: Deferred submits refused because the writer had already failed. Non-zero
-    #: means some evidence from a cancelled target did not land.
+    #: Deferred submits refused because the writer had already failed, plus anything
+    #: abandoned in the queue of a writer task that died. Non-zero means some evidence
+    #: from a cancelled target did not land.
     dropped: int = 0
+    #: Times `drain()` gave up before the queue emptied. Non-zero means the reported
+    #: per-target counts may be short of what actually committed.
+    drain_timeouts: int = 0
+    #: Connections `aclose` declined to close because a commit was still running on a
+    #: worker thread when its bound expired. Non-zero means one sqlite handle was
+    #: deliberately leaked in preference to closing it under a live statement.
+    unclosed_connections: int = 0
 
 
 _SENTINEL = object()
@@ -341,6 +432,7 @@ class SqliteWriter:
         max_ops_per_transaction: int = 32,
         busy_timeout_ms: int = 10_000,
         on_commit: Callable[[Sequence[RunEvent]], None] | None = None,
+        close_lock_timeout_seconds: float = 5.0,
     ) -> None:
         if queue_size < 1:
             raise ValueError("queue_size must be >= 1")
@@ -356,6 +448,17 @@ class SqliteWriter:
         self._pending: set[asyncio.Task] = set()
         self._sequences: dict[str, int] = {}
         self._failure: BaseException | None = None
+        #: True once the writer task has stopped on its own terms — the sentinel, or
+        #: a recorded commit failure. It is what tells `_reap` that a finished task
+        #: is a clean stop rather than a death nobody noticed.
+        self._stopped = False
+        #: Held by whichever thread is touching the connection: the worker thread for
+        #: the duration of a transaction, the event-loop thread while closing. It is
+        #: the handshake that makes `aclose` safe — `task.cancel()` does not stop a
+        #: `to_thread` worker, and `check_same_thread=False` means sqlite3 will not
+        #: stop the two of them from using one connection at once.
+        self._commit_lock = threading.Lock()
+        self._close_lock_timeout = max(0.0, close_lock_timeout_seconds)
         self.stats = WriterStats()
 
     # -- lifecycle --------------------------------------------------------- #
@@ -376,46 +479,171 @@ class SqliteWriter:
         runstore.require_canonical_schema(conn)
         return conn
 
-    async def aclose(self, *, drain: bool = True) -> None:
+    async def aclose(self, *, drain: bool = True, timeout: float | None = None) -> None:
         """Flush everything already submitted, then stop and close the connection.
 
         `drain=True` waits for the deferred `submit_soon` puts first, so records a
         cancelled target managed to hand over still land. `drain=False` is the
         panic path: stop taking work and close.
+
+        Every step is bounded by `timeout` and the release happens in a `finally`
+        that contains no `await`, because this is the ONLY place the writer task and
+        its sqlite connection are given up. The caller is a run's cleanup path that
+        may itself be under cancellation, and a close that got skipped — or that was
+        interrupted halfway — would leak a task and a file handle for the life of the
+        process. `timeout=None` keeps the original unbounded waits, for a caller that
+        owns the writer directly and has no run to protect.
         """
-        if self._task is None:
+        task = self._task
+        if task is None:
             return
-        if drain:
-            await self.drain()
         try:
-            await self._queue.put(_SENTINEL)
-            await self._task
+            if drain:
+                await self.drain(timeout=timeout)
+            # put_nowait, not an awaited put: a queue that is still full here is one
+            # nothing is consuming, and parking on it would be the unbounded wait
+            # this method exists to rule out. The cancel below stops that writer.
+            with contextlib.suppress(asyncio.QueueFull):
+                self._queue.put_nowait(_SENTINEL)
+            with absorb_cancel():
+                # asyncio.wait rather than `await task`: it neither cancels the task
+                # on timeout nor re-raises its exception, which `_reap` records.
+                await asyncio.wait({task}, timeout=timeout)
         finally:
+            self._reap()
             self._task = None
+            if not task.done():
+                # Synchronous, so the task cannot outlive this call even if we are
+                # cancelled on this very line.
+                task.cancel()
             conn, self._conn = self._conn, None
             if conn is not None:
-                await asyncio.to_thread(conn.close)
+                self._close_connection(conn)
 
-    async def drain(self) -> None:
-        """Block until everything submitted so far has committed.
+    def _close_connection(self, conn: sqlite3.Connection) -> None:
+        """Release the connection without racing a commit still on a worker thread.
+
+        Closed inline rather than on a worker thread because an `await` in `aclose`'s
+        `finally` can be interrupted by the cancellation that path exists to survive,
+        and the connection would then never be released at all.
+
+        Inline is only safe with the commit lock, though: `task.cancel()` above does
+        NOT stop a `to_thread` worker, so a transaction can still be executing on this
+        exact connection, and CPython's sqlite3 holds no per-connection lock to make
+        that merely an error rather than a data race. The acquire is blocking and
+        bounded — bounded because a stuck commit must not wedge the event loop in a
+        `finally`, blocking because there is nothing here that may await. In the
+        normal path the writer task has already finished and the lock is free, so this
+        costs nothing.
+
+        If the bound expires the connection is deliberately LEAKED rather than closed
+        under a live statement: one file handle in a process that is already in
+        trouble is a strictly better outcome than a use-after-free in a C extension,
+        and `stats.unclosed_connections` says it happened.
+        """
+        if not self._commit_lock.acquire(timeout=self._close_lock_timeout):
+            self.stats.unclosed_connections += 1
+            return
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - teardown; a close failure is not actionable
+            pass
+        finally:
+            self._commit_lock.release()
+
+    async def drain(self, *, timeout: float | None = None) -> bool:
+        """Block until everything submitted so far has committed. True if it did.
 
         Two waits, in order: the deferred `submit_soon` puts must reach the queue,
-        then the queue must empty. After this returns, every `RecordBatch`
+        then the queue must empty. After this returns True, every `RecordBatch`
         outcome_sink is complete, which is what lets the scheduler report exact
         per-target counts instead of counts that are short by the last batch.
+
+        Bounded, and that bound is load-bearing. `_loop` records a failure for a
+        commit that raised, which is the only failure it can see; a writer task that
+        died some other way — cancelled with the loop parked on `queue.get`, killed
+        by an error in the loop itself — leaves a queue nobody will ever consume, and
+        an unbounded `join()` on it never returns. `_reap` converts that death into a
+        recorded failure and abandons the queue; `timeout` is the backstop for
+        everything else, including a commit that is merely pathologically slow.
         """
         if self._task is None:
+            return True
+        try:
+            async with asyncio.timeout(timeout):
+                self._reap()
+                if self._pending:
+                    await asyncio.gather(*tuple(self._pending), return_exceptions=True)
+                # Again after the deferred puts land: they may have been parked on a
+                # queue whose consumer had already died, and they are then part of
+                # what has to be abandoned rather than waited for.
+                self._reap()
+                if self._task.done():
+                    return False
+                await self._queue.join()
+        except TimeoutError:
+            self.stats.drain_timeouts += 1
+            return False
+        return True
+
+    def _reap(self) -> None:
+        """Adopt a writer task that died without recording a failure, and give up on
+        whatever is still queued for it.
+
+        Every producer's contract is "submit raises once the writer is dead". A task
+        that died outside `_commit` never set `_failure`, so without this the run
+        would keep submitting into a queue nobody reads and then wait forever for it
+        to empty. Abandoning the queue is what releases producers already parked in
+        `put` and any `join()` waiting on it.
+        """
+        task = self._task
+        if task is None or not task.done():
             return
-        if self._pending:
-            await asyncio.gather(*tuple(self._pending), return_exceptions=True)
-        await self._queue.join()
+        if self._failure is None and not self._stopped:
+            if task.cancelled():
+                self._failure = WriterError("sqlite writer task was cancelled")
+            else:
+                exc = task.exception()
+                self._failure = exc if exc is not None else WriterError(
+                    "sqlite writer task exited before the writer was closed"
+                )
+        if self._failure is not None:
+            self._abandon()
+
+    def _abandon(self) -> None:
+        """Discard everything queued for a writer that will never consume it again.
+
+        Counted as dropped, so "the writer died and N operations were lost" stays
+        visible rather than inferred — the same accounting `_drain_and_drop` keeps
+        for the failure the writer task noticed itself.
+        """
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self._queue.task_done()
+            if item is not _SENTINEL:
+                self.stats.dropped += 1
 
     # -- submission -------------------------------------------------------- #
     async def submit(self, op: WriteOp) -> None:
-        """Enqueue, parking on a full queue. This is the backpressure point."""
+        """Enqueue, parking on a full queue. This is the backpressure point.
+
+        Checked for a dead writer on BOTH sides of the put, because the put is an
+        await and the writer can die while a producer is parked on it. Waking that
+        producer is exactly what abandoning the queue does, and it wakes it into a
+        free slot: `_abandon`'s loop runs to completion without yielding, finds the
+        queue empty, and stops; only then does the woken putter resume and hand over
+        an operation nothing will ever consume. Without the second check the caller
+        is told the handoff succeeded. The check re-runs `_reap`, so the operation
+        just enqueued is dropped and counted before the raise rather than sitting in
+        the queue until some later caller notices it.
+        """
         self._raise_if_failed()
         self.stats.submitted += 1
         await self._queue.put(op)
+        self._raise_if_failed()
         self.stats.max_queue_depth = max(self.stats.max_queue_depth, self._queue.qsize())
 
     def submit_soon(self, op: WriteOp) -> asyncio.Task | None:
@@ -430,22 +658,54 @@ class SqliteWriter:
         block already handling a failure, and raising there would replace a
         recorded failure with an unrelated one. The loss is counted in `stats.dropped`.
         """
-        if self._failure is not None:
+        self._reap()
+        if self._failure is not None or self._stopped:
             self.stats.dropped += 1
             return None
         self.stats.submitted += 1
-        task = asyncio.create_task(self._queue.put(op))
+        task = asyncio.create_task(self._deferred_put(op))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
         return task
 
+    async def _deferred_put(self, op: WriteOp) -> None:
+        """A `submit_soon` put, plus the same post-put death check `submit` makes.
+
+        A deferred put parks on a full queue exactly as an awaited one does, and is
+        woken the same way by a queue being abandoned. `submit_soon` promises not to
+        raise — its callers are `finally` blocks already handling a failure — so the
+        loss is counted here instead, at the moment it happens rather than whenever
+        the next `_reap` happens to find the operation still sitting in the queue.
+        """
+        await self._queue.put(op)
+        self._reap()
+
     def _raise_if_failed(self) -> None:
+        # A writer task that died outside `_commit` is a failure too; noticing it
+        # here is what stops a producer from filling a queue nobody will read.
+        self._reap()
         if self._failure is not None:
             raise WriterError("sqlite writer failed") from self._failure
+        if self._stopped:
+            # A cleanly stopped writer is as unable to commit as a dead one. Without
+            # this, a late submit lands in a queue nobody will ever read again and
+            # reports success — the same silent loss the post-put check exists to
+            # prevent, arrived at by a different route.
+            raise WriterError("sqlite writer is closed")
 
     @property
     def failure(self) -> BaseException | None:
         return self._failure
+
+    @property
+    def closed(self) -> bool:
+        """True once the writer task and its connection have been released.
+
+        The run's cleanup path reads this to decide whether an interrupted `aclose`
+        has to be retried; a writer that was never started reads as closed, which is
+        the same statement about what it owns.
+        """
+        return self._task is None and self._conn is None
 
     # -- the loop ---------------------------------------------------------- #
     async def _loop(self) -> None:
@@ -454,6 +714,7 @@ class SqliteWriter:
             first = await self._queue.get()
             if first is _SENTINEL:
                 self._queue.task_done()
+                self._stopped = True
                 return
             batch: list[WriteOp] = [first]
             while len(batch) < self._max_ops:
@@ -480,6 +741,7 @@ class SqliteWriter:
                 for _ in batch:
                     self._queue.task_done()
                 await self._drain_and_drop()
+                self._stopped = True
                 return
             for _ in batch:
                 self._queue.task_done()
@@ -510,7 +772,16 @@ class SqliteWriter:
         A rollback restores the event-sequence counters, so a retried batch reuses
         the same sequence numbers rather than leaving a hole (which an SSE client
         replaying `run_events` would read as a lost event).
+
+        Runs on a worker thread, and holds `_commit_lock` for as long as it is
+        touching the connection: `aclose` may be trying to close that connection on
+        the event-loop thread, and cancelling the writer task does not stop this
+        function. See `_close_connection`.
         """
+        with self._commit_lock:
+            return self._commit_locked(batch)
+
+    def _commit_locked(self, batch: Sequence[WriteOp]) -> list[RunEvent]:
         attempts = 2
         last: sqlite3.OperationalError | None = None
         for attempt in range(attempts):

@@ -925,6 +925,281 @@ def test_a_stale_checkpoint_is_not_handed_back_on_resume(tmp_path):
     assert scalar(connect, "SELECT COUNT(*) FROM run_postings") == 4
 
 
+def test_an_unattempted_row_never_consumes_a_fetch_attempt_number(tmp_path):
+    """The terminal row a gate-cancelled target leaves behind must be invisible to
+    attempt numbering (2.3 review follow-up 3).
+
+    `src:a` attempted once and was interrupted; `src:b` never started and carries
+    only the unattempted row. Resuming the run must number `src:a`'s next attempt 2
+    and `src:b`'s FIRST attempt 1 — if the unattempted row counted, `src:b` would
+    open at attempt 2 and the record would claim an attempt that never happened.
+    """
+    connect = make_connect(tmp_path)
+    _simulate_crashed_run(connect, run_uid="crashed", sources=["src:a"])
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        inserted = runstore.record_unattempted_source_run(
+            conn,
+            source_run_id="gate-1",
+            run_uid="crashed",
+            source="src:b",
+            status="cancelled",
+            requested_at="2026-08-03T00:00:00+00:00",
+            finished_at="2026-08-03T00:00:01+00:00",
+            inventory_scope="complete",
+        )
+        # A run and a later resume can each cancel the same target before it starts;
+        # UNIQUE(run_uid, source, step, attempt) makes the second row impossible, so
+        # the write has to be a no-op rather than a fatal writer error.
+        repeated = runstore.record_unattempted_source_run(
+            conn,
+            source_run_id="gate-2",
+            run_uid="crashed",
+            source="src:b",
+            status="cancelled",
+            requested_at="2026-08-03T00:00:00+00:00",
+            finished_at="2026-08-03T00:00:09+00:00",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert inserted is True
+    assert repeated is False
+
+    # ...and a genuine constraint violation is NOT quietly reported as "already
+    # existed". `INSERT OR IGNORE` would swallow this one too, and the missing
+    # evidence would look identical to the idempotent case above.
+    conn = connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            runstore.record_unattempted_source_run(
+                conn,
+                source_run_id="gate-3",
+                run_uid="crashed",
+                source=None,  # NOT NULL
+                status="cancelled",
+            )
+    finally:
+        conn.close()
+    assert scalar(connect, "SELECT COUNT(*) FROM source_runs WHERE source='src:b'") == 1
+    assert scalar(
+        connect, "SELECT finished_at FROM source_runs WHERE source='src:b'"
+    ) == "2026-08-03T00:00:01+00:00", "the first, earlier evidence is the one kept"
+
+    recover_orphans(connect)
+    conn = connect()
+    try:
+        assert runstore.max_attempt_by_source(conn, "crashed") == {"src:a": 1}
+    finally:
+        conn.close()
+
+    result = run(
+        scheduler(connect).run(
+            kind=RunKind.FULL_DIRECT,
+            plan=plan_of(
+                FakeAdapter("src", instances=("a",), body=fast(1)),
+                FakeAdapter("src", instances=("b",), body=fast(1)),
+            ),
+            resume_run_uid="crashed",
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert [
+        (r["source"], r["step"], r["attempt"], r["status"])
+        for r in rows(
+            connect,
+            "SELECT source, step, attempt, status FROM source_runs "
+            "ORDER BY source, step, attempt",
+        )
+    ] == [
+        ("src:a", "fetch", 1, "interrupted"),
+        ("src:a", "fetch", 2, "succeeded"),
+        ("src:b", "fetch", 1, "succeeded"),
+        ("src:b", "unattempted", 1, "cancelled"),
+    ]
+
+
+def test_a_repeated_unattempted_row_drops_its_event_instead_of_killing_the_batch(tmp_path):
+    """The second op's `INSERT OR IGNORE` writes nothing, so the row its event names
+    does not exist. Emitting the event anyway would point `run_events.source_run_id`
+    at nothing, and the foreign key would take down the whole transaction — every
+    unrelated op batched with it included."""
+    from backend.sources import writer as writer_module
+
+    connect = make_connect(tmp_path)
+    at = "2026-08-03T00:00:00+00:00"
+
+    async def scenario():
+        writer = writer_module.SqliteWriter(connect)
+        await writer.start()
+        try:
+            await writer.submit(
+                writer_module.StartRun(
+                    run_uid="r1",
+                    kind=str(RunKind.FULL_DIRECT),
+                    trigger="test",
+                    requested_at=at,
+                    started_at=at,
+                )
+            )
+            for source_run_id in ("gate-1", "gate-2"):
+                await writer.submit(
+                    writer_module.RecordUnattemptedSourceRun(
+                        source_run_id=source_run_id,
+                        run_uid="r1",
+                        source="src:a",
+                        status="cancelled",
+                        requested_at=at,
+                        finished_at=at,
+                        events=(
+                            writer_module.RunEvent(
+                                run_uid="r1",
+                                source_run_id=source_run_id,
+                                event_type="source.cancelled",
+                                at=at,
+                            ),
+                        ),
+                    )
+                )
+            await writer.drain()
+        finally:
+            await writer.aclose()
+        return writer
+
+    writer = run(scenario())
+
+    assert writer.failure is None, "the repeated row killed the transaction"
+    assert scalar(connect, "SELECT COUNT(*) FROM source_runs") == 1
+    assert [
+        (r["source_run_id"], r["event_type"])
+        for r in rows(connect, "SELECT source_run_id, event_type FROM run_events ORDER BY sequence")
+    ] == [("gate-1", "source.cancelled")]
+
+
+def test_only_fetch_rows_answer_the_resume_queries(tmp_path):
+    """Every resume query reads FETCH attempts, and says so in SQL.
+
+    `source_runs` is shared: `unattempted` rows live there today and Phase 3 adds
+    describe/score steps to the same table. A cursor, an attempt number, and an
+    "interrupted attempts" count are all statements about enumerating a source, and a
+    row of another step answering any of them would resume a target from a cursor
+    that never described its stream, or number an attempt that never happened.
+    """
+    connect = make_connect(tmp_path)
+    stale = Checkpoint(
+        source_key="paged",
+        instance_key="board",
+        cursor={"next_page": 99},
+        config_fingerprint="from-another-step-entirely",
+        emitted=999,
+    )
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        runstore.create_pipeline_run(
+            conn,
+            run_uid="mixed",
+            kind=str(RunKind.FULL_DIRECT),
+            requested_at="2026-08-04T00:00:00+00:00",
+            started_at="2026-08-04T00:00:00+00:00",
+        )
+        runstore.create_source_run(
+            conn,
+            source_run_id="score-9",
+            run_uid="mixed",
+            source="paged:board",
+            attempt=9,
+            step="score",
+            requested_at="2026-08-04T00:00:00+00:00",
+            started_at="2026-08-04T00:00:00+00:00",
+        )
+        conn.execute(
+            "UPDATE source_runs SET checkpoint_json=?, status='interrupted' "
+            "WHERE source_run_id='score-9'",
+            (stale.to_json(),),
+        )
+        conn.execute(
+            "UPDATE pipeline_runs SET status='interrupted' WHERE run_uid='mixed'"
+        )
+        conn.commit()
+
+        assert runstore.latest_checkpoint_json(conn, run_uid="mixed", source="paged:board") is None
+        assert runstore.max_attempt_by_source(conn, "mixed") == {}
+        plan = runstore.resume_plan(conn, "mixed")
+        assert plan["checkpoints"] == {}
+        assert plan["max_attempt_by_source"] == {}
+        assert plan["pending_sources"] == ()
+        listed = runstore.resumable_runs(conn)
+    finally:
+        conn.close()
+
+    assert [r["run_uid"] for r in listed] == ["mixed"]
+    assert listed[0]["interrupted_attempts"] == 0, (
+        "a non-fetch row was counted as an interrupted enumeration attempt"
+    )
+
+
+def test_a_fatal_writer_failure_leaves_the_run_row_running_until_recovery(tmp_path):
+    """DELIBERATE, and asserted here so it stays deliberate (2.3 review follow-up 4).
+
+    The in-memory result says `failed`, but `pipeline_runs.status` is still
+    `running`: the row that would say otherwise can only be written by the writer
+    that just died, and giving the scheduler a second write path for it would mean
+    two writers — the one thing Phase 2 rules out. The reconciliation is startup
+    orphan recovery, which exists for exactly this shape of run: one that could not
+    write its own ending. Both halves are pinned below.
+    """
+    connect = make_connect(tmp_path)
+    import backend.sources.writer as writer_module
+
+    original = writer_module.SqliteWriter._commit_once
+    calls = {"n": 0}
+
+    def exploding(self, batch):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("disk on fire")
+        return original(self, batch)
+
+    writer_module.SqliteWriter._commit_once = exploding
+    try:
+        adapters = [FakeAdapter(f"src{n}", instances=("a",), body=fast(40)) for n in range(3)]
+        result = run(
+            scheduler(
+                connect,
+                batch_size=1,
+                flush_interval_seconds=0.0,
+                queue_size=2,
+                max_ops_per_transaction=1,
+                max_concurrent_targets=3,
+            ).run(kind=RunKind.FULL_DIRECT, plan=plan_of(*adapters))
+        )
+    finally:
+        writer_module.SqliteWriter._commit_once = original
+
+    assert result.status == "failed"
+    assert result.error["stage"] == "writer"
+    row = rows(connect, "SELECT status, finished_at, error_json FROM pipeline_runs")[0]
+    assert row["status"] == "running", "the terminal row was written by a dead writer"
+    assert row["finished_at"] is None
+    assert row["error_json"] is None
+
+    report = recover_orphans(connect)
+
+    assert report.run_uids == (result.run_uid,)
+    assert scalar(connect, "SELECT status FROM pipeline_runs") == "interrupted"
+    assert scalar(connect, "SELECT finished_at FROM pipeline_runs") is None
+    assert json.loads(scalar(connect, "SELECT error_json FROM pipeline_runs"))["type"] == (
+        "Interrupted"
+    )
+    # Whatever attempts the dead writer had managed to create are reconciled with
+    # it; none is left claiming to be running.
+    assert scalar(connect, "SELECT COUNT(*) FROM source_runs WHERE status='running'") == 0
+
+
 def test_resuming_a_run_that_is_not_interrupted_is_refused(tmp_path):
     connect = make_connect(tmp_path)
     adapter = FakeAdapter("src", instances=("a",), body=fast(1))

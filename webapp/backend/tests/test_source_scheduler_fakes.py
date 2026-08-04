@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -244,6 +245,31 @@ def hanging(*, before: int = 0):
             yield posting(target, n)
         await asyncio.sleep(3600)
         yield posting(target, 999)  # pragma: no cover - unreachable
+
+    return _body
+
+
+def blocking(seconds: float, *, before: int = 1, mark: dict | None = None, key: str = "started"):
+    """Yields `before` records, then genuinely BLOCKS the event loop with a
+    synchronous `time.sleep` rather than `await asyncio.sleep`.
+
+    Stands in for an adapter that violates the async contract in-process — a
+    blocking C extension, a synchronous `requests` call, CPU-bound parsing — done
+    directly on the event loop despite whatever `ExecutionMode` it declares.
+    `ExecutionMode.SUBPROCESS` is descriptor metadata the scheduler never reads to
+    change how a target is scheduled (2.6 follow-up 1): the isolation it promises
+    exists only if the adapter itself hands the blocking work to a real child
+    process, which this one deliberately does not. `mark[key]` records the
+    wall-clock instant execution actually reached the block, for tests that need
+    to prove another target's task could not even start meanwhile.
+    """
+
+    async def _body(adapter, target, ctx):
+        for n in range(before):
+            yield posting(target, n)
+        if mark is not None:
+            mark[key] = time.monotonic()
+        time.sleep(seconds)  # deliberately not awaited: this IS the defect under test
 
     return _body
 

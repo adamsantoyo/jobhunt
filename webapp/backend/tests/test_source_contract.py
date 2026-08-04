@@ -727,3 +727,118 @@ def test_registered_adapters_satisfy_the_protocol():
         assert isinstance(adapter, SourceAdapter)
         assert isinstance(adapter.descriptor, SourceDescriptor)
         assert adapter.descriptor.source_key
+
+
+# --------------------------------------------------------------------------- #
+# Registry-wide pins: the two declarations whose default is dangerous
+# --------------------------------------------------------------------------- #
+#: The absence licence of every registered source, pinned exactly. COMPLETE means
+#: "a successful run of this source may retire every posting it owns and did not
+#: deliver", so this map is the blast radius of Phase 2.4 and a change to it is a
+#: change to what the app is allowed to hide from the user. `SourceDescriptor`
+#: now DEFAULTS to PARTIAL (2.6: the licence must fail closed), which makes an
+#: accidental COMPLETE impossible but an accidental PARTIAL silent — a source that
+#: lost its COMPLETE would simply stop retiring closed requisitions, and nothing
+#: else would look wrong. This map is what notices.
+REGISTRY_INVENTORY_SCOPES = {
+    "amazon": "partial",
+    "ashby": "complete",
+    "builtin": "partial",
+    "eightfold": "partial",
+    "greenhouse": "complete",
+    "icims": "complete",
+    "jibe": "partial",
+    "jobspy": "partial",
+    "lever": "complete",
+    "manual": "partial",
+    "phenom": "partial",
+    "recruitee": "complete",
+    "smartrecruiters": "complete",
+    "workable": "complete",
+    "workday": "partial",
+    "yc": "complete",
+}
+
+
+def test_every_registered_adapter_declares_its_inventory_scope_explicitly():
+    """Explicitly, and to the same value it had before the default flipped.
+
+    Two separate claims. First, the scope map above is exact: no source silently
+    gained or lost the right to mark postings absent. Second, every descriptor SAYS
+    its scope in source rather than inheriting one, so the guarantee does not rest
+    on which way the dataclass default happens to point.
+    """
+    import inspect
+
+    import backend.sources.adapters  # noqa: F401  (registers the built-ins)
+
+    effective = {
+        adapter.descriptor.source_key: str(adapter.descriptor.default_inventory_scope)
+        for adapter in registry.all_adapters()
+    }
+    assert effective == REGISTRY_INVENTORY_SCOPES
+
+    for adapter in registry.all_adapters():
+        module = inspect.getmodule(type(adapter))
+        source = inspect.getsource(module)
+        assert "default_inventory_scope=" in source, (
+            f"{adapter.descriptor.source_key} inherits its absence licence from a "
+            "dataclass default instead of declaring it"
+        )
+
+
+def test_a_target_and_a_descriptor_default_to_the_scope_that_licenses_nothing():
+    """The default has to fail closed: an omitted `inventory_scope` must cost a
+    marking that does not happen, never one that should not have happened."""
+    assert SourceTarget(source_key="s").inventory_scope is InventoryScope.PARTIAL
+    assert (
+        SourceDescriptor(
+            source_key="s",
+            category=SourceCategory.DIRECT,
+            run_kinds=frozenset({RunKind.DAILY}),
+        ).default_inventory_scope
+        is InventoryScope.PARTIAL
+    )
+
+
+def test_an_aggregator_or_manual_source_may_not_claim_a_complete_inventory():
+    """Category error, not a tuning choice: neither can ever mean "these are all of
+    them", so the only thing COMPLETE could produce there is mass retirement of
+    postings the source never claimed to enumerate."""
+    for category in (SourceCategory.AGGREGATOR, SourceCategory.MANUAL):
+        with pytest.raises(ConfigError, match="may not declare"):
+            SourceDescriptor(
+                source_key="s",
+                category=category,
+                run_kinds=frozenset({RunKind.AGGREGATORS}),
+                default_inventory_scope=InventoryScope.COMPLETE,
+            )
+    # A direct source declaring COMPLETE is exactly what the rule protects.
+    assert SourceDescriptor(
+        source_key="s",
+        category=SourceCategory.DIRECT,
+        run_kinds=frozenset({RunKind.DAILY}),
+        default_inventory_scope=InventoryScope.COMPLETE,
+    ).default_inventory_scope is InventoryScope.COMPLETE
+
+
+def test_subprocess_execution_is_an_allowlist_not_a_declaration():
+    """SUBPROCESS isolation is the ADAPTER's obligation, not a service the scheduler
+    provides (see `ExecutionMode`): an adapter that declares SUBPROCESS and then
+    blocks in-process stalls every other source's deadline, and nothing in the
+    scheduler can detect that.
+
+    So the mode is allowlisted here. A new SUBPROCESS adapter fails this test until
+    it is added below, and it may only be added together with a scheduler-level test
+    proving its child is actually cancelled and reaped — jobspy's is
+    `test_the_real_jobspy_subprocess_adapter_is_cancellable_through_the_scheduler_and_orphans_no_child`
+    in `test_source_scheduler_scenarios.py`.
+    """
+    import backend.sources.adapters  # noqa: F401  (registers the built-ins)
+
+    subprocess_sources = {
+        adapter.descriptor.source_key
+        for adapter in registry.all_adapters()
+        if adapter.descriptor.execution is ExecutionMode.SUBPROCESS
+    }
+    assert subprocess_sources == {"jobspy"}

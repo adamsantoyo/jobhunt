@@ -59,8 +59,19 @@ class HttpxTransport:
     """`Transport` backed by one shared `httpx.AsyncClient`.
 
     Constructed once per run by the scheduler and shared by every adapter, so
-    connection reuse and the per-host ceiling apply across sources rather than
-    per source. Use as an async context manager, or call `aclose()`.
+    connection reuse applies across sources rather than per source. Use as an async
+    context manager, or call `aclose()`.
+
+    KNOWN LIMITATION, stated rather than worked around: httpx has no per-host
+    connection limit. `httpx.Limits` offers `max_connections` (pool-wide) and
+    `max_keepalive_connections` (pool-wide idle sockets kept alive); neither is
+    per-host, and `max_connections_per_host` below is mapped onto the keepalive cap,
+    which is a reuse hint and not a ceiling. Emulating a real per-host limit here
+    would mean intercepting the pool, so the per-host ceiling that the descriptors
+    actually promise is enforced one layer up, in `PacedTransport`, where it is one
+    semaphore keyed by request host and is testable without a socket. Treat the
+    argument below as pool tuning; `SourceDescriptor.per_host_concurrency` is the
+    ceiling that binds.
     """
 
     def __init__(
@@ -68,6 +79,7 @@ class HttpxTransport:
         *,
         timeout: float = 15.0,
         max_connections: int = 32,
+        #: Pool-wide keepalive cap, NOT a per-host limit — see the class docstring.
         max_connections_per_host: int = 6,
         headers: Mapping[str, str] | None = None,
         verify: bool | None = None,
@@ -160,6 +172,11 @@ class PacedTransport:
 
     The wait happens outside the adapter's control flow, so a source waiting
     its turn is still cancellable at the run's deadline.
+
+    One instance per host (the scheduler builds them that way), which is what makes
+    the state below meaningful: an instance shared by two sources behind one host
+    paces them together, and two instances on one host would each pace half of a
+    host that experiences all of it.
     """
 
     def __init__(
@@ -173,7 +190,10 @@ class PacedTransport:
         self._min_interval = max(0.0, min_interval_seconds)
         self._per_host = max(1, per_host_concurrency)
         self._gates: dict[str, asyncio.Semaphore] = {}
-        self._last_at: dict[str, float] = {}
+        #: Per host, the earliest instant at which the NEXT request may be sent.
+        #: A schedule of future slots rather than a memory of the last send: see
+        #: `_reserve` for why the difference is the whole feature.
+        self._next_at: dict[str, float] = {}
 
     def _gate(self, host: str) -> asyncio.Semaphore:
         gate = self._gates.get(host)
@@ -182,14 +202,31 @@ class PacedTransport:
             self._gates[host] = gate
         return gate
 
+    async def _reserve(self, host: str) -> None:
+        """Claim this host's next send slot, then wait for it to arrive.
+
+        The claim is taken and the following slot written BEFORE the wait, with no
+        await in between, so two concurrent callers cannot claim the same instant.
+        Reading a "last request at" stamp instead — which is what this did before
+        2.6 — makes interval pacing a no-op as soon as `per_host_concurrency > 1`:
+        every caller admitted by the gate reads the same stamp, sleeps the same
+        remainder, and they all hit the host together, which is precisely the
+        stampede the interval exists to prevent.
+
+        The slot is also claimed at request START rather than stamped at completion,
+        so the interval is the gap between requests arriving at the host rather than
+        a gap appended to however long the host took to answer.
+        """
+        if not self._min_interval:
+            return
+        now = time.monotonic()
+        at = max(now, self._next_at.get(host, 0.0))
+        self._next_at[host] = at + self._min_interval
+        if at > now:
+            await asyncio.sleep(at - now)
+
     async def send(self, request: HttpRequest) -> HttpResponse:
         host = request.host
         async with self._gate(host):
-            if self._min_interval:
-                elapsed = time.monotonic() - self._last_at.get(host, 0.0)
-                if elapsed < self._min_interval:
-                    await asyncio.sleep(self._min_interval - elapsed)
-            try:
-                return await self._inner.send(request)
-            finally:
-                self._last_at[host] = time.monotonic()
+            await self._reserve(host)
+            return await self._inner.send(request)

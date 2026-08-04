@@ -671,7 +671,10 @@ def test_a_cancel_before_the_run_task_starts_spawns_no_targets(tmp_path):
 
     assert adapter.attempts == {}, "a run cancelled before it started still fetched"
     assert scalar(connect, "SELECT COUNT(*) FROM run_postings") == 0
-    assert scalar(connect, "SELECT COUNT(*) FROM source_runs") == 0
+    # No FETCH attempt was made, and no fetch-attempt row exists to claim otherwise.
+    assert (
+        scalar(connect, "SELECT COUNT(*) FROM source_runs WHERE step='fetch'") == 0
+    )
     assert result.status == "cancelled"
     assert scalar(connect, "SELECT status FROM pipeline_runs") == "cancelled"
     # Every planned target is still accounted for, so the report reconciles
@@ -720,6 +723,257 @@ def test_targets_cancelled_while_queued_at_a_gate_still_appear_in_the_report(tmp
         t.skipped_reason == "cancelled before the first attempt started" for t in queued
     )
     assert result.target("queued:a").attempts, "the running target lost its attempt evidence"
+
+
+def test_a_target_never_spawned_still_records_terminal_source_run_evidence(tmp_path):
+    """A planned target the cancel arrived before must exist in `source_runs`.
+
+    Without a row, a later reader cannot tell a board that was never asked from a
+    board that was never planned — and the run report, which is the only other place
+    it appears, is in-memory only. The row is terminal on creation, carries no
+    timing because nothing started, and lives under its own step so that it consumes
+    no fetch attempt number (2.3 review follow-up 3).
+    """
+    import json
+
+    from backend.sources import runstore
+    from backend.sources.scheduler import successful_source_scopes
+
+    connect = make_connect(tmp_path)
+    adapter = FakeAdapter("never", instances=("a", "b"), body=fast(5))
+
+    async def scenario():
+        handle = scheduler(connect).start(kind=RunKind.FULL_DIRECT, plan=plan_of(adapter))
+        handle.cancel()
+        return await handle.wait()
+
+    result = run(scenario())
+
+    recorded = _rows(
+        connect,
+        "SELECT source_run_id, source, step, attempt, status, started_at, finished_at, "
+        "inventory_scope, error_json, metadata_json FROM source_runs ORDER BY source",
+    )
+    assert [r["source"] for r in recorded] == ["never:a", "never:b"]
+    assert {r["step"] for r in recorded} == {runstore.UNATTEMPTED_SOURCE_RUN_STEP}
+    assert {r["status"] for r in recorded} == {"cancelled"}
+    assert all(
+        r["started_at"] is None for r in recorded
+    ), "nothing started, so nothing may claim a start time"
+    assert all(r["finished_at"] for r in recorded)
+    assert all(r["inventory_scope"] == str(InventoryScope.COMPLETE) for r in recorded)
+    assert json.loads(recorded[0]["metadata_json"])["attempted"] is False
+    assert json.loads(recorded[0]["error_json"])["type"] == "Cancelled"
+
+    # Each row is joined by its own event, keyed to it, so a Phase 4 replay can
+    # show which boards were dropped by the cancel.
+    cancelled_events = [e for e in _events(connect) if e["event_type"] == "source.cancelled"]
+    assert {e["source_run_id"] for e in cancelled_events} == {
+        r["source_run_id"] for r in recorded
+    }
+
+    conn = connect()
+    try:
+        # The three things the row must NOT do: consume an attempt number a resume
+        # would need, licence absence marking, or degrade the source's freshness.
+        assert runstore.max_attempt_by_source(conn, result.run_uid) == {}
+        assert successful_source_scopes(conn, result.run_uid) == []
+        assert runstore.source_instance_freshness(conn) == []
+    finally:
+        conn.close()
+
+
+def test_a_target_cancelled_at_a_gate_records_terminal_evidence_beside_the_one_that_ran(
+    tmp_path,
+):
+    """The same row, on the other path: cancelled while queued behind a semaphore.
+
+    The target holding the single slot has a real fetch attempt; the three behind it
+    have terminal rows with no attempt at all, and the two kinds are told apart by
+    `step` rather than by having to guess from a missing `started_at`.
+    """
+    from backend.sources import runstore
+
+    connect = make_connect(tmp_path)
+
+    async def scenario():
+        gate = asyncio.Event()
+        adapter = FakeAdapter(
+            "queued", instances=("a", "b", "c", "d"), body=gated(before=2, gate=gate, after=1)
+        )
+        sched = scheduler(
+            connect, max_concurrent_targets=1, batch_size=1, flush_interval_seconds=0.0
+        )
+        handle = sched.start(kind=RunKind.FULL_DIRECT, plan=plan_of(adapter))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if scalar(connect, "SELECT COUNT(*) FROM run_postings") >= 2:
+                break
+            await asyncio.sleep(0.01)
+        handle.cancel()
+        gate.set()
+        return await handle.wait(), adapter
+
+    result, adapter = run(scenario())
+
+    assert list(adapter.attempts) == ["a"], "more than one target got past the gate"
+    by_source = {
+        r["source"]: (r["step"], r["attempt"], r["status"])
+        for r in _rows(connect, "SELECT source, step, attempt, status FROM source_runs")
+    }
+    assert by_source["queued:a"] == ("fetch", 1, "cancelled")
+    for key in ("queued:b", "queued:c", "queued:d"):
+        assert by_source[key] == (runstore.UNATTEMPTED_SOURCE_RUN_STEP, 1, "cancelled")
+    assert result.status == "cancelled"
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup hardening (2.3 review follow-up 2)
+# --------------------------------------------------------------------------- #
+def _is_closed(conn) -> bool:
+    import sqlite3
+
+    try:
+        conn.execute("SELECT 1")
+    except sqlite3.ProgrammingError:
+        return True
+    return False
+
+
+def test_a_run_task_cancelled_during_cleanup_still_closes_the_writer(tmp_path):
+    """The run task itself — not its targets — is cancelled inside `_execute`'s
+    cleanup path, at the one await that closes the writer.
+
+    Two things must survive that: the writer's task and sqlite connection have to be
+    released (this is the only code that ever releases them), and the run has to
+    leave `_LIVE_RUNS`. A run stranded in that set is excluded from startup orphan
+    recovery for the life of the process, so the rows it left behind would never be
+    reconciled by anything at all.
+    """
+    import contextlib
+
+    import backend.sources.scheduler as scheduler_module
+    import backend.sources.writer as writer_module
+
+    base = make_connect(tmp_path)
+    opened = []
+
+    def connect():
+        conn = base()
+        opened.append(conn)
+        return conn
+
+    original_aclose = writer_module.SqliteWriter.aclose
+    writers = []
+
+    async def cancelling_aclose(self, **kwargs):
+        """Cancel the run task as the real close begins.
+
+        The cancel is requested BEFORE delegating and delivered at the first await
+        INSIDE `aclose` — a wrapper that parked on its own sleep would absorb the
+        cancellation itself and leave the code under test untouched.
+        """
+        writers.append(self)
+        asyncio.current_task().cancel()
+        return await original_aclose(self, **kwargs)
+
+    async def scenario():
+        adapter = FakeAdapter("src", instances=("a",), body=fast(3))
+        handle = scheduler(connect).start(kind=RunKind.FULL_DIRECT, plan=plan_of(adapter))
+        with contextlib.suppress(asyncio.CancelledError):
+            await handle._task
+        await asyncio.sleep(0)
+        leftovers = [
+            t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()
+        ]
+        return handle, leftovers
+
+    writer_module.SqliteWriter.aclose = cancelling_aclose
+    try:
+        handle, leftovers = run(scenario())
+    finally:
+        writer_module.SqliteWriter.aclose = original_aclose
+
+    assert writers, "the run never reached its writer close"
+    assert handle.run_uid not in scheduler_module._LIVE_RUNS, (
+        "a run cancelled during cleanup is fenced off from orphan recovery forever"
+    )
+    assert writers[0].closed, "the writer was left holding its task and connection"
+    assert leftovers == [], f"cleanup was cut short and orphaned {leftovers}"
+    assert opened, "the test never observed a connection"
+    assert all(_is_closed(conn) for conn in opened), "the writer's connection leaked"
+    # The swallowed cancellation was un-counted, so the run task does not carry a
+    # cancellation nobody raised: an `asyncio.timeout` inside or around this task
+    # would otherwise surface a bare CancelledError where its caller expects a
+    # TimeoutError.
+    assert handle._task.cancelling() == 0, (
+        "a suppressed cancellation left the task's cancelling() count elevated"
+    )
+
+
+def test_a_writer_task_that_dies_outside_a_commit_does_not_hang_the_run(tmp_path):
+    """`_commit` records the failures it can see. A writer task killed some other
+    way — cancelled while parked on its queue — records nothing, and the queue it
+    leaves behind is one nobody will ever consume.
+
+    An unbounded drain on that queue never returns, so the run hangs in its own
+    cleanup with every attempt already settled. The drain has to notice the death,
+    give up, and let the run finish saying that persistence failed.
+    """
+    import backend.sources.writer as writer_module
+
+    connect = make_connect(tmp_path)
+    original_start = writer_module.SqliteWriter.start
+    writers = []
+
+    async def capturing_start(self):
+        await original_start(self)
+        writers.append(self)
+
+    async def scenario():
+        gate = asyncio.Event()
+        adapter = FakeAdapter("src", instances=("a",), body=gated(before=2, gate=gate, after=3))
+        sched = Scheduler(
+            connect,
+            config=SchedulerConfig(
+                batch_size=1,
+                flush_interval_seconds=0.0,
+                writer_drain_timeout_seconds=0.5,
+                **FAST_RETRY,
+            ),
+        )
+        handle = sched.start(kind=RunKind.FULL_DIRECT, plan=plan_of(adapter))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if writers and scalar(connect, "SELECT COUNT(*) FROM run_postings") >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert writers, "the writer never started"
+        writers[0]._task.cancel()
+        gate.set()
+        result = await handle.wait()
+        await asyncio.sleep(0)
+        leftovers = [
+            t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()
+        ]
+        return result, leftovers
+
+    writer_module.SqliteWriter.start = capturing_start
+    started = time.monotonic()
+    try:
+        result, leftovers = run(scenario())
+    finally:
+        writer_module.SqliteWriter.start = original_start
+    elapsed = time.monotonic() - started
+
+    assert result.status == "failed"
+    assert result.error["stage"] == "writer"
+    assert leftovers == [], f"the dead writer left {leftovers}"
+    assert elapsed < 10.0, "the run did not finish promptly after the writer died"
+    # The records that committed before the death are still there; the ones that
+    # could not are counted rather than silently lost.
+    assert scalar(connect, "SELECT COUNT(*) FROM run_postings") >= 2
+    assert result.target("src:a").status == "failed"
 
 
 def test_a_writer_failure_is_not_recorded_as_an_adapter_failure(tmp_path):
@@ -901,6 +1155,117 @@ def test_a_single_slot_host_serialises_and_paces_its_requests(tmp_path):
     gaps = [b - a for a, b in zip(times, times[1:])]
     assert len(gaps) == 3
     assert all(gap >= 0.025 for gap in gaps), f"pacing not applied: {gaps}"
+
+
+def test_two_sources_behind_one_host_share_one_pacer_with_the_politest_limits(tmp_path):
+    """A pacer per SOURCE is a pacer over half of the host (2.3 review follow-up 5).
+
+    Greenhouse-shaped reality: two sources whose targets sit behind the same API
+    host. One pacer each means the host is asked for the sum of their ceilings and
+    is paced by neither, so the pacer is a property of the host — with the same
+    arithmetic the gates use: politest concurrency, longest interval.
+    """
+    from backend.sources.contract import HttpRequest, TransportKind
+    from backend.sources.transport import PacedTransport
+
+    connect = make_connect(tmp_path)
+    transport = RecordingTransport()
+    handed: list[object] = []
+    host = "api.shared.example"
+
+    async def one_request(adapter, target, ctx):
+        handed.append(ctx.http())
+        await ctx.http().send(HttpRequest(url=f"https://{host}/jobs"))
+        yield target.record(
+            title="Support Engineer",
+            company="Acme",
+            url=f"https://{host}/{target.source_run_key}",
+            req_id=target.instance_key,
+        )
+
+    polite = FakeAdapter(
+        "polite",
+        instances=("p1", "p2"),
+        body=one_request,
+        descriptor=descriptor_for(
+            "polite",
+            transport=TransportKind.HTTP,
+            per_host_concurrency=1,
+            min_request_interval_seconds=0.03,
+        ),
+        host=host,
+    )
+    greedy = FakeAdapter(
+        "greedy",
+        instances=("g1", "g2"),
+        body=one_request,
+        descriptor=descriptor_for(
+            "greedy",
+            transport=TransportKind.HTTP,
+            per_host_concurrency=8,
+            min_request_interval_seconds=0.0,
+        ),
+        host=host,
+    )
+
+    sched = Scheduler(
+        connect,
+        config=SchedulerConfig(max_concurrent_targets=4, **FAST_RETRY),
+        transport=transport,
+    )
+    result = run(sched.run(kind=RunKind.FULL_DIRECT, plan=plan_of(polite, greedy)))
+
+    assert len(result.succeeded_targets) == 4
+    assert len(handed) == 4
+    assert all(isinstance(t, PacedTransport) for t in handed)
+    assert len({id(t) for t in handed}) == 1, "each source behind the host got its own pacer"
+    pacer = handed[0]
+    assert pacer._per_host == 1, "the greedier source's ceiling was applied to the host"
+    assert pacer._min_interval == 0.03, "the shorter interval was applied to the host"
+    assert transport.peak == 1
+    times = sorted(transport.started_at)
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert all(gap >= 0.025 for gap in gaps), f"the shared host was not paced: {gaps}"
+
+
+def test_a_source_keeps_its_own_pacer_when_it_declares_no_host(tmp_path):
+    """The fallback is the pre-2.6 arrangement, not one global pacer: a target with
+    no declared host is keyed `source:<key>` exactly as it is at the gates, so two
+    host-less sources are never accidentally paced against each other."""
+    from backend.sources.contract import HttpRequest, TransportKind
+
+    connect = make_connect(tmp_path)
+    transport = RecordingTransport()
+    handed: dict[str, object] = {}
+
+    async def one_request(adapter, target, ctx):
+        handed[target.source_run_key] = ctx.http()
+        await ctx.http().send(HttpRequest(url="https://anywhere.example/jobs"))
+        yield target.record(
+            title="Support Engineer",
+            company="Acme",
+            url=f"https://anywhere.example/{target.source_run_key}",
+            req_id=target.instance_key,
+        )
+
+    adapters = [
+        FakeAdapter(
+            key,
+            instances=("a",),
+            body=one_request,
+            descriptor=descriptor_for(key, transport=TransportKind.HTTP),
+        )
+        for key in ("one", "two")
+    ]
+    sched = Scheduler(
+        connect,
+        config=SchedulerConfig(max_concurrent_targets=2, **FAST_RETRY),
+        transport=transport,
+    )
+    run(sched.run(kind=RunKind.FULL_DIRECT, plan=plan_of(*adapters)))
+
+    assert len(handed) == 2
+    assert len({id(t) for t in handed.values()}) == 2
 
 
 def test_an_adapter_declaring_no_transport_is_given_none(tmp_path):

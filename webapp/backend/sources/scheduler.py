@@ -11,10 +11,11 @@ WHAT THIS OWNS (the adapter side of the table in `contract.py` owns the rest):
                 cannot deadlock: global -> per-source -> per-host. Per-host caps
                 are computed from the whole plan up front, so two sources sharing
                 an API host share one ceiling instead of each getting its own.
-  pacing        one `PacedTransport` per source key, shared by that source's
-                targets, which is the only arrangement in which
+  pacing        one `PacedTransport` per host, shared by every target behind that
+                host, which is the only arrangement in which
                 `min_request_interval_seconds` means anything (a pacer with a
-                single client paces nothing).
+                single client paces nothing, and two pacers on one host pace half
+                of it each).
   deadlines     one `asyncio.timeout` per attempt. A hanging adapter is cancelled
                 at its deadline and the records it already delivered are kept.
   retries       at most two attempts, transient classification only, jittered.
@@ -59,8 +60,12 @@ is subtly wrong:
    cancelled before it ever ran — queued at a gate, or never spawned because the
    cancel arrived before the run's first tick — is reported as a cancelled target
    with no attempts, so the report still balances against the plan it describes.
-   It has no `source_runs` row: an attempt that never started has no timing to
-   record, and minting one would consume an attempt number a resume would need.
+   It DOES get a `source_runs` row (2.6), created already terminal, with no timing
+   because nothing started and under `runstore.UNATTEMPTED_SOURCE_RUN_STEP` because
+   it is not a fetch attempt: every attempt-numbering, absence-licensing and
+   freshness query is bounded to the `fetch` step, so the row consumes no attempt
+   number a resume would need. Without it, `source_runs` cannot distinguish a board
+   that was never asked from a board that was never planned.
 """
 from __future__ import annotations
 
@@ -108,10 +113,12 @@ from .writer import (
     FinishSourceRun,
     MarkPresence,
     RecordBatch,
+    RecordUnattemptedSourceRun,
     RunEvent,
     SqliteWriter,
     StartRun,
     WriterError,
+    absorb_cancel,
 )
 
 __all__ = [
@@ -173,6 +180,13 @@ class SchedulerConfig:
     #: cancellation-propagation budget for SUBPROCESS adapters: their `finally` is
     #: where the child process is killed.
     stream_close_grace_seconds: float = 5.0
+    #: Hard bound on every wait in the run's cleanup path (drain, presence pass,
+    #: writer close). Generous, because exceeding it costs exact counts and possibly
+    #: a committed presence pass: it is there to turn a writer that will never make
+    #: progress into a finished run rather than a hung one, not to police a slow
+    #: commit. Only a writer task that died in a way `_commit` could not see, or a
+    #: transaction that has been stuck for half a minute, can reach it.
+    writer_drain_timeout_seconds: float = 30.0
     recover_orphans_on_start: bool = True
 
     def __post_init__(self) -> None:
@@ -186,6 +200,8 @@ class SchedulerConfig:
             raise ValueError("attempt_budget_multiplier must be >= 1.0")
         if not 0.0 <= self.retry_jitter < 1.0:
             raise ValueError("retry_jitter must be in [0, 1)")
+        if self.writer_drain_timeout_seconds <= 0:
+            raise ValueError("writer_drain_timeout_seconds must be > 0")
 
 
 # --------------------------------------------------------------------------- #
@@ -266,6 +282,12 @@ class RunResult:
     target_budget_seconds: float | None = None
     dueness_filtered: bool = False
     priority: str = "normal"
+    #: Times the writer's drain gave up before its queue emptied, counted over the
+    #: WHOLE run including the close. The persisted report carries the same counter
+    #: as of the moment the run's terminal row was built, which is necessarily before
+    #: the close; this field is the only place a close-time timeout can appear.
+    #: Non-zero means some evidence this run produced may not have committed.
+    writer_drain_timeouts: int = 0
 
     @property
     def succeeded_targets(self) -> tuple[TargetResult, ...]:
@@ -559,6 +581,11 @@ class Scheduler:
             queue_size=self.config.queue_size,
             max_ops_per_transaction=self.config.max_ops_per_transaction,
             on_commit=self._event_hook,
+            # How long the close may block the event loop waiting for a commit that
+            # is still on a worker thread. Capped well below the drain bound: the
+            # drain is an await and may take its full budget, whereas this one runs
+            # in a `finally` that cannot await and therefore stalls the loop.
+            close_lock_timeout_seconds=min(5.0, self.config.writer_drain_timeout_seconds),
         )
         try:
             await writer.start()
@@ -568,11 +595,12 @@ class Scheduler:
 
         started_at = runstore.utc_now_iso()
         gates = self._build_gates(plan)
-        transports: dict[str, Transport] = {}
+        transports = self._build_transports(plan)
         results: list[TargetResult] = []
         cleanup: set[asyncio.Task] = set()
         run_status = "succeeded"
         run_error: Mapping[str, object] | None = None
+        drain_timeouts = 0
 
         try:
             await writer.submit(
@@ -651,7 +679,20 @@ class Scheduler:
                     )
                     continue
                 if cancel_event.is_set():
-                    results.append(_not_started(target))
+                    result = _not_started(target)
+                    # Deferred, not awaited: this is evidence about a run that is
+                    # already stopping, and a `submit` here could park on a full
+                    # queue or raise a `WriterError` that would turn a cancelled run
+                    # into a failed one. `aclose(drain=True)` still waits for it.
+                    writer.submit_soon(
+                        _unattempted_source_run(
+                            run_uid=run_uid,
+                            target=target,
+                            requested_at=requested_at,
+                            reason=str(result.skipped_reason),
+                        )
+                    )
+                    results.append(result)
                     continue
                 task = asyncio.create_task(
                     self._run_target(
@@ -700,60 +741,90 @@ class Scheduler:
             run_error = {"type": type(exc).__name__, "message": str(exc)}
             raise
         finally:
-            if cleanup:
-                # Give cancelled adapter generators their unwind window; this is
-                # where a SUBPROCESS adapter kills its child.
-                await asyncio.wait(cleanup, timeout=self.config.stream_close_grace_seconds)
-            # Everything submitted must commit before per-target counts are read:
-            # a target settles its attempt as soon as its stream ends, which can
-            # precede the commit of its final batch.
-            #
-            # BaseException, not Exception: this is the only path that closes the
-            # writer and its connection, so it has to reach `aclose()` even if the
-            # run task itself is being cancelled from outside. A cancelled drain
-            # costs exact counts; a skipped `aclose()` leaks a task and a file
-            # handle for the life of the process.
-            with contextlib.suppress(BaseException):
-                await writer.drain()
-            results = [_with_record_totals(result) for result in results]
+            # Two nested `finally`s, because the two obligations have different
+            # failure modes. Everything below can be interrupted — the run task
+            # itself may be cancelled from outside at any of these awaits — but
+            # `_LIVE_RUNS.discard` cannot be allowed to be: a run left in that set
+            # is permanently excluded from startup orphan recovery, so its 'running'
+            # rows would never be reconciled by anything, ever.
+            try:
+                drain_timeout = self.config.writer_drain_timeout_seconds
+                if cleanup:
+                    # Give cancelled adapter generators their unwind window; this is
+                    # where a SUBPROCESS adapter kills its child. Suppressed, because
+                    # a cancel delivered while they unwind must not skip the writer
+                    # close below and leak a task plus a file handle.
+                    with absorb_cancel():
+                        await asyncio.wait(
+                            cleanup, timeout=self.config.stream_close_grace_seconds
+                        )
+                # Everything submitted must commit before per-target counts are read:
+                # a target settles its attempt as soon as its stream ends, which can
+                # precede the commit of its final batch.
+                #
+                # BaseException, not Exception: this is the only path that closes the
+                # writer and its connection, so it has to reach `aclose()` even if the
+                # run task itself is being cancelled from outside. A cancelled drain
+                # costs exact counts; a skipped `aclose()` leaks a task and a file
+                # handle for the life of the process.
+                with absorb_cancel():
+                    await writer.drain(timeout=drain_timeout)
+                results = [_with_record_totals(result) for result in results]
 
-            finished_at = runstore.utc_now_iso()
-            if writer.failure is not None and run_status != "cancelled":
-                run_status = "failed"
-                run_error = {
-                    "type": type(writer.failure).__name__,
-                    "message": str(writer.failure),
-                    "stage": "writer",
-                }
-            # Phase 2.4. After every target has settled and everything they produced
-            # has committed, and before the run writes its own terminal row, so the
-            # pass reads a complete snapshot of this run's attempts and its result is
-            # part of the same run's evidence rather than a later run's.
-            absence = await self._settle_presence(
-                writer, run_uid=run_uid, at=finished_at, run_status=run_status
-            )
-            report = _run_report(plan, results, gates, writer, profile, absence)
-            writer.submit_soon(
-                FinishRun(
+                finished_at = runstore.utc_now_iso()
+                if writer.failure is not None and run_status != "cancelled":
+                    run_status = "failed"
+                    run_error = {
+                        "type": type(writer.failure).__name__,
+                        "message": str(writer.failure),
+                        "stage": "writer",
+                    }
+                # Phase 2.4. After every target has settled and everything they
+                # produced has committed, and before the run writes its own terminal
+                # row, so the pass reads a complete snapshot of this run's attempts
+                # and its result is part of the same run's evidence rather than a
+                # later run's.
+                absence = await self._settle_presence(
+                    writer,
                     run_uid=run_uid,
-                    status=run_status,
-                    finished_at=finished_at,
-                    kept_count=sum(t.accepted for t in results),
-                    new_count=sum(t.created for t in results),
-                    report=report,
-                    error=run_error,
-                    events=(
-                        RunEvent(
-                            run_uid=run_uid,
-                            event_type=f"run.{run_status}",
-                            at=finished_at,
-                            payload=report,
-                        ),
-                    ),
+                    at=finished_at,
+                    run_status=run_status,
+                    timeout=drain_timeout,
                 )
-            )
-            await writer.aclose()
-            _LIVE_RUNS.discard(run_uid)
+                report = _run_report(plan, results, gates, writer, profile, absence)
+                writer.submit_soon(
+                    FinishRun(
+                        run_uid=run_uid,
+                        status=run_status,
+                        finished_at=finished_at,
+                        kept_count=sum(t.accepted for t in results),
+                        new_count=sum(t.created for t in results),
+                        report=report,
+                        error=run_error,
+                        events=(
+                            RunEvent(
+                                run_uid=run_uid,
+                                event_type=f"run.{run_status}",
+                                at=finished_at,
+                                payload=report,
+                            ),
+                        ),
+                    )
+                )
+                # One call, not a retry loop: `aclose` releases the writer task and
+                # the connection in a `finally` that contains no `await`, so a cancel
+                # arriving anywhere inside it still leaves the writer closed. There is
+                # nothing for a second attempt to do — asserted by
+                # `test_a_cancel_delivered_inside_aclose_still_releases_the_task_and_connection`.
+                with absorb_cancel():
+                    await writer.aclose(timeout=drain_timeout)
+                # Read AFTER the close, so a drain that gave up while closing is
+                # visible somewhere: the persisted report cannot carry it (the writer
+                # has to commit that row before it can be closed), so the in-memory
+                # result is where it lands.
+                drain_timeouts = writer.stats.drain_timeouts
+            finally:
+                _LIVE_RUNS.discard(run_uid)
 
         return RunResult(
             run_uid=run_uid,
@@ -772,6 +843,7 @@ class Scheduler:
             target_budget_seconds=profile.target_budget_seconds,
             dueness_filtered=profile.dueness_filtered,
             priority=str(profile.priority),
+            writer_drain_timeouts=drain_timeouts,
         )
 
     # -- preflight --------------------------------------------------------- #
@@ -890,6 +962,49 @@ class Scheduler:
             host_of=host_of,
         )
 
+    def _build_transports(
+        self, plan: Sequence[tuple[SourceAdapter, SourceTarget]]
+    ) -> dict[str, Transport]:
+        """One `PacedTransport` per HOST, shared by every target behind that host.
+
+        Per host, not per source (2.6). `min_request_interval_seconds` and
+        `per_host_concurrency` are statements about the machine being asked, so two
+        sources sharing one API host have to share one pacer: a pacer each means the
+        host sees the sum of their ceilings and none of their pacing, which is the
+        opposite of what the descriptors asked for.
+
+        The arithmetic is the same `min` across descriptors `_build_gates` uses, plus
+        a `max` on the interval: politeness is a floor, so behind a shared host the
+        politer concurrency and the longer interval both win. Built once, up front,
+        so the policy cannot depend on which target happened to start first.
+
+        A target that declares no host falls back to `source:<key>` exactly as the
+        gates do, which degrades this to the pre-2.6 per-source pacer rather than to
+        one global pacer over unrelated hosts.
+        """
+        if self._transport is None:
+            return {}
+        limits: dict[str, int] = {}
+        intervals: dict[str, float] = {}
+        for adapter, target in plan:
+            descriptor = adapter.descriptor
+            if descriptor.transport is TransportKind.NONE:
+                continue
+            host = _host_key(target)
+            limit = max(1, descriptor.per_host_concurrency)
+            limits[host] = min(limits.get(host, limit), limit)
+            intervals[host] = max(
+                intervals.get(host, 0.0), descriptor.min_request_interval_seconds
+            )
+        return {
+            host: PacedTransport(
+                self._transport,
+                min_interval_seconds=intervals[host],
+                per_host_concurrency=limit,
+            )
+            for host, limit in limits.items()
+        }
+
     @contextlib.asynccontextmanager
     async def _hold(self, gates: _Gates, target: SourceTarget):
         """Acquire global -> per-source -> per-host, in that fixed order.
@@ -933,7 +1048,7 @@ class Scheduler:
         attempt_offset: int,
         payloads: Sequence[InboundPayload],
         cleanup: set[asyncio.Task],
-        transports: dict[str, Transport],
+        transports: Mapping[str, Transport],
     ) -> TargetResult:
         descriptor = adapter.descriptor
         deadline = descriptor.deadline_for(target)
@@ -966,6 +1081,19 @@ class Scheduler:
             # cancelled while queued behind a semaphore, or between attempts, has
             # no attempt of its own to settle, and dropping it here would leave a
             # planned target absent from the run report entirely.
+            if not outcomes:
+                # No attempt row exists for this target, so the only evidence in
+                # `source_runs` that it was ever planned is this terminal row. The
+                # deferred path is mandatory here: this task is cancelled and
+                # cannot await anything.
+                writer.submit_soon(
+                    _unattempted_source_run(
+                        run_uid=run_uid,
+                        target=target,
+                        requested_at=requested_at,
+                        reason="cancelled before the first attempt started",
+                    )
+                )
             return TargetResult(
                 source_run_key=target.source_run_key,
                 source_key=target.source_key,
@@ -1010,7 +1138,7 @@ class Scheduler:
         attempt_offset: int,
         payloads: Sequence[InboundPayload],
         cleanup: set[asyncio.Task],
-        transports: dict[str, Transport],
+        transports: Mapping[str, Transport],
         deadline: float,
         budget: float,
         outcomes: list[AttemptOutcome],
@@ -1095,7 +1223,7 @@ class Scheduler:
         payloads: Sequence[InboundPayload],
         sink: list[runstore.RecordOutcome],
         cleanup: set[asyncio.Task],
-        transports: dict[str, Transport],
+        transports: Mapping[str, Transport],
     ) -> AttemptOutcome:
         descriptor = adapter.descriptor
         source_run_id = runstore.new_uid()
@@ -1138,7 +1266,7 @@ class Scheduler:
 
         ctx = FetchContext(
             config=config,
-            transport=self._transport_for(descriptor, transports),
+            transport=self._transport_for(descriptor, target, transports),
             resume_from=checkpoint,
             payloads=payloads,
             deadline_at=started_mono + deadline_seconds,
@@ -1303,6 +1431,7 @@ class Scheduler:
         run_uid: str,
         at: str,
         run_status: str,
+        timeout: float | None = None,
     ) -> dict | None:
         """Run the Phase 2.4 presence pass, or decline to and say so with `None`.
 
@@ -1315,14 +1444,26 @@ class Scheduler:
         `finally`, where a raise would replace whatever outcome the run already has
         with a persistence error, and where the run task may itself be under
         cancellation. A pass that could not commit reports `None` — no marking is
-        strictly better than a partial one.
+        strictly better than a partial one. The drain is bounded for the same reason
+        every other wait in that `finally` is: a writer that will never commit this
+        op must cost the run a report field, not its ability to finish.
         """
         if run_status not in PRESENCE_PASS_RUN_STATUSES or writer.failure is not None:
             return None
         op = MarkPresence(run_uid=run_uid, at=at)
-        with contextlib.suppress(BaseException):
+        drained = False
+        with absorb_cancel():
             await writer.submit(op)
-            await writer.drain()
+            drained = await writer.drain(timeout=timeout)
+        if not drained or writer.failure is not None:
+            # `MarkPresence.apply` publishes its report from INSIDE the transaction,
+            # so the object carries a report whether or not that transaction went on
+            # to commit. A rollback — a fatal commit error, a busy retry that then
+            # failed — would otherwise have this return a description of markings
+            # that are not in the database, into the run's own persisted evidence.
+            # Re-checked here rather than only before the submit, because the failure
+            # this is about happens during the commit, not before it.
+            return None
         return op.report
 
     # -- helpers ----------------------------------------------------------- #
@@ -1354,25 +1495,21 @@ class Scheduler:
         return False
 
     def _transport_for(
-        self, descriptor: SourceDescriptor, transports: dict[str, Transport]
+        self,
+        descriptor: SourceDescriptor,
+        target: SourceTarget,
+        transports: Mapping[str, Transport],
     ) -> Transport | None:
-        """One `PacedTransport` per source key, shared by that source's targets.
+        """The run's pacer for this target's host, or None for a source that asked
+        for no transport at all.
 
-        Per-source rather than per-target because pacing and per-host request
-        concurrency are properties of the host, and a pacer with a single client is
-        a pacer that never paces.
+        A lookup rather than a construction: `_build_transports` computed the whole
+        table from the plan before any target started, so pacing is a property of the
+        run, not of whichever target happened to reach this line first.
         """
         if descriptor.transport is TransportKind.NONE or self._transport is None:
             return None
-        paced = transports.get(descriptor.source_key)
-        if paced is None:
-            paced = PacedTransport(
-                self._transport,
-                min_interval_seconds=descriptor.min_request_interval_seconds,
-                per_host_concurrency=descriptor.per_host_concurrency,
-            )
-            transports[descriptor.source_key] = paced
-        return paced
+        return transports.get(_host_key(target))
 
     def _backoff(self) -> float:
         base = self.config.retry_base_delay_seconds
@@ -1408,6 +1545,43 @@ def _not_started(target: SourceTarget) -> TargetResult:
         status="cancelled",
         skipped_reason="cancelled before the target started",
         error={"type": "Cancelled", "message": "run cancelled before this target started"},
+    )
+
+
+def _unattempted_source_run(
+    *, run_uid: str, target: SourceTarget, requested_at: str, reason: str
+) -> RecordUnattemptedSourceRun:
+    """The `source_runs` row for a planned target that never attempted a fetch.
+
+    Terminal on creation and numbered under a step of its own, so it records what
+    happened without joining the attempt sequence — see decision 5 in the module
+    docstring and `runstore.record_unattempted_source_run`.
+    """
+    at = runstore.utc_now_iso()
+    source_run_id = runstore.new_uid()
+    return RecordUnattemptedSourceRun(
+        source_run_id=source_run_id,
+        run_uid=run_uid,
+        source=target.source_run_key,
+        status="cancelled",
+        requested_at=requested_at,
+        finished_at=at,
+        inventory_scope=str(target.inventory_scope),
+        error={"type": "Cancelled", "message": reason},
+        metadata={"label": target.label, "reason": reason, "attempted": False},
+        events=(
+            RunEvent(
+                run_uid=run_uid,
+                source_run_id=source_run_id,
+                event_type="source.cancelled",
+                at=at,
+                payload={
+                    "source": target.source_run_key,
+                    "reason": reason,
+                    "attempted": False,
+                },
+            ),
+        ),
     )
 
 
@@ -1496,5 +1670,14 @@ def _run_report(
             "max_ops_per_transaction": writer.stats.max_ops_per_transaction,
             "busy_retries": writer.stats.busy_retries,
             "dropped": writer.stats.dropped,
+            #: Non-zero means a drain gave up before the queue emptied, so the counts
+            #: above and the per-target counts in this report may be short of what
+            #: actually committed. Recorded rather than hidden: it is the only signal
+            #: that distinguishes "nothing more was written" from "we stopped
+            #: waiting to find out". Necessarily counts only the drains BEFORE this
+            #: row was built — the writer has to still be open to commit it, so a
+            #: timeout during the close appears in `RunResult.writer_drain_timeouts`
+            #: and nowhere in the database.
+            "drain_timeouts": writer.stats.drain_timeouts,
         },
     }
