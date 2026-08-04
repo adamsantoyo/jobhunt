@@ -1,0 +1,47 @@
+{
+  "jobs": [
+    {
+      "id": 4020123,
+      "internal_job_id": 4012345,
+      "title": "Support   Engineer, Platform\n",
+      "updated_at": "2026-07-21T18:04:33-04:00",
+      "first_published": "2026-07-14T09:00:00-04:00",
+      "requisition_id": "REQ-1234",
+      "location": {"name": "San Francisco, CA"},
+      "absolute_url": "https://job-boards.greenhouse.io/examplecorp/jobs/4020123?gh_src=abc123",
+      "metadata": [],
+      "data_compliance": [{"type": "gdpr", "requires_consent": false}]
+    },
+    {
+      "id": 4020124,
+      "internal_job_id": 4012346,
+      "title": "Technical Program Manager",
+      "updated_at": "2026-07-30T11:12:00-04:00",
+      "requisition_id": null,
+      "location": null,
+      "absolute_url": "https://job-boards.greenhouse.io/examplecorp/jobs/4020124",
+      "metadata": []
+    },
+    {
+      "id": 4020125,
+      "title": "Solutions Engineer",
+      "updated_at": "Posted 30+ Days Ago",
+      "location": {"name": "Remote - US"},
+      "absolute_url": "https://job-boards.greenhouse.io/examplecorp/jobs/4020125"
+    },
+    {
+      "id": 4020126,
+      "title": "",
+      "updated_at": "2026-07-30T11:12:00-04:00",
+      "location": {"name": "Oakland, CA"},
+      "absolute_url": "https://job-boards.greenhouse.io/examplecorp/jobs/4020126"
+    },
+    {
+      "id": 4020127,
+      "title": "Product Support Specialist",
+      "updated_at": "2026-07-30T11:12:00-04:00",
+      "location": {"name": "Palo Alto, CA"}
+    }
+  ],
+  "meta": {"total": 5}
+}
