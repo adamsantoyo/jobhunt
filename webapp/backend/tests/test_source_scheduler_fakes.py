@@ -118,11 +118,14 @@ def descriptor_for(
     inventory_scope: InventoryScope = InventoryScope.COMPLETE,
     min_request_interval_seconds: float = 0.0,
     transport: TransportKind = TransportKind.NONE,
+    run_kinds: frozenset[RunKind] = frozenset({RunKind.FULL_DIRECT, RunKind.DAILY}),
+    refresh_interval_seconds: int = 6 * 3600,
 ) -> SourceDescriptor:
     return SourceDescriptor(
         source_key=source_key,
         category=SourceCategory.DIRECT,
-        run_kinds=frozenset({RunKind.FULL_DIRECT, RunKind.DAILY}),
+        run_kinds=run_kinds,
+        refresh_interval_seconds=refresh_interval_seconds,
         default_deadline_seconds=deadline,
         supports_checkpoint=supports_checkpoint,
         execution=execution,

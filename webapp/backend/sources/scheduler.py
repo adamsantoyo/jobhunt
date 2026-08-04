@@ -74,7 +74,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
-from . import registry, runstore
+from . import registry, run_profiles, runstore
 from .contract import (
     CANONICAL_HASH_FIELDS,
     CHECKPOINT_VERSION,
@@ -225,8 +225,13 @@ class TargetResult:
     conflicts: int = 0
     duration_seconds: float = 0.0
     error: Mapping[str, object] | None = None
-    #: Set when a resume skipped this target because it already succeeded.
+    #: Set when a resume skipped this target because it already succeeded, or
+    #: DAILY dueness filtering skipped it because it is still fresh.
     skipped_reason: str | None = None
+    #: Structured evidence behind `skipped_reason`, populated for the DAILY
+    #: not-due case (`last_success_at`, `age_seconds`, `refresh_interval_seconds`)
+    #: so a Phase 4 UI can render "skipped (fresh)" without a second query.
+    skip_detail: Mapping[str, object] | None = None
     #: Live accumulator the writer appends committed outcomes to. Counts above are
     #: recomputed from it once the writer has drained; before that they are zero.
     record_outcomes: list = field(default_factory=list, repr=False, compare=False)
@@ -255,6 +260,12 @@ class RunResult:
     peak_by_host: Mapping[str, int] = field(default_factory=dict)
     recovery: RecoveryReport | None = None
     error: Mapping[str, object] | None = None
+    #: The Phase 2.5 run profile this run was scheduled under, mirrored here so
+    #: 2.6b and Phase 4 can read them without re-parsing `report` (which also
+    #: carries them, for persistence -- see `_run_report`).
+    target_budget_seconds: float | None = None
+    dueness_filtered: bool = False
+    priority: str = "normal"
 
     @property
     def succeeded_targets(self) -> tuple[TargetResult, ...]:
@@ -397,6 +408,9 @@ class _Preflight:
     checkpoints: dict[str, Checkpoint]
     attempts: dict[str, int]
     completed: set[str]
+    #: DAILY-only. `source_run_key` -> the evidence that excluded it, for kinds
+    #: whose `RunProfile.dueness_filtered` is True. Empty for every other kind.
+    not_due: dict[str, run_profiles.SkippedTarget] = field(default_factory=dict)
 
 
 class RunHandle:
@@ -530,10 +544,11 @@ class Scheduler:
         requested_at = runstore.utc_now_iso()
         config_hash = config_hash_for(config)
         code_hash = code_hash_for(plan)
+        profile = run_profiles.profile_for(run_kind)
 
         try:
             preflight: _Preflight = await asyncio.to_thread(
-                self._preflight, run_uid, plan, resume
+                self._preflight, run_uid, run_kind, plan, resume
             )
         except BaseException:
             _LIVE_RUNS.discard(run_uid)
@@ -581,6 +596,9 @@ class Scheduler:
                                 "planned_targets": len(plan),
                                 "config_hash": config_hash,
                                 "code_hash": code_hash,
+                                "target_budget_seconds": profile.target_budget_seconds,
+                                "dueness_filtered": profile.dueness_filtered,
+                                "priority": str(profile.priority),
                                 "recovered_runs": (
                                     len(preflight.recovery.run_uids) if preflight.recovery else 0
                                 ),
@@ -610,6 +628,25 @@ class Scheduler:
                             inventory_scope=target.inventory_scope,
                             status="skipped",
                             skipped_reason="already succeeded in this run",
+                        )
+                    )
+                    continue
+                not_due = preflight.not_due.get(target.source_run_key)
+                if not_due is not None:
+                    results.append(
+                        TargetResult(
+                            source_run_key=target.source_run_key,
+                            source_key=target.source_key,
+                            instance_key=target.instance_key,
+                            label=target.label,
+                            inventory_scope=target.inventory_scope,
+                            status="skipped",
+                            skipped_reason="not due (fresh)",
+                            skip_detail={
+                                "last_success_at": not_due.last_success_at,
+                                "age_seconds": not_due.age_seconds,
+                                "refresh_interval_seconds": not_due.refresh_interval_seconds,
+                            },
                         )
                     )
                     continue
@@ -695,7 +732,7 @@ class Scheduler:
             absence = await self._settle_presence(
                 writer, run_uid=run_uid, at=finished_at, run_status=run_status
             )
-            report = _run_report(plan, results, gates, writer, absence)
+            report = _run_report(plan, results, gates, writer, profile, absence)
             writer.submit_soon(
                 FinishRun(
                     run_uid=run_uid,
@@ -732,22 +769,26 @@ class Scheduler:
             peak_by_host=dict(gates.host_peak),
             recovery=preflight.recovery,
             error=run_error,
+            target_budget_seconds=profile.target_budget_seconds,
+            dueness_filtered=profile.dueness_filtered,
+            priority=str(profile.priority),
         )
 
     # -- preflight --------------------------------------------------------- #
     def _preflight(
         self,
         run_uid: str,
+        run_kind: RunKind,
         plan: Sequence[tuple[SourceAdapter, SourceTarget]],
         resume: bool,
     ) -> _Preflight:
         """One synchronous pass over the database before any target starts.
 
         Runs on a worker thread with its own short-lived connection. Orphan
-        recovery, checkpoint loading, and attempt-number continuation all have to
-        complete before the first attempt row is written, and doing them on the
-        writer's connection would mean ordering them against a queue that is not
-        running yet.
+        recovery, checkpoint loading, attempt-number continuation, and DAILY
+        dueness all have to complete before the first attempt row is written,
+        and doing them on the writer's connection would mean ordering them
+        against a queue that is not running yet.
         """
         conn = self._connect()
         try:
@@ -792,11 +833,30 @@ class Scheduler:
                     # query; `config_fingerprint` covers params and inventory scope.
                     if checkpoint is not None and checkpoint.is_valid_for(target):
                         checkpoints[key] = checkpoint
+
+            not_due: dict[str, run_profiles.SkippedTarget] = {}
+            if run_profiles.profile_for(run_kind).dueness_filtered and plan:
+                # `source_instance_freshness` is the existing query helper the
+                # roadmap says to reuse rather than writing new SQL; only the
+                # `last_success_at` field feeds the pure decision in
+                # `run_profiles.filter_due` below.
+                wanted = sorted({target.source_run_key for _adapter, target in plan})
+                now = datetime.now(timezone.utc)
+                freshness = runstore.source_instance_freshness(
+                    conn, at=now.isoformat(), sources=wanted
+                )
+                last_success_at = {
+                    str(row["source"]): row["last_success_at"] for row in freshness
+                }
+                _due, skipped = run_profiles.filter_due(plan, last_success_at, now=now)
+                not_due = {s.source_run_key: s for s in skipped}
+
             return _Preflight(
                 recovery=recovery,
                 checkpoints=checkpoints,
                 attempts=attempts,
                 completed=completed,
+                not_due=not_due,
             )
         finally:
             conn.close()
@@ -1395,9 +1455,17 @@ def _run_report(
     results: Sequence[TargetResult],
     gates: _Gates,
     writer: SqliteWriter,
+    profile: run_profiles.RunProfile,
     absence: dict | None = None,
 ) -> dict[str, object]:
     return {
+        # Phase 2.5: the run kind and the profile it was scheduled under,
+        # persisted here (`aggregate_report_json`) so 2.6b and Phase 4 can
+        # read them without re-deriving them from `pipeline_runs.kind`.
+        "kind": str(profile.kind),
+        "target_budget_seconds": profile.target_budget_seconds,
+        "dueness_filtered": profile.dueness_filtered,
+        "priority": str(profile.priority),
         "targets": len(plan),
         #: None means the presence pass did not run (cancelled run, failed run, or
         #: dead writer). That is a materially different statement from a pass that
@@ -1407,6 +1475,16 @@ def _run_report(
         "failed": sum(1 for t in results if t.status in ("failed", "timeout")),
         "cancelled": sum(1 for t in results if t.status == "cancelled"),
         "skipped": sum(1 for t in results if t.status == "skipped"),
+        #: The DAILY-dueness subset of "skipped", broken out with its evidence so
+        #: a Phase 4 UI can render "skipped (fresh)" instead of these targets
+        #: silently vanishing from the run's story. Every planned target still
+        #: appears exactly once among `targets`/the result list; this is a view
+        #: onto that same data, not a second source of truth.
+        "skipped_not_due": [
+            {"source": t.source_run_key, "label": t.label, **(t.skip_detail or {})}
+            for t in results
+            if t.status == "skipped" and t.skipped_reason == "not due (fresh)"
+        ],
         "accepted": sum(t.accepted for t in results),
         "created": sum(t.created for t in results),
         "peak_concurrency": gates.peak,

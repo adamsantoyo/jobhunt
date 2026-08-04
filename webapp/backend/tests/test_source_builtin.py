@@ -170,11 +170,17 @@ def test_plan_without_search_terms_is_empty_not_an_error():
     assert list(builtin.ADAPTER.plan(SourceConfig())) == []
 
 
-def test_descriptor_declares_daily_partial_and_checkpointable():
+def test_descriptor_declares_daily_full_direct_partial_and_checkpointable():
     descriptor = builtin.DESCRIPTOR
     assert descriptor.category is SourceCategory.STARTUP_BOARD
     assert descriptor.runs_in(RunKind.DAILY)
-    assert not descriptor.runs_in(RunKind.FULL_DIRECT)
+    # Phase 2.5 membership audit: PARTIAL inventory scope does not carve a
+    # source out of FULL_DIRECT (`amazon`, `eightfold`, `jibe`, `phenom`, and
+    # `workday` are all PARTIAL and all run there); FULL_DIRECT means "every
+    # direct/startup-board source", not "only sources with an exhaustible
+    # inventory". `AGGREGATORS` remains the one run this is never in.
+    assert descriptor.runs_in(RunKind.FULL_DIRECT)
+    assert not descriptor.runs_in(RunKind.AGGREGATORS)
     assert descriptor.supports_checkpoint is True
     assert descriptor.default_inventory_scope is InventoryScope.PARTIAL
 

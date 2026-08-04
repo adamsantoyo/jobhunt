@@ -126,10 +126,15 @@ DESCRIPTOR = SourceDescriptor(
     source_key=SOURCE_KEY,
     category=SourceCategory.STARTUP_BOARD,
     # Runs in the same daily sweep `scraper.py` gave it (unconditional unless
-    # `--only` excludes it); it is not a `FULL_DIRECT` board crawl (no
-    # complete inventory exists to walk to exhaustion) and not the
-    # `AGGREGATORS` run reserved for the JobSpy/meta-search arm.
-    run_kinds=frozenset({RunKind.DAILY}),
+    # `--only` excludes it), and in `FULL_DIRECT` alongside every other
+    # direct/startup-board source (Phase 2.5). `InventoryScope.PARTIAL` does
+    # NOT carve a source out of `FULL_DIRECT` -- `amazon`, `eightfold`,
+    # `jibe`, `phenom`, and `workday` are all PARTIAL and all run there too;
+    # `FULL_DIRECT` means "every direct/startup source, dueness unfiltered",
+    # not "only sources with an exhaustible inventory". Reserved exclusively
+    # for the `AGGREGATORS` run is the JobSpy/meta-search arm, which this is
+    # not.
+    run_kinds=frozenset({RunKind.DAILY, RunKind.FULL_DIRECT}),
     refresh_interval_seconds=6 * 3600,
     # Up to 2 locales x N search terms x MAX_PAGES sequential requests, each
     # paced by min_request_interval_seconds below. Generous relative to
