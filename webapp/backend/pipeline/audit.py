@@ -38,10 +38,12 @@ def _require_current_schema(conn):
     ):
         objects[row["type"]].add(row["name"])
     if not _REQUIRED_TABLES <= objects["table"] or not _REQUIRED_VIEWS <= objects["view"]:
-        raise RuntimeError("pipeline audit requires the complete schema version 12 database")
+        raise RuntimeError("pipeline audit requires the complete schema version 13 database")
     row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    if row is None or row[0] is None or int(row[0]) < 12:
-        raise RuntimeError("pipeline audit requires schema version 12 or newer")
+    if row is None or row[0] is None or int(row[0]) < 13:
+        # v12 predates run_postings.membership_kind; auditing it would report
+        # history-parity blockers that read as data loss rather than a stale schema.
+        raise RuntimeError("pipeline audit requires schema version 13 or newer")
 
 
 def _text(value):

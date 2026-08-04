@@ -1,8 +1,10 @@
 """Forward-only schema migration runner + versioned migrations.
 
-`db.init_db()` first applies the baseline schema (CREATE TABLE IF NOT EXISTS, which
-never alters an existing table) and then calls `run_migrations()`, so every process
-start converges the schema. Migrations are applied in version order, each in its own
+`db.init_db()` first applies the baseline schema and then calls `run_migrations()`,
+so every process start converges the schema. The legacy baseline (`DDL`) is pure
+CREATE IF NOT EXISTS, but `CANONICAL_DDL` also contains an ALTER TABLE and backfill
+DML, so it is NOT idempotent and runs only on brand-new empty databases (init_db
+gates it on `fresh`); existing databases reach the same structure via migrations. Migrations are applied in version order, each in its own
 transaction, recorded in `schema_version`. On a *fresh* database the baseline already
 reflects the latest schema, so every migration is stamped as satisfied without being
 executed (its old->new transform would be a no-op or, worse, misfire on an empty DB).
@@ -412,6 +414,36 @@ CREATE TABLE IF NOT EXISTS legacy_artifact_imports (
 );
 """
 
+RUN_POSTING_MEMBERSHIP_COLUMN_DDL = """
+ALTER TABLE run_postings ADD COLUMN membership_kind TEXT NOT NULL DEFAULT 'snapshot'
+    CHECK (membership_kind IN ('snapshot', 'current-only'));
+"""
+
+# No trigger maintains membership_kind: the only writer that ever produces
+# 'legacy-current' posting versions is migration 11's backfill, and both migration 13
+# and migration 11's rerun guard re-run the classifying UPDATE after it. Runtime code
+# never inserts legacy-current rows, so a trigger would tax every future run_postings
+# write to defend a path with no caller.
+RUN_POSTING_MEMBERSHIP_OBJECTS_DDL = """
+UPDATE run_postings SET membership_kind='current-only'
+WHERE posting_version_id IN (
+    SELECT posting_version_id FROM posting_versions WHERE version_kind='legacy-current'
+);
+DROP TRIGGER IF EXISTS trg_run_postings_membership_kind;
+DROP VIEW IF EXISTS compat_job_history;
+CREATE VIEW compat_job_history AS
+SELECT (SELECT a2.url FROM posting_aliases a2
+                WHERE a2.posting_id = rp.posting_id AND a2.valid_from <= rp.recorded_at
+                    AND (a2.valid_to IS NULL OR a2.valid_to > rp.recorded_at) AND a2.url IS NOT NULL
+                ORDER BY a2.valid_from DESC, a2.alias_id DESC LIMIT 1) AS url,
+       pr.legacy_run_date AS run_date, rp.posting_id AS seen_key,
+       v.tier AS tier, v.odds AS odds, rp.present AS present
+FROM run_postings rp
+JOIN pipeline_runs pr ON pr.run_uid = rp.run_uid
+LEFT JOIN posting_versions v ON v.posting_version_id = rp.posting_version_id
+WHERE pr.status IN ('done', 'imported') AND rp.membership_kind='snapshot';
+"""
+
 CANONICAL_DDL = "\n".join((
         PROFILE_VERSIONS_DDL,
         RUNS_DDL,
@@ -420,6 +452,8 @@ CANONICAL_DDL = "\n".join((
         DECISIONS_DDL,
         COMPATIBILITY_DDL,
         LEGACY_ARTIFACT_IMPORTS_DDL,
+        RUN_POSTING_MEMBERSHIP_COLUMN_DDL,
+        RUN_POSTING_MEMBERSHIP_OBJECTS_DDL,
 ))
 
 
@@ -1174,9 +1208,24 @@ def _migration_11_legacy_canonical_backfill(conn: sqlite3.Connection) -> None:
         if first_seen > lineage["first_seen"]:
             raise RuntimeError(f"posting first_seen moved later: {lineage['posting_id']}")
 
+    # A defensive direct rerun on a newer schema must not restore migration 10's
+    # unfiltered history view. This branch is unreachable during the original v11
+    # upgrade because membership_kind does not exist until migration 13.
+    if "membership_kind" in {
+        column["name"] for column in conn.execute("PRAGMA table_info(run_postings)")
+    }:
+        _execute_ddl(conn, RUN_POSTING_MEMBERSHIP_OBJECTS_DDL)
+
 
 def _migration_12_legacy_artifact_imports(conn: sqlite3.Connection) -> None:
     _execute_ddl(conn, LEGACY_ARTIFACT_IMPORTS_DDL)
+
+
+def _migration_13_run_posting_membership(conn: sqlite3.Connection) -> None:
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(run_postings)")}
+    if "membership_kind" not in columns:
+        _execute_ddl(conn, RUN_POSTING_MEMBERSHIP_COLUMN_DDL)
+    _execute_ddl(conn, RUN_POSTING_MEMBERSHIP_OBJECTS_DDL)
 
 
 # Ordered (version, name, fn). Append new migrations here; never renumber.
@@ -1193,6 +1242,7 @@ MIGRATIONS = [
     (10, "canonical_compatibility", _migration_10_compatibility),
     (11, "legacy_canonical_backfill", _migration_11_legacy_canonical_backfill),
     (12, "legacy_artifact_imports", _migration_12_legacy_artifact_imports),
+    (13, "run_posting_membership", _migration_13_run_posting_membership),
 ]
 
 

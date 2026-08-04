@@ -101,7 +101,7 @@ def test_fully_backfilled_database_is_ready_and_json_safe(tmp_path):
 
     assert report["readiness"] == {"ready": True, "blockers": []}
     assert report["database"] == {
-        "integrity_check": "ok", "foreign_key_violation_count": 0, "schema_version": 12,
+        "integrity_check": "ok", "foreign_key_violation_count": 0, "schema_version": 13,
     }
     for private_value in (
         PRIVATE_URL, PRIVATE_KEY, PRIVATE_TITLE, PRIVATE_COMPANY, PRIVATE_NOTES,

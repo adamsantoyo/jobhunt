@@ -83,7 +83,9 @@ def _main_db_file(conn):
 
 
 def init_db(conn):
-    """Create the baseline schema if absent (idempotent), then converge via migrations.
+    """Create the baseline schema, then converge via migrations. The legacy DDL is
+    idempotent; CANONICAL_DDL is fresh-only (it contains an ALTER TABLE and backfill
+    DML) and is gated on `fresh` below — never apply it to an existing database.
 
     `fresh` is captured *before* the DDL runs: a brand-new DB has the full baseline
     (which already reflects the latest schema, including state_events) so migrations

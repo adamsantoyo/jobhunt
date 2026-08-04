@@ -200,6 +200,19 @@ def build_v11_db(path):
     conn.close()
 
 
+def build_v12_db(path):
+    build_v11_db(path)
+    conn = connect(path)
+    import backend.migrations as migrations_mod
+    original = list(migrations_mod.MIGRATIONS)
+    migrations_mod.MIGRATIONS[:] = original[:12]
+    try:
+        run_migrations(conn, str(path))
+    finally:
+        migrations_mod.MIGRATIONS[:] = original
+    conn.close()
+
+
 def _objects(conn, object_type):
     return {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type=?", (object_type,)
@@ -273,7 +286,7 @@ def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
     upgraded_path = tmp_path / "upgraded_equivalent.db"
     build_v4_db(upgraded_path)
     upgraded = connect(upgraded_path)
-    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 13))
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 14))
 
     assert _canonical_structure(upgraded) == _canonical_structure(fresh)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -791,6 +804,7 @@ def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
     assert run_migrations(upgraded, str(path)) == [
         (11, "legacy_canonical_backfill"),
         (12, "legacy_artifact_imports"),
+        (13, "run_posting_membership"),
     ]
 
     for table in ("job_state", "state_events"):
@@ -820,7 +834,10 @@ def test_v11_upgrade_matches_fresh_legacy_import_ledger(tmp_path):
     build_v11_db(path)
     upgraded = connect(path)
 
-    assert run_migrations(upgraded, str(path)) == [(12, "legacy_artifact_imports")]
+    assert run_migrations(upgraded, str(path)) == [
+        (12, "legacy_artifact_imports"),
+        (13, "run_posting_membership"),
+    ]
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(legacy_artifact_imports)")] == [
         tuple(r) for r in fresh.execute("PRAGMA table_info(legacy_artifact_imports)")
     ]
@@ -834,6 +851,44 @@ def test_v11_upgrade_matches_fresh_legacy_import_ledger(tmp_path):
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
     upgraded.close()
     fresh.close()
+
+
+def test_v12_upgrade_classifies_current_only_membership_and_fixes_history_view(tmp_path):
+    path = tmp_path / "v12_membership.db"
+    build_v12_db(path)
+    conn = connect(path)
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('p','active','t0','t0',NULL)"
+    )
+    conn.execute(
+        "INSERT INTO posting_versions "
+        "(posting_version_id,posting_id,version_kind,version_hash,observed_at,payload_json) "
+        "VALUES ('v','p','legacy-current','h','t0','{}')"
+    )
+    conn.execute(
+        "INSERT INTO pipeline_runs (run_uid,kind,status,legacy_run_date) "
+        "VALUES ('r','imported','imported','t0')"
+    )
+    conn.execute(
+        "INSERT INTO run_postings "
+        "(run_uid,posting_id,posting_version_id,present,first_seen_in_run,recorded_at) "
+        "VALUES ('r','p','v',1,1,'t0')"
+    )
+    conn.commit()
+
+    assert run_migrations(conn, str(path)) == [(13, "run_posting_membership")]
+    assert conn.execute(
+        "SELECT membership_kind FROM run_postings"
+    ).fetchone()[0] == "current-only"
+    assert conn.execute("SELECT COUNT(*) FROM compat_job_history").fetchone()[0] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO run_postings "
+            "(run_uid,posting_id,posting_version_id,present,first_seen_in_run,recorded_at,"
+            "membership_kind) VALUES ('r','p','v',1,0,'t1','SNAPSHOT')"
+        )
+    conn.close()
 
 
 def test_legacy_canonical_backfill_preserves_lineages_history_content_and_state(tmp_path):
@@ -1036,7 +1091,35 @@ def test_migration_11_direct_rerun_is_idempotent(tmp_path):
     path = tmp_path / "rerun_v11.db"
     _build_backfill_v10(path)
     conn = connect(path)
+    # A current job with no job_history row at its latest_run produces a
+    # 'current-only' run membership; without it the view-exclusion assertions
+    # below would be vacuously true (the shared fixture yields none).
+    conn.execute(
+        "INSERT INTO jobs (url,seen_key,tier,title,latest_run,present) "
+        "VALUES ('https://solo','solo-key',3,'Solo Role','2026-07-05',1)"
+    )
+    conn.commit()
     run_migrations(conn, str(path))
+
+    def current_only_memberships():
+        return [tuple(r) for r in conn.execute(
+            "SELECT rp.run_uid, rp.posting_id FROM run_postings rp "
+            "WHERE rp.membership_kind='current-only' ORDER BY 1, 2"
+        )]
+
+    def view_rows_for_current_only():
+        return conn.execute(
+            "SELECT COUNT(*) FROM compat_job_history h "
+            "WHERE h.seen_key IN (SELECT posting_id FROM run_postings "
+            "                     WHERE membership_kind='current-only')"
+        ).fetchone()[0]
+
+    # The guard must have something real to protect.
+    assert len(current_only_memberships()) == 1
+    assert view_rows_for_current_only() == 0
+    history_rows_before = conn.execute("SELECT COUNT(*) FROM compat_job_history").fetchone()[0]
+    assert history_rows_before > 0
+
     tables = ("postings", "posting_aliases", "identity_evidence", "legacy_identity_map",
               "identity_migration_archive", "posting_versions", "descriptions",
               "score_versions", "pipeline_runs", "run_postings")
@@ -1044,6 +1127,7 @@ def test_migration_11_direct_rerun_is_idempotent(tmp_path):
               for table in tables}
     state_before = [dict(r) for r in conn.execute("SELECT * FROM job_state ORDER BY seen_key")]
     events_before = [dict(r) for r in conn.execute("SELECT * FROM state_events ORDER BY id")]
+    memberships_before = current_only_memberships()
 
     conn.execute("BEGIN IMMEDIATE")
     _migration_11_legacy_canonical_backfill(conn)
@@ -1053,6 +1137,13 @@ def test_migration_11_direct_rerun_is_idempotent(tmp_path):
             for table in tables} == before
     assert [dict(r) for r in conn.execute("SELECT * FROM job_state ORDER BY seen_key")] == state_before
     assert [dict(r) for r in conn.execute("SELECT * FROM state_events ORDER BY id")] == events_before
+    # The rerun recreates the migration-10 unfiltered view mid-flight; the guard
+    # must restore the membership-filtered view so current-only rows stay excluded.
+    assert current_only_memberships() == memberships_before
+    assert view_rows_for_current_only() == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM compat_job_history"
+    ).fetchone()[0] == history_rows_before
     conn.close()
 
 
@@ -1346,7 +1437,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == set(range(1, 13))
+    assert versions == set(range(1, 14))
     conn.close()
 
 
