@@ -1,0 +1,25 @@
+{
+  "total": 21,
+  "jobPostings": [
+    {
+      "title": "Support Engineer II",
+      "externalPath": "/job/Remote/Support-Engineer-II_R-1001",
+      "locationsText": "Bellevue, WA",
+      "postedOn": "Posted 3 Days Ago",
+      "bulletFields": ["R-1001"]
+    },
+    {
+      "title": "Product Support Specialist",
+      "externalPath": "/job/Seattle-WA/Product-Support-Specialist_R-1002",
+      "postedOn": "Posted Today",
+      "bulletFields": []
+    },
+    {
+      "title": "",
+      "externalPath": "/job/Remote/Blank-Title_R-1003",
+      "locationsText": "Remote",
+      "postedOn": "Posted 30+ Days Ago",
+      "bulletFields": ["R-1003"]
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "data": {
+    "positions": [
+      {
+        "id": 9001,
+        "displayJobId": "REQ-9001",
+        "name": "Support Engineer II",
+        "standardizedLocations": [
+          "Seattle, WA, United States",
+          "Redmond, WA, United States"
+        ],
+        "positionUrl": "/careers/job/9001?domain=starbucks.com",
+        "postedTs": 1786060800,
+        "workLocationOption": "remote"
+      },
+      {
+        "id": 9002,
+        "name": "Technical Support Specialist",
+        "locations": "San Francisco, CA, United States",
+        "postedTs": 1786147200
+      },
+      {
+        "id": 9003,
+        "displayJobId": "REQ-9003",
+        "name": "",
+        "standardizedLocations": [
+          "Austin, TX, United States"
+        ]
+      },
+      {
+        "id": 9004,
+        "displayJobId": "REQ-9004",
+        "name": "IT Support Engineer",
+        "standardizedLocations": [
+          "Austin, TX, United States",
+          "Denver, CO, United States"
+        ]
+      }
+    ],
+    "count": 42
+  }
+}

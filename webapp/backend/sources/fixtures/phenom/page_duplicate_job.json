@@ -1,0 +1,15 @@
+{
+  "refineSearch": {
+    "data": {
+      "jobs": [
+        {
+          "jobId": "30012345",
+          "title": "Support Engineer II",
+          "cityStateCountry": "Seattle, WA, United States",
+          "applyUrl": "https://careers.seattlechildrens.org/job/30012345/support-engineer-ii?gh_src=abc",
+          "postedDate": "2026-07-20T00:00:00.000Z"
+        }
+      ]
+    }
+  }
+}

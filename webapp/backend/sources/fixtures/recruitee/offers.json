@@ -1,0 +1,48 @@
+{
+  "offers": [
+    {
+      "id": 812345,
+      "title": "Senior   Support Engineer\n",
+      "location": "Amsterdam, Netherlands",
+      "careers_url": "https://edifecs.recruitee.com/o/senior-support-engineer",
+      "careers_apply_url": "https://edifecs.recruitee.com/o/senior-support-engineer/c/new",
+      "department": "Customer Support",
+      "employment_type_code": "full_time",
+      "remote": true,
+      "published_at": "2026-07-10T08:00:00.000Z",
+      "updated_at": "2026-07-18T09:30:00.000Z"
+    },
+    {
+      "id": 812346,
+      "title": "Platform Engineer",
+      "location": null,
+      "careers_url": "https://edifecs.recruitee.com/o/platform-engineer",
+      "remote": false,
+      "published_at": null
+    },
+    {
+      "id": 812347,
+      "title": "",
+      "location": "Remote",
+      "careers_url": "https://edifecs.recruitee.com/o/no-title",
+      "remote": true,
+      "published_at": "2026-07-05T00:00:00.000Z"
+    },
+    {
+      "id": 812348,
+      "title": "Support Specialist Without URL",
+      "location": "Seattle, WA",
+      "careers_url": "",
+      "remote": false,
+      "published_at": "2026-07-02T00:00:00.000Z"
+    },
+    {
+      "id": 812349,
+      "title": "IT Support Analyst",
+      "location": "Bellevue, WA",
+      "careers_url": "https://edifecs.recruitee.com/o/it-support-analyst",
+      "remote": "yes",
+      "published_at": "2026-06-01T00:00:00.000Z"
+    }
+  ]
+}

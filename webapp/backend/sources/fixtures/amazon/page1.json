@@ -1,0 +1,44 @@
+{
+  "hits": 120,
+  "jobs": [
+    {
+      "id": "2871234",
+      "id_icims": "2871234",
+      "job_path": "/jobs/2871234/support-engineer-ii",
+      "title": "Support Engineer II",
+      "city": "Seattle",
+      "state": "WA",
+      "posted_date": "July 20, 2026",
+      "company_name": "Amazon.com Services LLC"
+    },
+    {
+      "id": "2871235",
+      "id_icims": "2871235",
+      "job_path": "/jobs/2871235/technical-program-manager",
+      "title": "Technical Program Manager",
+      "city": "Bellevue",
+      "state": "",
+      "posted_date": "July 18, 2026"
+    },
+    {
+      "id_icims": "",
+      "job_path": "/jobs/2871236/solutions-engineer",
+      "title": "Solutions Engineer",
+      "city": "Austin",
+      "state": "TX"
+    },
+    {
+      "id_icims": "2871237",
+      "job_path": "/jobs/2871237/blank-title-role",
+      "title": "",
+      "city": "Denver",
+      "state": "CO"
+    },
+    {
+      "id_icims": "2871238",
+      "title": "Missing Path Role",
+      "city": "Phoenix",
+      "state": "AZ"
+    }
+  ]
+}

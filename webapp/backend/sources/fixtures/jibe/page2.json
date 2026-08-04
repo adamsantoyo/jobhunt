@@ -1,0 +1,14 @@
+{
+  "jobs": [
+    {
+      "data": {
+        "req_id": "R-3001",
+        "slug": "systems-administrator-renton",
+        "title": "Systems Administrator",
+        "full_location": "Renton, WA",
+        "apply_url": "https://sso.example.com/apply?req=R-3001",
+        "posted_date": "2026-07-20"
+      }
+    }
+  ]
+}

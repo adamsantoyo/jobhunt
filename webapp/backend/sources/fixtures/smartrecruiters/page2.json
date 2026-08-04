@@ -1,0 +1,18 @@
+{
+  "totalFound": 4,
+  "offset": 3,
+  "limit": 100,
+  "content": [
+    {
+      "name": "Field Marketing Manager",
+      "releasedDate": "2026-06-01T00:00:00.000Z",
+      "location": {"city": "Chicago", "region": "IL", "country": "US", "remote": false}
+    },
+    {
+      "id": 743999881234571,
+      "name": "Support Specialist",
+      "releasedDate": "Not a date",
+      "location": {"country": "US"}
+    }
+  ]
+}

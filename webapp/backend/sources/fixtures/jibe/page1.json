@@ -1,0 +1,52 @@
+{
+  "jobs": [
+    {
+      "data": {
+        "req_id": "R-2001",
+        "slug": "support-engineer-seattle",
+        "title": "Support Engineer II",
+        "city": "Seattle",
+        "state": "WA",
+        "full_location": "Seattle, WA, United States",
+        "posted_date": "2026-07-18T00:00:00Z",
+        "apply_url": "https://sso.example.com/apply?req=R-2001",
+        "canonical_url": "https://careers.example.com/job/R-2001",
+        "description": "<p>Support our customers.</p>"
+      }
+    },
+    {
+      "data": {
+        "req_id": "R-2002",
+        "slug": "marketing-coordinator",
+        "title": "Marketing Coordinator",
+        "city": "Bellevue",
+        "state": "WA",
+        "posted_date": "2026-07-10"
+      }
+    },
+    {
+      "data": {
+        "slug": "network-technician-tacoma",
+        "title": "Network Technician",
+        "full_location": "Tacoma, WA",
+        "create_date": "2026-06-30T08:00:00-07:00"
+      }
+    },
+    {
+      "data": {
+        "req_id": "",
+        "slug": "",
+        "title": "Data Analyst Intern",
+        "city": "Issaquah",
+        "state": "WA"
+      }
+    },
+    {
+      "data": {
+        "req_id": "R-2004",
+        "title": "IT Support Specialist",
+        "posted_date": "Recently Posted"
+      }
+    }
+  ]
+}

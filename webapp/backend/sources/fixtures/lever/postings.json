@@ -1,0 +1,58 @@
+[
+  {
+    "id": "6f3a1b2c-8d4e-4f2a-9c1d-0a1b2c3d4e5f",
+    "text": "Support   Engineer, Platform\n",
+    "categories": {
+      "location": "San Francisco, CA",
+      "team": "Platform",
+      "commitment": "Full-time",
+      "department": "Engineering"
+    },
+    "hostedUrl": "https://jobs.lever.co/examplecorp/6f3a1b2c-8d4e-4f2a-9c1d-0a1b2c3d4e5f?gh_src=abc123",
+    "applyUrl": "https://jobs.lever.co/examplecorp/6f3a1b2c-8d4e-4f2a-9c1d-0a1b2c3d4e5f/apply",
+    "createdAt": 1784019600000,
+    "workplaceType": "remote"
+  },
+  {
+    "id": "7a4b2c3d-9e5f-4a3b-8d2e-1b2c3d4e5f6a",
+    "text": "Technical Program Manager",
+    "hostedUrl": "https://jobs.lever.co/examplecorp/7a4b2c3d-9e5f-4a3b-8d2e-1b2c3d4e5f6a",
+    "createdAt": 1785409920000
+  },
+  {
+    "id": "8b5c3d4e-0f6a-4b4c-9e3f-2c3d4e5f6a7b",
+    "text": "Solutions Engineer",
+    "categories": {
+      "location": "New York, NY"
+    },
+    "hostedUrl": "https://jobs.lever.co/examplecorp/8b5c3d4e-0f6a-4b4c-9e3f-2c3d4e5f6a7b",
+    "createdAt": 1784019600000,
+    "workplaceType": "onsite"
+  },
+  {
+    "id": "9c6d4e5f-1a7b-4c5d-8f4a-3d4e5f6a7b8c",
+    "text": "",
+    "categories": {
+      "location": "Austin, TX"
+    },
+    "hostedUrl": "https://jobs.lever.co/examplecorp/9c6d4e5f-1a7b-4c5d-8f4a-3d4e5f6a7b8c",
+    "createdAt": 1784019600000
+  },
+  {
+    "id": "ad7e5f60-2b8c-4d6e-9a5b-4e5f6a7b8c9d",
+    "text": "Product Support Specialist",
+    "categories": {
+      "location": "Palo Alto, CA"
+    },
+    "createdAt": 1784019600000
+  },
+  {
+    "id": "be8f6071-3c9d-4e7f-8b6c-5f6a7b8c9d0e",
+    "text": "Field Sales Representative",
+    "categories": {
+      "location": "Remote - US"
+    },
+    "hostedUrl": "https://jobs.lever.co/examplecorp/be8f6071-3c9d-4e7f-8b6c-5f6a7b8c9d0e",
+    "createdAt": null
+  }
+]

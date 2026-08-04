@@ -1,0 +1,16 @@
+{
+  "data": {
+    "positions": [
+      {
+        "id": 9005,
+        "displayJobId": "REQ-9005",
+        "name": "Field Support Engineer",
+        "standardizedLocations": [
+          "Chicago, IL, United States"
+        ],
+        "postedTs": 1786320000
+      }
+    ],
+    "count": 42
+  }
+}

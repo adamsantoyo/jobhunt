@@ -1,0 +1,45 @@
+{
+  "name": "Seeq",
+  "description": "Seeq careers",
+  "jobs": [
+    {
+      "title": "  Senior Software Engineer, Platform\n",
+      "shortcode": "AB1234CD",
+      "code": "REQ-5001",
+      "employment_type": "Full-time",
+      "telecommuting": false,
+      "department": "Engineering",
+      "url": "https://apply.workable.com/seeq/j/AB1234CD/",
+      "shortlink": "https://apply.workable.com/j/AB1234CD",
+      "city": "Seattle",
+      "state": "WA",
+      "country": "United States",
+      "published_on": "2026-07-10"
+    },
+    {
+      "title": "Product Manager, Remote",
+      "shortcode": "EF5678GH",
+      "telecommuting": true,
+      "url": "https://apply.workable.com/seeq/j/EF5678GH/",
+      "country": "United States",
+      "published_on": "2026-07-22T00:00:00.000Z"
+    },
+    {
+      "title": "Customer Success Manager",
+      "shortcode": "IJ9012KL",
+      "telecommuting": false,
+      "city": "Remote",
+      "url": "https://apply.workable.com/seeq/j/IJ9012KL/",
+      "published_on": "Recently"
+    },
+    {
+      "title": "",
+      "shortcode": "MN3456OP",
+      "url": "https://apply.workable.com/seeq/j/MN3456OP/"
+    },
+    {
+      "title": "Row With No Apply Link",
+      "shortcode": "QR7890ST"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "jobs": [
+    {
+      "id": "5f2c9a10-8b3e-4c1a-9d4f-1a2b3c4d5e6f",
+      "title": "Platform Support Engineer\n",
+      "departmentName": "Customer Engineering",
+      "teamName": "Platform",
+      "employmentType": "FullTime",
+      "location": "San Francisco, CA",
+      "jobUrl": "https://jobs.ashbyhq.com/examplecorp/5f2c9a10-8b3e-4c1a-9d4f-1a2b3c4d5e6f",
+      "applyUrl": "https://jobs.ashbyhq.com/examplecorp/5f2c9a10-8b3e-4c1a-9d4f-1a2b3c4d5e6f/application",
+      "publishedAt": "2026-07-18T00:00:00.000Z",
+      "isListed": true,
+      "isRemote": false,
+      "compensation": {
+        "compensationTierSummaries": [
+          {
+            "compensationTierSummary": "$150K – $190K",
+            "title": "Base Salary"
+          }
+        ]
+      }
+    },
+    {
+      "id": "a1b2c3d4-e5f6-4789-9abc-def012345678",
+      "title": "Solutions Architect",
+      "departmentName": "Field Engineering",
+      "location": "Remote - US",
+      "jobUrl": "https://jobs.ashbyhq.com/examplecorp/a1b2c3d4-e5f6-4789-9abc-def012345678",
+      "publishedAt": "2026-07-22T00:00:00.000Z",
+      "isListed": true,
+      "isRemote": true
+    },
+    {
+      "id": "11112222-3333-4444-5555-666677778888",
+      "title": "IT Support Specialist",
+      "jobUrl": "https://jobs.ashbyhq.com/examplecorp/11112222-3333-4444-5555-666677778888",
+      "isListed": true,
+      "isRemote": false
+    },
+    {
+      "id": "99990000-1111-2222-3333-444455556666",
+      "title": "",
+      "location": "Austin, TX",
+      "jobUrl": "https://jobs.ashbyhq.com/examplecorp/99990000-1111-2222-3333-444455556666",
+      "publishedAt": "2026-07-20T00:00:00.000Z",
+      "isRemote": false
+    },
+    {
+      "id": "77778888-9999-0000-1111-222233334444",
+      "title": "Deployment Strategist",
+      "location": "New York, NY",
+      "publishedAt": "2026-07-19T00:00:00.000Z",
+      "isRemote": false
+    }
+  ]
+}

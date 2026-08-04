@@ -1,0 +1,41 @@
+{
+  "refineSearch": {
+    "data": {
+      "jobs": [
+        {
+          "jobId": "30012345",
+          "jobSeqNo": "SEQ-30012345",
+          "title": "Support   Engineer II\n",
+          "cityStateCountry": "Seattle, WA, United States",
+          "location": "should-not-be-used",
+          "applyUrl": "https://careers.seattlechildrens.org/job/30012345/support-engineer-ii?gh_src=abc",
+          "postedDate": "2026-07-20T00:00:00.000Z",
+          "dateCreated": "2026-07-01"
+        },
+        {
+          "jobId": "30012346",
+          "title": "Patient Support Specialist",
+          "location": "Seattle, WA",
+          "dateCreated": "2026-07-15"
+        },
+        {
+          "jobSeqNo": "SEQ-30012348",
+          "title": "IT Support Technician (Per Diem)",
+          "cityState": "Bellevue, WA",
+          "dateCreated": "2026-06-01"
+        },
+        {
+          "jobId": "30012347",
+          "title": "",
+          "cityStateCountry": "Seattle, WA",
+          "applyUrl": "https://careers.seattlechildrens.org/job/30012347"
+        },
+        {
+          "title": "Unlinkable Listing",
+          "cityStateCountry": "Seattle, WA"
+        }
+      ]
+    }
+  },
+  "counts": {"total": 5}
+}

@@ -1,0 +1,26 @@
+{
+  "totalFound": 4,
+  "offset": 0,
+  "limit": 100,
+  "content": [
+    {
+      "id": 743999881234567,
+      "name": "Senior Support Engineer",
+      "refNumber": "REQ-9001",
+      "releasedDate": "2026-07-01T00:00:00.000Z",
+      "location": {"city": "Austin", "region": "TX", "country": "US", "remote": true}
+    },
+    {
+      "id": 743999881234568,
+      "name": "Platform Engineer",
+      "releasedDate": "2026-07-05T12:30:00.000Z",
+      "location": null
+    },
+    {
+      "id": 743999881234569,
+      "name": "",
+      "releasedDate": "2026-07-06T00:00:00.000Z",
+      "location": {"city": "Denver", "region": "CO", "country": "US"}
+    }
+  ]
+}

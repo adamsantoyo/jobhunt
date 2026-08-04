@@ -1,0 +1,112 @@
+[
+  {
+    "id": "in-flood1",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood1",
+    "title": "Technical Support Engineer",
+    "company": "Staffing Partners LLC",
+    "location": "San Francisco, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-flood2",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood2",
+    "title": "Technical support engineer",
+    "company": "staffing partners llc",
+    "location": "Oakland, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-flood3",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood3",
+    "title": "Technical Support Engineer",
+    "company": "Staffing Partners LLC",
+    "location": "San Jose, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-flood4",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood4",
+    "title": "Technical Support Engineer",
+    "company": "Staffing Partners LLC",
+    "location": "Berkeley, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-flood5",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood5",
+    "title": "Technical Support Engineer",
+    "company": "Staffing Partners LLC",
+    "location": "Fremont, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-flood6",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood6",
+    "title": "Technical Support Engineer",
+    "company": "Staffing Partners LLC",
+    "location": "Daly City, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-flood7",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood7",
+    "title": "Technical Support Engineer",
+    "company": "Staffing Partners LLC",
+    "location": "Hayward, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-flood1-again",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood1",
+    "title": "Technical Support Engineer",
+    "company": "Staffing Partners LLC",
+    "location": "San Francisco, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-flood2-tracked",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=flood2&utm_campaign=repost&gclid=xyz",
+    "title": "Technical Support Engineer",
+    "company": "Staffing Partners LLC",
+    "location": "Oakland, CA",
+    "date_posted": "2026-08-01",
+    "min_amount": null,
+    "is_remote": false
+  },
+  {
+    "id": "in-real1",
+    "site": "indeed",
+    "job_url": "https://www.indeed.com/viewjob?jk=real1",
+    "title": "Technical Support Engineer",
+    "company": "Example Corp",
+    "location": "San Francisco, CA",
+    "date_posted": "2026-08-02",
+    "min_amount": null,
+    "is_remote": false
+  }
+]

@@ -1,0 +1,69 @@
+[
+  {
+    "title": "Product Support Engineer",
+    "company": "Cartesia",
+    "location": "San Francisco, California, USA",
+    "url": "https://www.dice.com/job-detail/c9a2dcc9-3728-4bd3-a6c6-e1aaeae4f2c0?utm_source=claude-user&utm_medium=mcp",
+    "source": "mcp-dice",
+    "posted": "2026-07-03",
+    "salary": "USD 100,000.00 - 150,000.00 per year",
+    "remote": false,
+    "req_id": "c9a2dcc9-3728-4bd3-a6c6-e1aaeae4f2c0"
+  },
+  {
+    "title": "Robotics Support Engineer",
+    "company": "Atoms",
+    "location": "San Francisco, California",
+    "url": "https://www.ziprecruiter.com/job-redirect?match_token=abc123&tsid=100000502",
+    "source": "mcp-zip",
+    "posted": "",
+    "salary": "72500-114500",
+    "remote": true,
+    "req_id": "",
+    "_desc": "Robotics  support   role.\nSome whitespace noise."
+  },
+  {
+    "title": "AI Product Support Lead",
+    "company": "Wonderschool",
+    "url": "https://www.dice.com/job-detail/71133bdd-6cb5-4a81-9b80-2647728e24d5?utm_source=claude-user&utm_medium=mcp",
+    "source": "mcp-dice",
+    "posted": "3 days ago",
+    "salary": "",
+    "remote": false,
+    "req_id": "71133bdd-6cb5-4a81-9b80-2647728e24d5"
+  },
+  {
+    "title": "",
+    "company": "Bio-Rad Laboratories",
+    "location": "Hercules, California, USA",
+    "url": "https://www.dice.com/job-detail/ef097c1e-26bb-4f18-8341-48cea880ef4e",
+    "source": "mcp-dice",
+    "posted": "2026-06-24",
+    "salary": "",
+    "remote": false,
+    "req_id": "ef097c1e-26bb-4f18-8341-48cea880ef4e"
+  },
+  {
+    "title": "Mechanical Engineer",
+    "company": "Graco, Inc.",
+    "location": "Fremont, California, USA",
+    "url": "",
+    "source": "mcp-dice",
+    "posted": "2026-07-10",
+    "salary": "USD 64,600.00 - 113,100.00 per year",
+    "remote": false,
+    "req_id": "d753a178-0d88-4df4-987b-4445f9a8eb11"
+  },
+  {
+    "title": "Staff Software Engineer, Cloud Monitoring",
+    "company": "Crusoe",
+    "location": "San Francisco, California, USA",
+    "url": "https://www.dice.com/job-detail/486ee527-c855-4c40-a546-d829d1124e16",
+    "source": "",
+    "posted": "2026-07-11",
+    "salary": "USD 215,000.00 - 260,000.00 per year",
+    "remote": false,
+    "req_id": "486ee527-c855-4c40-a546-d829d1124e16"
+  },
+  "not-a-row"
+]
