@@ -444,6 +444,38 @@ LEFT JOIN posting_versions v ON v.posting_version_id = rp.posting_version_id
 WHERE pr.status IN ('done', 'imported') AND rp.membership_kind='snapshot';
 """
 
+# Two nullable columns the Phase 2.3 scheduler writes and later phases read.
+#
+# source_runs.inventory_scope — Phase 2.4 marks postings absent only for the exact
+#   inventory a source actually enumerated, and only when that enumeration was
+#   COMPLETE. That decision is the one place in the system where a wrong answer
+#   silently deletes live jobs, so its input is a first-class indexed column on the
+#   attempt row rather than a json_extract() into metadata_json.
+# run_postings.content_hash — Phase 3.1 mints a posting_versions row only on a
+#   material change, which means it needs the previous run's canonical hash to diff
+#   against. Phase 2 only records the hash (NormalizedPosting.content_hash()); it
+#   builds no versioning logic and writes no posting_versions rows.
+#
+# Both are nullable: every pre-existing row (all of them legacy imports) genuinely
+# has no value, and inventing one would be fabricated evidence.
+#
+# The two constants below are shared verbatim by CANONICAL_DDL (fresh databases) and
+# migration 14 (existing databases). SQLite records an added column's definition text
+# byte-for-byte in sqlite_master, so re-spelling the same ALTER in the migration would
+# make an upgraded database structurally unequal to a fresh one.
+SOURCE_RUN_SCOPE_COLUMN_DDL = """
+ALTER TABLE source_runs ADD COLUMN inventory_scope TEXT
+    CHECK (inventory_scope IS NULL OR inventory_scope IN ('complete', 'partial'));
+"""
+
+RUN_POSTING_CONTENT_HASH_COLUMN_DDL = """
+ALTER TABLE run_postings ADD COLUMN content_hash TEXT;
+"""
+
+SCHEDULER_PERSISTENCE_COLUMNS_DDL = (
+    SOURCE_RUN_SCOPE_COLUMN_DDL + RUN_POSTING_CONTENT_HASH_COLUMN_DDL
+)
+
 CANONICAL_DDL = "\n".join((
         PROFILE_VERSIONS_DDL,
         RUNS_DDL,
@@ -454,6 +486,7 @@ CANONICAL_DDL = "\n".join((
         LEGACY_ARTIFACT_IMPORTS_DDL,
         RUN_POSTING_MEMBERSHIP_COLUMN_DDL,
         RUN_POSTING_MEMBERSHIP_OBJECTS_DDL,
+        SCHEDULER_PERSISTENCE_COLUMNS_DDL,
 ))
 
 
@@ -1228,6 +1261,21 @@ def _migration_13_run_posting_membership(conn: sqlite3.Connection) -> None:
     _execute_ddl(conn, RUN_POSTING_MEMBERSHIP_OBJECTS_DDL)
 
 
+def _migration_14_scheduler_persistence(conn: sqlite3.Connection) -> None:
+    """Add source_runs.inventory_scope and run_postings.content_hash.
+
+    Per-column PRAGMA guards rather than a bare ALTER, matching migrations 4 and 13:
+    a fresh database already has both columns from CANONICAL_DDL, and the direct
+    invocation path in the migration tests re-runs this function against it.
+    """
+    source_columns = {r["name"] for r in conn.execute("PRAGMA table_info(source_runs)")}
+    if "inventory_scope" not in source_columns:
+        _execute_ddl(conn, SOURCE_RUN_SCOPE_COLUMN_DDL)
+    membership_columns = {r["name"] for r in conn.execute("PRAGMA table_info(run_postings)")}
+    if "content_hash" not in membership_columns:
+        _execute_ddl(conn, RUN_POSTING_CONTENT_HASH_COLUMN_DDL)
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
@@ -1243,6 +1291,7 @@ MIGRATIONS = [
     (11, "legacy_canonical_backfill", _migration_11_legacy_canonical_backfill),
     (12, "legacy_artifact_imports", _migration_12_legacy_artifact_imports),
     (13, "run_posting_membership", _migration_13_run_posting_membership),
+    (14, "scheduler_persistence_columns", _migration_14_scheduler_persistence),
 ]
 
 

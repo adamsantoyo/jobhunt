@@ -286,7 +286,7 @@ def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
     upgraded_path = tmp_path / "upgraded_equivalent.db"
     build_v4_db(upgraded_path)
     upgraded = connect(upgraded_path)
-    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 14))
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 15))
 
     assert _canonical_structure(upgraded) == _canonical_structure(fresh)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -805,6 +805,7 @@ def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
         (11, "legacy_canonical_backfill"),
         (12, "legacy_artifact_imports"),
         (13, "run_posting_membership"),
+        (14, "scheduler_persistence_columns"),
     ]
 
     for table in ("job_state", "state_events"):
@@ -837,6 +838,7 @@ def test_v11_upgrade_matches_fresh_legacy_import_ledger(tmp_path):
     assert run_migrations(upgraded, str(path)) == [
         (12, "legacy_artifact_imports"),
         (13, "run_posting_membership"),
+        (14, "scheduler_persistence_columns"),
     ]
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(legacy_artifact_imports)")] == [
         tuple(r) for r in fresh.execute("PRAGMA table_info(legacy_artifact_imports)")
@@ -877,7 +879,10 @@ def test_v12_upgrade_classifies_current_only_membership_and_fixes_history_view(t
     )
     conn.commit()
 
-    assert run_migrations(conn, str(path)) == [(13, "run_posting_membership")]
+    assert run_migrations(conn, str(path)) == [
+        (13, "run_posting_membership"),
+        (14, "scheduler_persistence_columns"),
+    ]
     assert conn.execute(
         "SELECT membership_kind FROM run_postings"
     ).fetchone()[0] == "current-only"
@@ -1437,7 +1442,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == set(range(1, 14))
+    assert versions == set(range(1, 15))
     conn.close()
 
 
