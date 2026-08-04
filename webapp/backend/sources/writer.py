@@ -53,6 +53,7 @@ __all__ = [
     "EmitEvents",
     "FinishRun",
     "FinishSourceRun",
+    "MarkPresence",
     "RecordBatch",
     "RunEvent",
     "SqliteWriter",
@@ -246,6 +247,59 @@ class FinishSourceRun:
             error=self.error,
             metadata=self.metadata,
         )
+
+
+@dataclass(slots=True)
+class MarkPresence:
+    """Phase 2.4's presence pass for one settled run, as a single transaction.
+
+    One op rather than one per source, because the pass is a whole-run judgement:
+    every licence has to be read from the same committed snapshot of `source_runs`,
+    and the refresh that returns re-delivered postings to present has to land with
+    the markings rather than beside them.
+
+    Not frozen, and that is the point. The counts only exist once the SQL has run, so
+    `apply` publishes them by ASSIGNING `self.events` and `self.report` — assignment,
+    never append, so a busy-database rollback that replays the whole batch overwrites
+    them instead of doubling them (`WriteOp.apply` must be re-runnable).
+
+    The run-level report is what `FinishRun` carries into `aggregate_report_json`; the
+    per-source events are what Phase 4 replays to show which board dropped what.
+    """
+
+    run_uid: str
+    at: str
+    events: tuple[RunEvent, ...] = ()
+    #: The pass's report, or None when it has not run yet.
+    report: dict | None = field(default=None, compare=False)
+
+    def apply(self, conn: sqlite3.Connection) -> dict:
+        report = runstore.apply_run_presence(conn, run_uid=self.run_uid, at=self.at)
+        events = [
+            RunEvent(
+                run_uid=self.run_uid,
+                event_type="run.presence_refreshed",
+                at=self.at,
+                payload={
+                    "seen": report["seen"],
+                    "returned": report["returned"],
+                    "licensed_sources": report["licensed_sources"],
+                },
+            )
+        ]
+        for scope in report["sources"]:
+            events.append(
+                RunEvent(
+                    run_uid=self.run_uid,
+                    source_run_id=str(scope["source_run_id"]),
+                    event_type="source.absence_marked",
+                    at=self.at,
+                    payload=dict(scope),
+                )
+            )
+        self.events = tuple(events)
+        self.report = report
+        return report
 
 
 @dataclass(frozen=True, slots=True)

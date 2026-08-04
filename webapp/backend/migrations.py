@@ -476,6 +476,56 @@ SCHEDULER_PERSISTENCE_COLUMNS_DDL = (
     SOURCE_RUN_SCOPE_COLUMN_DDL + RUN_POSTING_CONTENT_HASH_COLUMN_DDL
 )
 
+# Six nullable columns carrying Phase 2.4's presence evidence for one posting.
+#
+# Absence is a REVERSIBLE MARKING WITH EVIDENCE, never a delete: no row is removed
+# anywhere, and every column below records something that was observed rather than
+# something that was inferred and then forgotten.
+#
+#   last_seen_at / last_seen_run_uid
+#       the most recent positive observation of this posting by ANY source. A
+#       delivery is direct evidence the posting exists; absence is only ever an
+#       inference, so a delivery always wins and always refreshes these.
+#   absent_since
+#       NULL means present. This is the whole present/absent test, and it is a
+#       timestamp rather than a flag so "how long has it been gone" needs no join.
+#   absent_run_uid / absent_source_run_id
+#       WHICH successful COMPLETE enumeration licensed the marking. Keeping the
+#       attempt id means the licence is auditable: that row in source_runs still
+#       carries its status, scope, timing, and counts.
+#   returned_at
+#       when the posting last came back. Deliberately sticky, as are absent_run_uid
+#       and absent_source_run_id: clearing absent_since on a return would otherwise
+#       erase the fact that an absence ever happened, and "that transition is also
+#       evidenced" is a requirement, not a nicety. A posting that is present now and
+#       was absent before is exactly `absent_since IS NULL AND returned_at IS NOT
+#       NULL`, with the previous absence still fully described beside it.
+#
+# All six are nullable: every pre-existing posting (all of them legacy imports)
+# genuinely has no observation under this scheme, and NULL says that honestly where
+# a default would fabricate one. No index is added — the ownership lookup rides
+# `uq_posting_aliases_active` (alias_kind, namespace) and the membership lookups ride
+# `run_postings`' primary key, so an extra low-selectivity index would only tax every
+# write in the run.
+#
+# Column DDL text is shared verbatim by CANONICAL_DDL (fresh databases) and migration
+# 15 (existing databases), for the sqlite_master reason spelled out above 14.
+POSTING_PRESENCE_COLUMNS = (
+    "last_seen_at",
+    "last_seen_run_uid",
+    "absent_since",
+    "absent_run_uid",
+    "absent_source_run_id",
+    "returned_at",
+)
+
+POSTING_PRESENCE_COLUMN_DDL = {
+    name: f"ALTER TABLE postings ADD COLUMN {name} TEXT;\n"
+    for name in POSTING_PRESENCE_COLUMNS
+}
+
+POSTING_PRESENCE_COLUMNS_DDL = "".join(POSTING_PRESENCE_COLUMN_DDL.values())
+
 CANONICAL_DDL = "\n".join((
         PROFILE_VERSIONS_DDL,
         RUNS_DDL,
@@ -487,6 +537,7 @@ CANONICAL_DDL = "\n".join((
         RUN_POSTING_MEMBERSHIP_COLUMN_DDL,
         RUN_POSTING_MEMBERSHIP_OBJECTS_DDL,
         SCHEDULER_PERSISTENCE_COLUMNS_DDL,
+        POSTING_PRESENCE_COLUMNS_DDL,
 ))
 
 
@@ -1276,6 +1327,21 @@ def _migration_14_scheduler_persistence(conn: sqlite3.Connection) -> None:
         _execute_ddl(conn, RUN_POSTING_CONTENT_HASH_COLUMN_DDL)
 
 
+def _migration_15_posting_presence(conn: sqlite3.Connection) -> None:
+    """Add the six Phase 2.4 presence columns to `postings`.
+
+    Per-column PRAGMA guards rather than a bare ALTER, matching migrations 4, 13, and
+    14: a fresh database already has all six from CANONICAL_DDL, and the migration
+    tests re-invoke this function directly against one. Adding a column is the entire
+    migration — no backfill runs, because a pre-existing posting has no observation
+    under this scheme and writing one would be fabricated evidence.
+    """
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(postings)")}
+    for name, ddl in POSTING_PRESENCE_COLUMN_DDL.items():
+        if name not in columns:
+            _execute_ddl(conn, ddl)
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
@@ -1292,6 +1358,7 @@ MIGRATIONS = [
     (12, "legacy_artifact_imports", _migration_12_legacy_artifact_imports),
     (13, "run_posting_membership", _migration_13_run_posting_membership),
     (14, "scheduler_persistence_columns", _migration_14_scheduler_persistence),
+    (15, "posting_presence_columns", _migration_15_posting_presence),
 ]
 
 

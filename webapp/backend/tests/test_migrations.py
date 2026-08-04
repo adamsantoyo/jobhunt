@@ -213,6 +213,19 @@ def build_v12_db(path):
     conn.close()
 
 
+def build_v14_db(path):
+    build_v12_db(path)
+    conn = connect(path)
+    import backend.migrations as migrations_mod
+    original = list(migrations_mod.MIGRATIONS)
+    migrations_mod.MIGRATIONS[:] = original[:14]
+    try:
+        run_migrations(conn, str(path))
+    finally:
+        migrations_mod.MIGRATIONS[:] = original
+    conn.close()
+
+
 def _objects(conn, object_type):
     return {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type=?", (object_type,)
@@ -286,7 +299,7 @@ def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
     upgraded_path = tmp_path / "upgraded_equivalent.db"
     build_v4_db(upgraded_path)
     upgraded = connect(upgraded_path)
-    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 15))
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 16))
 
     assert _canonical_structure(upgraded) == _canonical_structure(fresh)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -644,8 +657,14 @@ def test_compat_runs_preserves_legacy_health_and_ingested_at(tmp_path):
 def test_canonical_fk_policies_and_uniqueness(tmp_path):
     conn = connect(tmp_path / "constraints.db")
     init_db(conn)
-    conn.execute("INSERT INTO postings VALUES ('p1','active','t0','t0',NULL)")
-    conn.execute("INSERT INTO postings VALUES ('p2','active','t0','t0',NULL)")
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('p1','active','t0','t0',NULL)"
+    )
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('p2','active','t0','t0',NULL)"
+    )
     conn.execute(
         "INSERT INTO posting_aliases VALUES ('a1','p1','url','web','same',NULL,NULL,NULL,NULL,'t0',NULL)"
     )
@@ -692,7 +711,9 @@ def test_canonical_composite_foreign_keys_reject_cross_owner_links(tmp_path):
         conn.execute("INSERT INTO run_events VALUES ('e1','r2','s1',0,'bad','t0',NULL)")
 
     conn.executemany(
-        "INSERT INTO postings VALUES (?,'active','t0','t0',NULL)", [("p1",), ("p2",)],
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES (?,'active','t0','t0',NULL)",
+        [("p1",), ("p2",)],
     )
     conn.execute(
         "INSERT INTO posting_versions "
@@ -717,8 +738,14 @@ def test_canonical_composite_foreign_keys_reject_cross_owner_links(tmp_path):
 def test_posting_version_hash_is_scoped_to_posting(tmp_path):
     conn = connect(tmp_path / "version_hash_scope.db")
     init_db(conn)
-    conn.execute("INSERT INTO postings VALUES ('p1','active','t0','t0',NULL)")
-    conn.execute("INSERT INTO postings VALUES ('p2','active','t0','t0',NULL)")
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('p1','active','t0','t0',NULL)"
+    )
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('p2','active','t0','t0',NULL)"
+    )
     insert = (
         "INSERT INTO posting_versions "
         "(posting_version_id, posting_id, version_hash, observed_at, payload_json) "
@@ -806,6 +833,7 @@ def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
         (12, "legacy_artifact_imports"),
         (13, "run_posting_membership"),
         (14, "scheduler_persistence_columns"),
+        (15, "posting_presence_columns"),
     ]
 
     for table in ("job_state", "state_events"):
@@ -839,6 +867,7 @@ def test_v11_upgrade_matches_fresh_legacy_import_ledger(tmp_path):
         (12, "legacy_artifact_imports"),
         (13, "run_posting_membership"),
         (14, "scheduler_persistence_columns"),
+        (15, "posting_presence_columns"),
     ]
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(legacy_artifact_imports)")] == [
         tuple(r) for r in fresh.execute("PRAGMA table_info(legacy_artifact_imports)")
@@ -882,6 +911,7 @@ def test_v12_upgrade_classifies_current_only_membership_and_fixes_history_view(t
     assert run_migrations(conn, str(path)) == [
         (13, "run_posting_membership"),
         (14, "scheduler_persistence_columns"),
+        (15, "posting_presence_columns"),
     ]
     assert conn.execute(
         "SELECT membership_kind FROM run_postings"
@@ -893,6 +923,90 @@ def test_v12_upgrade_classifies_current_only_membership_and_fixes_history_view(t
             "(run_uid,posting_id,posting_version_id,present,first_seen_in_run,recorded_at,"
             "membership_kind) VALUES ('r','p','v',1,0,'t1','SNAPSHOT')"
         )
+    conn.close()
+
+
+def test_v14_upgrade_matches_fresh_posting_presence_structure(tmp_path):
+    """Migration 15 adds Phase 2.4's presence columns to `postings`.
+
+    SQLite stores an added column's definition text byte-for-byte in sqlite_master, so
+    the upgraded table's CREATE TABLE sql must be character-identical to the fresh
+    one. Comparing the sql, not just `PRAGMA table_info`, is what catches a migration
+    that re-spells the same ALTER.
+    """
+    import backend.migrations as migrations_mod
+
+    fresh = connect(tmp_path / "fresh_v15.db")
+    init_db(fresh)
+    path = tmp_path / "v14_presence.db"
+    build_v14_db(path)
+    upgraded = connect(path)
+
+    before = {r["name"] for r in upgraded.execute("PRAGMA table_info(postings)")}
+    assert not (before & set(migrations_mod.POSTING_PRESENCE_COLUMNS))
+
+    assert run_migrations(upgraded, str(path)) == [(15, "posting_presence_columns")]
+
+    assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(postings)")] == [
+        tuple(r) for r in fresh.execute("PRAGMA table_info(postings)")
+    ]
+    assert upgraded.execute(
+        "SELECT sql FROM sqlite_master WHERE name='postings'"
+    ).fetchone()[0] == fresh.execute(
+        "SELECT sql FROM sqlite_master WHERE name='postings'"
+    ).fetchone()[0]
+    # Every new column is nullable and defaults to NULL: a posting that predates the
+    # scheme has no observation, and a default would fabricate one.
+    added = {
+        r["name"]: (r["notnull"], r["dflt_value"])
+        for r in upgraded.execute("PRAGMA table_info(postings)")
+        if r["name"] in migrations_mod.POSTING_PRESENCE_COLUMNS
+    }
+    assert len(added) == 6
+    assert set(added.values()) == {(0, None)}
+    assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
+    upgraded.close()
+    fresh.close()
+
+
+def test_migration_15_direct_rerun_preserves_recorded_presence(tmp_path):
+    """The PRAGMA guard is what makes a direct re-invocation inert. Without it the
+    ALTER raises 'duplicate column name', and a migration that cannot be re-run is a
+    migration that cannot be dry-run or replayed.
+
+    Non-vacuous by construction: the row inserted below carries real values in all six
+    columns, so a rerun that dropped and re-added them (or that failed halfway) is
+    visible as data loss rather than as a silent pass.
+    """
+    import backend.migrations as migrations_mod
+
+    path = tmp_path / "rerun_v15.db"
+    conn = connect(path)
+    init_db(conn)
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,"
+        "retired_at,last_seen_at,last_seen_run_uid,absent_since,absent_run_uid,"
+        "absent_source_run_id,returned_at) "
+        "VALUES ('p','active','t0','t0',NULL,'t5','run-5','t6','run-6','attempt-6','t4')"
+    )
+    conn.commit()
+    before = dict(conn.execute("SELECT * FROM postings").fetchone())
+    schema_before = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='postings'"
+    ).fetchone()[0]
+    # The guard must have something real to protect.
+    assert before["absent_since"] == "t6"
+    assert before["absent_source_run_id"] == "attempt-6"
+
+    conn.execute("BEGIN IMMEDIATE")
+    migrations_mod._migration_15_posting_presence(conn)
+    conn.commit()
+
+    assert dict(conn.execute("SELECT * FROM postings").fetchone()) == before
+    assert conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='postings'"
+    ).fetchone()[0] == schema_before
+    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     conn.close()
 
 
@@ -1052,7 +1166,9 @@ def test_conflicting_existing_history_mapping_rolls_back(tmp_path):
     target_run = real_insert("pipeline_run", "2026-07-01")
     target_posting = migrations_mod._lineage_posting_id("https://shared", "old-key")
     conn.execute(
-        "INSERT INTO postings VALUES (?, 'active', 't0', 't0', NULL)", (target_posting,)
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES (?, 'active', 't0', 't0', NULL)",
+        (target_posting,)
     )
     conn.execute(
         "INSERT INTO pipeline_runs (run_uid,kind,status,legacy_run_date) "
@@ -1216,7 +1332,9 @@ def test_state_posting_fk_and_partial_uniqueness(tmp_path):
     conn = connect(tmp_path / "state_constraints.db")
     init_db(conn)
     conn.executemany(
-        "INSERT INTO postings VALUES (?,'active','t0','t0',NULL)", [("p1",), ("p2",)]
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES (?,'active','t0','t0',NULL)",
+        [("p1",), ("p2",)]
     )
     conn.execute(
         "INSERT INTO job_state (seen_key, updated_at, posting_id) VALUES ('s1','t0','p1')"
@@ -1442,7 +1560,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == set(range(1, 15))
+    assert versions == set(range(1, 16))
     conn.close()
 
 

@@ -16,9 +16,10 @@ What this module is NOT:
   * It never mints `posting_versions` rows. Creating a version on material change
     is Phase 3.1; Phase 2 only records `run_postings.content_hash` so 3.1 has
     something to diff against.
-  * It never marks a posting absent. That is Phase 2.4, and it is licensed by
-    `source_runs.status = 'succeeded'` plus `source_runs.inventory_scope`, both of
-    which this module writes.
+  * It marks a posting absent only through `apply_run_presence`, and only under the
+    licence `source_runs.status = 'succeeded'` plus
+    `source_runs.inventory_scope = 'complete'` grants. Absence is a reversible
+    marking with evidence; no row is ever removed.
 
 Identity, restated because this is where the rule is enforced (Phase 1 decision,
 `contract.IdentityClaim`):
@@ -62,26 +63,32 @@ from datetime import datetime, timezone
 from .contract import IdentityClaim, JSONValue, NormalizedPosting
 
 __all__ = [
+    "DEFAULT_STALE_AFTER_SECONDS",
     "RecordOutcome",
     "RecoveryReport",
+    "SOURCE_REQ_ALIAS_KIND",
     "SOURCE_RUN_STEP",
     "TERMINAL_SOURCE_RUN_STATUSES",
     "append_run_events",
+    "apply_run_presence",
     "canonical_json",
     "create_pipeline_run",
     "create_source_run",
     "finish_pipeline_run",
     "finish_source_run",
     "latest_checkpoint_json",
+    "mark_absent_for_scope",
     "max_attempt_by_source",
     "new_uid",
     "next_event_sequence",
     "posting_id_for_claim",
     "recover_orphans",
+    "refresh_presence",
     "require_canonical_schema",
     "resumable_runs",
     "resume_plan",
     "reopen_pipeline_run",
+    "source_instance_freshness",
     "successful_source_scopes",
     "update_source_run_progress",
     "utc_now_iso",
@@ -93,6 +100,19 @@ __all__ = [
 #: naming it explicitly keeps the UNIQUE(run_uid, source, step, attempt) key
 #: meaningful if Phase 3 adds `describe`/`score` steps against the same run.
 SOURCE_RUN_STEP = "fetch"
+
+#: The alias kind that carries a source instance's own requisition identity. It is
+#: the ONLY evidence that says "this posting belongs to `greenhouse:anthropic`",
+#: because its namespace is the instance's `source_run_key`. A rank-1 URL alias lives
+#: in the shared `"url"` namespace and names no instance at all, so it can never scope
+#: absence — see `_owned_by_instance_sql`.
+SOURCE_REQ_ALIAS_KIND = "source_req"
+
+#: How old a source instance's last successful enumeration may get before
+#: `source_instance_freshness` calls its data stale. One day: the daily run is the
+#: cadence the Success Contract is written against, so a source that missed a full
+#: day of them is degraded whatever its last attempt said.
+DEFAULT_STALE_AFTER_SECONDS = 24 * 3600
 
 #: Statuses that make a `source_runs` row immutable evidence. `finish_source_run`
 #: refuses to write over any of them, which is how "never overwrite a failed
@@ -125,6 +145,21 @@ def canonical_json(value: object) -> str:
 
 def _json_or_none(value: object) -> str | None:
     return None if value is None else canonical_json(value)
+
+
+#: Migration 15's presence columns, named here rather than imported so that this
+#: module keeps its "no knowledge of migrations" property and a schema drift shows up
+#: as a clear scheduler-start error instead of an OperationalError three batches in.
+_PRESENCE_COLUMNS = frozenset(
+    {
+        "last_seen_at",
+        "last_seen_run_uid",
+        "absent_since",
+        "absent_run_uid",
+        "absent_source_run_id",
+        "returned_at",
+    }
+)
 
 
 def require_canonical_schema(conn: sqlite3.Connection) -> None:
@@ -163,6 +198,13 @@ def require_canonical_schema(conn: sqlite3.Connection) -> None:
         raise RuntimeError(
             "scheduler requires schema version 14 "
             "(source_runs.inventory_scope, run_postings.content_hash)"
+        )
+    posting_columns = {r["name"] for r in conn.execute("PRAGMA table_info(postings)")}
+    missing_presence = sorted(_PRESENCE_COLUMNS - posting_columns)
+    if missing_presence:
+        raise RuntimeError(
+            "scheduler requires schema version 15; postings is missing: "
+            + ", ".join(missing_presence)
         )
 
 
@@ -818,6 +860,313 @@ def successful_source_scopes(conn: sqlite3.Connection, run_uid: str) -> list[dic
             (run_uid, SOURCE_RUN_STEP),
         )
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Presence: Phase 2.4's absence marking
+#
+# The roadmap line this implements: "Mark postings absent only when that source
+# completed successfully. Failed/timed-out sources retain last-known-good records and
+# show degraded freshness."
+#
+# Three rules, each of which exists because breaking it silently deletes live jobs:
+#
+#   LICENCE. Only an attempt that both SUCCEEDED and declared
+#     `inventory_scope='complete'` may mark anything. Partial success, failure,
+#     timeout, cancellation, and interruption all mark nothing at all; those
+#     postings keep their last-known-good state and their staleness shows up in
+#     `source_instance_freshness` instead.
+#   SCOPE. A licence covers only postings whose identity belongs to that exact
+#     source instance, evidenced by an active `source_req` alias in the instance's
+#     own namespace. `greenhouse:anthropic` enumerating its board says nothing
+#     whatsoever about `greenhouse:acme`, about an aggregator's postings, or about a
+#     manual import.
+#   EVIDENCE. Nothing is deleted, nothing is hidden. A marking sets four columns on
+#     `postings` naming the instant, the run, and the licensing attempt, and a
+#     delivery in a later run clears `absent_since` while leaving that record beside
+#     a `returned_at` stamp.
+# --------------------------------------------------------------------------- #
+
+#: Postings whose identity belongs to one source instance. `source_runs.source`,
+#: `SourceTarget.source_run_key`, and `NormalizedPosting.namespace` are the same
+#: string by construction, which is what makes this join exact rather than a guess.
+_OWNED_BY_INSTANCE_SQL = (
+    "SELECT posting_id FROM posting_aliases "
+    "WHERE alias_kind=? AND namespace=? AND valid_to IS NULL"
+)
+
+#: What one attempt actually delivered. This is the join `successful_source_scopes`
+#: documents: `write_records` re-points rows first written by an earlier attempt of
+#: the same target onto the attempt that finished, so on a retried target this is the
+#: whole inventory rather than only the rows attempt 2 happened to insert.
+_DELIVERED_BY_ATTEMPT_SQL = (
+    "SELECT posting_id FROM run_postings "
+    "WHERE run_uid=? AND source_run_id=? AND present=1"
+)
+
+#: Everything any source positively observed in this run.
+_SEEN_IN_RUN_SQL = "SELECT posting_id FROM run_postings WHERE run_uid=? AND present=1"
+
+
+def refresh_presence(
+    conn: sqlite3.Connection, *, run_uid: str, at: str
+) -> dict[str, object]:
+    """Record every positive observation this run made, and undo stale absences.
+
+    A delivery is direct evidence that a posting exists; an absence is only ever an
+    inference from not seeing one. So ANY source that delivered a posting — including
+    a PARTIAL aggregator or a manual import — refreshes its `last_seen_*` and returns
+    it to present. That asymmetry is the safe one: the failure mode of believing a
+    delivery is a posting that lingers a run too long, and the failure mode of
+    ignoring one is a live job the user never sees again.
+
+    `last_seen_at` is the run's own `recorded_at` for that posting rather than the
+    pass's timestamp, so it is a measurement of when delivery happened rather than of
+    when this function ran.
+
+    `absent_run_uid`, `absent_source_run_id`, and `returned_at` are deliberately not
+    cleared: they are what makes the return transition legible afterwards. A posting
+    that is present now and was absent before reads as `absent_since IS NULL AND
+    returned_at IS NOT NULL`, with the previous absence still fully described.
+    """
+    returned = conn.execute(
+        "SELECT COUNT(*) FROM postings WHERE absent_since IS NOT NULL "
+        f"AND posting_id IN ({_SEEN_IN_RUN_SQL})",
+        (run_uid,),
+    ).fetchone()[0]
+    cursor = conn.execute(
+        "UPDATE postings SET "
+        "last_seen_at=(SELECT MAX(rp.recorded_at) FROM run_postings rp "
+        "              WHERE rp.posting_id=postings.posting_id "
+        "                AND rp.run_uid=? AND rp.present=1), "
+        "last_seen_run_uid=?, "
+        "returned_at=CASE WHEN absent_since IS NULL THEN returned_at ELSE ? END, "
+        "absent_since=NULL "
+        f"WHERE posting_id IN ({_SEEN_IN_RUN_SQL})",
+        (run_uid, run_uid, at, run_uid),
+    )
+    return {"seen": cursor.rowcount, "returned": int(returned)}
+
+
+def mark_absent_for_scope(
+    conn: sqlite3.Connection,
+    *,
+    run_uid: str,
+    source: str,
+    source_run_id: str,
+    at: str,
+) -> dict[str, object]:
+    """Mark this instance's unseen postings absent. Caller checks the licence.
+
+    The candidate set is `owned by this instance` minus `delivered by this attempt`
+    minus `observed by anything else in this run`.
+
+    The middle term is the licence's own inventory and is the reason a retried target
+    is safe (2.3's re-point invariant). The third term is a guard, and it is
+    load-bearing rather than redundant: `write_records` refuses to move a membership
+    row ACROSS sources, so when an aggregator resolves a board's posting by URL and
+    inserts the `run_postings` row first, that row keeps the aggregator's
+    `source_run_id` even after the board re-delivers the same posting seconds later.
+    The board's attempt-scoped inventory is then genuinely missing a posting the board
+    genuinely enumerated, and without this clause a live job would be marked absent.
+    The clause is stated as a refusal to contradict a positive observation, which is
+    the same principle `refresh_presence` runs on, and `retained_positively_observed`
+    in the returned report counts exactly the times it mattered.
+
+    `absent_since IS NULL` bounds the UPDATE, so running the pass twice marks nothing
+    a second time and cannot restamp a posting that was already absent — its
+    `absent_since` stays the instant it actually went missing.
+    """
+    owned = conn.execute(
+        f"SELECT COUNT(*) FROM ({_OWNED_BY_INSTANCE_SQL})",
+        (SOURCE_REQ_ALIAS_KIND, source),
+    ).fetchone()[0]
+    inventory = conn.execute(
+        f"SELECT COUNT(*) FROM ({_DELIVERED_BY_ATTEMPT_SQL})", (run_uid, source_run_id)
+    ).fetchone()[0]
+    retained = conn.execute(
+        "SELECT COUNT(*) FROM postings WHERE absent_since IS NULL "
+        f"AND posting_id IN ({_OWNED_BY_INSTANCE_SQL}) "
+        f"AND posting_id NOT IN ({_DELIVERED_BY_ATTEMPT_SQL}) "
+        f"AND posting_id IN ({_SEEN_IN_RUN_SQL})",
+        (SOURCE_REQ_ALIAS_KIND, source, run_uid, source_run_id, run_uid),
+    ).fetchone()[0]
+    cursor = conn.execute(
+        "UPDATE postings SET absent_since=?, absent_run_uid=?, absent_source_run_id=? "
+        "WHERE absent_since IS NULL "
+        f"AND posting_id IN ({_OWNED_BY_INSTANCE_SQL}) "
+        f"AND posting_id NOT IN ({_SEEN_IN_RUN_SQL})",
+        (at, run_uid, source_run_id, SOURCE_REQ_ALIAS_KIND, source, run_uid),
+    )
+    return {
+        "source": source,
+        "source_run_id": source_run_id,
+        "owned": int(owned),
+        "inventory": int(inventory),
+        "marked_absent": cursor.rowcount,
+        "retained_positively_observed": int(retained),
+    }
+
+
+def apply_run_presence(
+    conn: sqlite3.Connection, *, run_uid: str, at: str | None = None
+) -> dict[str, object]:
+    """The whole Phase 2.4 pass for one settled run, in the caller's transaction.
+
+    Refresh first, then mark: a positive observation is stronger evidence than an
+    absence inference, so it is applied before anything is inferred. (The guard in
+    `mark_absent_for_scope` makes the two orders equivalent; doing them in this order
+    means the code does not depend on that.)
+
+    Only the HIGHEST-numbered succeeded attempt of each source is honoured. The
+    scheduler stops attempting a target the moment one succeeds, so a second
+    succeeded attempt for one source can only come from a resume; treating the
+    earlier one as authoritative there would licence it to mark the later attempt's
+    whole inventory absent.
+    """
+    stamp = at or utc_now_iso()
+    presence = refresh_presence(conn, run_uid=run_uid, at=stamp)
+
+    licensed: dict[str, dict[str, object]] = {}
+    for scope in successful_source_scopes(conn, run_uid):
+        if scope["inventory_scope"] != "complete":
+            continue
+        # successful_source_scopes orders by (source, attempt), so a later attempt
+        # of the same source overwrites an earlier one.
+        licensed[str(scope["source"])] = scope
+
+    sources = [
+        mark_absent_for_scope(
+            conn,
+            run_uid=run_uid,
+            source=str(scope["source"]),
+            source_run_id=str(scope["source_run_id"]),
+            at=stamp,
+        )
+        for scope in licensed.values()
+    ]
+    return {
+        "at": stamp,
+        "run_uid": run_uid,
+        "seen": presence["seen"],
+        "returned": presence["returned"],
+        "licensed_sources": len(sources),
+        "marked_absent": sum(int(s["marked_absent"]) for s in sources),
+        "retained_positively_observed": sum(
+            int(s["retained_positively_observed"]) for s in sources
+        ),
+        "sources": sources,
+    }
+
+
+def source_instance_freshness(
+    conn: sqlite3.Connection,
+    *,
+    at: str | None = None,
+    stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS,
+    sources: Sequence[str] | None = None,
+) -> list[dict[str, object]]:
+    """Per-source-instance freshness, computed entirely from `source_runs` evidence.
+
+    This is the data contract behind "failed/timed-out sources ... show degraded
+    freshness". Phase 4 owns the display; there is deliberately no stored freshness
+    state to drift, because every field here is derived from attempt rows that are
+    already immutable.
+
+    A RUN, not an attempt, is the unit: a target that failed once and succeeded on
+    its retry had a good run, and counting its two attempts as one failure and one
+    success would make every retried source look permanently degraded. A run counts
+    as successful for a source when ANY of that source's attempts in it succeeded.
+
+    `licenses_absence` is the same test `apply_run_presence` applies, reported ahead
+    of time: it is true when the most recent run's succeeding attempt declared
+    COMPLETE scope. A source with `licenses_absence` false can never remove a posting
+    from view, however stale it is — which is exactly the intended failure mode.
+    """
+    now = _parse_instant(at) if at else datetime.now(timezone.utc)
+    rows = conn.execute(
+        "SELECT source, run_uid, attempt, status, inventory_scope, "
+        "  COALESCE(finished_at, started_at, requested_at) AS at "
+        "FROM source_runs WHERE step=? ORDER BY source, attempt",
+        (SOURCE_RUN_STEP,),
+    ).fetchall()
+
+    wanted = None if sources is None else set(sources)
+    by_source: dict[str, dict[str, dict[str, object]]] = {}
+    for row in rows:
+        source = row["source"]
+        if wanted is not None and source not in wanted:
+            continue
+        runs = by_source.setdefault(source, {})
+        run = runs.setdefault(
+            row["run_uid"],
+            {"at": None, "succeeded": False, "complete": False, "last_status": None},
+        )
+        stamp = row["at"]
+        if stamp and (run["at"] is None or stamp > run["at"]):
+            run["at"] = stamp
+        # Attempts arrive in ascending order, so the last one wins.
+        run["last_status"] = row["status"]
+        if row["status"] == "succeeded":
+            run["succeeded"] = True
+            run["complete"] = row["inventory_scope"] == "complete"
+
+    report: list[dict[str, object]] = []
+    for source in sorted(by_source):
+        ordered = sorted(
+            by_source[source].values(),
+            key=lambda r: (r["at"] or "", ),
+            reverse=True,
+        )
+        last_success_at = next((r["at"] for r in ordered if r["succeeded"]), None)
+        last_complete_at = next(
+            (r["at"] for r in ordered if r["succeeded"] and r["complete"]), None
+        )
+        consecutive = 0
+        for run in ordered:
+            if run["succeeded"]:
+                break
+            consecutive += 1
+        newest = ordered[0]
+        age = _age_seconds(last_success_at, now)
+        report.append(
+            {
+                "source": source,
+                "last_success_at": last_success_at,
+                "last_complete_success_at": last_complete_at,
+                "last_attempt_at": newest["at"],
+                "last_attempt_status": newest["last_status"],
+                "consecutive_failed_runs": consecutive,
+                "runs_observed": len(ordered),
+                "age_seconds": age,
+                "stale": (
+                    last_success_at is None
+                    or consecutive > 0
+                    or (age is not None and age > stale_after_seconds)
+                ),
+                "licenses_absence": bool(newest["succeeded"] and newest["complete"]),
+            }
+        )
+    return report
+
+
+def _parse_instant(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _age_seconds(stamp: object, now: datetime) -> float | None:
+    """Seconds between a stored timestamp and `now`, or None when unusable.
+
+    An unparseable timestamp returns None rather than raising: freshness is a
+    reporting query, and one malformed row must not take out the whole report.
+    """
+    if not isinstance(stamp, str) or not stamp.strip():
+        return None
+    try:
+        return max(0.0, (now - _parse_instant(stamp)).total_seconds())
+    except ValueError:
+        return None
 
 
 def resumable_runs(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict[str, object]]:

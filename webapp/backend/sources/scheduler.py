@@ -23,6 +23,12 @@ WHAT THIS OWNS (the adapter side of the table in `contract.py` owns the rest):
                 broadcast.
   recovery      attempts left 'running' by a dead process are marked interrupted,
                 and an interrupted run can be resumed as an explicit decision.
+  presence      once every target has settled and committed, one whole-run pass
+                (`MarkPresence` -> `runstore.apply_run_presence`) refreshes what was
+                seen and marks absent what a successful COMPLETE enumeration proved
+                gone. It runs before the run's own terminal row so its result is part
+                of that run's evidence, and it is skipped entirely on a cancelled or
+                failed run.
 
 FIVE DECISIONS WORTH RATIFYING, because for each one the obvious implementation
 is subtly wrong:
@@ -87,13 +93,20 @@ from .contract import (
     Transport,
     TransportKind,
 )
-from .runstore import RecoveryReport, resumable_runs, resume_plan, successful_source_scopes
+from .runstore import (
+    RecoveryReport,
+    resumable_runs,
+    resume_plan,
+    source_instance_freshness,
+    successful_source_scopes,
+)
 from .transport import PacedTransport
 from .writer import (
     CreateSourceRun,
     EmitEvents,
     FinishRun,
     FinishSourceRun,
+    MarkPresence,
     RecordBatch,
     RunEvent,
     SqliteWriter,
@@ -113,8 +126,20 @@ __all__ = [
     "recover_orphans",
     "resumable_runs",
     "resume_plan",
+    "source_instance_freshness",
     "successful_source_scopes",
 ]
+
+#: Run outcomes that licence the Phase 2.4 presence pass. A cancelled run is excluded
+#: by decision: cancellation stops targets mid-enumeration, and a COMPLETE-scope
+#: target that settled before the cancel arrived would otherwise mark its instance's
+#: unseen postings absent on the strength of a run whose other evidence is missing.
+#: A failed run is excluded because the failure is either the writer (no evidence
+#: landed) or the scheduler itself (the report cannot be trusted to describe the run).
+#: `partial` IS included: per-source failure isolation is the whole design, and a
+#: healthy board must still be able to retire its own closed requisitions on a day
+#: another board 404s.
+PRESENCE_PASS_RUN_STATUSES = frozenset({"succeeded", "partial"})
 
 
 # --------------------------------------------------------------------------- #
@@ -663,7 +688,14 @@ class Scheduler:
                     "message": str(writer.failure),
                     "stage": "writer",
                 }
-            report = _run_report(plan, results, gates, writer)
+            # Phase 2.4. After every target has settled and everything they produced
+            # has committed, and before the run writes its own terminal row, so the
+            # pass reads a complete snapshot of this run's attempts and its result is
+            # part of the same run's evidence rather than a later run's.
+            absence = await self._settle_presence(
+                writer, run_uid=run_uid, at=finished_at, run_status=run_status
+            )
+            report = _run_report(plan, results, gates, writer, absence)
             writer.submit_soon(
                 FinishRun(
                     run_uid=run_uid,
@@ -1203,6 +1235,36 @@ class Scheduler:
             error=error,
         )
 
+    # -- presence ---------------------------------------------------------- #
+    async def _settle_presence(
+        self,
+        writer: SqliteWriter,
+        *,
+        run_uid: str,
+        at: str,
+        run_status: str,
+    ) -> dict | None:
+        """Run the Phase 2.4 presence pass, or decline to and say so with `None`.
+
+        Declining is the safe direction and is what the roadmap asks for on every
+        path that is not a settled run: "failed/timed-out sources retain
+        last-known-good records". A run that never reached the pass simply leaves
+        every posting exactly as the last successful run left it.
+
+        The submit and drain are suppressed as a pair. This runs inside `_execute`'s
+        `finally`, where a raise would replace whatever outcome the run already has
+        with a persistence error, and where the run task may itself be under
+        cancellation. A pass that could not commit reports `None` — no marking is
+        strictly better than a partial one.
+        """
+        if run_status not in PRESENCE_PASS_RUN_STATUSES or writer.failure is not None:
+            return None
+        op = MarkPresence(run_uid=run_uid, at=at)
+        with contextlib.suppress(BaseException):
+            await writer.submit(op)
+            await writer.drain()
+        return op.report
+
     # -- helpers ----------------------------------------------------------- #
     async def _close_stream(
         self, stream: object, *, cancelled: bool, cleanup: set[asyncio.Task]
@@ -1333,9 +1395,14 @@ def _run_report(
     results: Sequence[TargetResult],
     gates: _Gates,
     writer: SqliteWriter,
+    absence: dict | None = None,
 ) -> dict[str, object]:
     return {
         "targets": len(plan),
+        #: None means the presence pass did not run (cancelled run, failed run, or
+        #: dead writer). That is a materially different statement from a pass that
+        #: ran and marked nothing, and the report must not conflate them.
+        "presence": absence,
         "succeeded": sum(1 for t in results if t.status == "succeeded"),
         "failed": sum(1 for t in results if t.status in ("failed", "timeout")),
         "cancelled": sum(1 for t in results if t.status == "cancelled"),

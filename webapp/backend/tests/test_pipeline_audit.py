@@ -101,7 +101,7 @@ def test_fully_backfilled_database_is_ready_and_json_safe(tmp_path):
 
     assert report["readiness"] == {"ready": True, "blockers": []}
     assert report["database"] == {
-        "integrity_check": "ok", "foreign_key_violation_count": 0, "schema_version": 14,
+        "integrity_check": "ok", "foreign_key_violation_count": 0, "schema_version": 15,
     }
     for private_value in (
         PRIVATE_URL, PRIVATE_KEY, PRIVATE_TITLE, PRIVATE_COMPANY, PRIVATE_NOTES,
@@ -132,7 +132,10 @@ def test_current_missing_and_unexpected_rows_are_counted(tmp_path):
     conn.execute(
         "UPDATE posting_versions SET version_kind='other' WHERE version_kind='legacy-current'"
     )
-    conn.execute("INSERT INTO postings VALUES ('extra','active','2026-01-01','t0',NULL)")
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('extra','active','2026-01-01','t0',NULL)"
+    )
     conn.execute(
         "INSERT INTO posting_aliases "
         "(alias_id,posting_id,alias_kind,namespace,value,url,valid_from) "
@@ -229,7 +232,10 @@ def test_stale_archive_payload_does_not_account_changed_state(tmp_path):
 def test_ambiguous_lineage_encodings_and_orphan_mapping_block(tmp_path):
     conn, _ = _backfilled_db(tmp_path)
     posting_id = conn.execute("SELECT posting_id FROM postings").fetchone()[0]
-    conn.execute("INSERT INTO postings VALUES ('other','active','t0','t0',NULL)")
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('other','active','t0','t0',NULL)"
+    )
     encoded = json.dumps([PRIVATE_URL, PRIVATE_KEY], indent=1)
     conn.execute(
         "INSERT INTO legacy_identity_map VALUES ('lineage','legacy-db',?,'other','t0',NULL)",
@@ -247,7 +253,10 @@ def test_ambiguous_lineage_encodings_and_orphan_mapping_block(tmp_path):
 
 def test_orphan_posting_and_hidden_run_membership_block(tmp_path):
     conn, _ = _backfilled_db(tmp_path)
-    conn.execute("INSERT INTO postings VALUES ('orphan','active','t0','t0',NULL)")
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('orphan','active','t0','t0',NULL)"
+    )
     conn.execute(
         "INSERT INTO pipeline_runs (run_uid,kind,status,legacy_run_date) "
         "VALUES ('running-extra','full','running','2099-01-01')"
@@ -274,7 +283,10 @@ def test_orphan_posting_and_hidden_run_membership_block(tmp_path):
 def test_identity_conflicts_cycles_ambiguity_and_orphans_are_detected(tmp_path):
     conn, _ = _backfilled_db(tmp_path)
     posting_id = conn.execute("SELECT posting_id FROM postings").fetchone()[0]
-    conn.execute("INSERT INTO postings VALUES ('second','active','2026-01-01','t0',NULL)")
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('second','active','2026-01-01','t0',NULL)"
+    )
     conn.execute("DROP INDEX uq_posting_aliases_active")
     conn.execute(
         "INSERT INTO posting_aliases "
@@ -312,7 +324,10 @@ def test_identity_conflicts_cycles_ambiguity_and_orphans_are_detected(tmp_path):
 def test_first_seen_regression_blocks_and_recycled_url_is_reported(tmp_path):
     conn, _ = _backfilled_db(tmp_path)
     conn.execute("UPDATE postings SET first_seen_at='2026-08-01'")
-    conn.execute("INSERT INTO postings VALUES ('retired','retired','2025-01-01','t0','t1')")
+    conn.execute(
+        "INSERT INTO postings (posting_id,identity_status,first_seen_at,created_at,retired_at) "
+        "VALUES ('retired','retired','2025-01-01','t0','t1')"
+    )
     conn.execute(
         "INSERT INTO posting_aliases "
         "(alias_id,posting_id,alias_kind,namespace,value,url,valid_from,valid_to) "
