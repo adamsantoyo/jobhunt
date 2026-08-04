@@ -532,7 +532,7 @@ def test_every_change_query_is_index_keyed_and_never_scans_a_table(tmp_path):
     connect = make_connect(tmp_path)
     conn = connect()
     try:
-        _write_runs(conn, runs=2, postings=600)
+        _write_runs(conn, runs=20, postings=150)
         run_uid = "run-1"
         # The real statements, captured with their parameters already substituted, so
         # this cannot drift from what the code actually runs.
@@ -682,6 +682,13 @@ def _write_runs(conn, *, runs=2, postings=600, sources=8):
     index on it is worth using. A fixture that put every row under one attempt would
     make SQLite prefer a table scan for perfectly sound reasons and the plan assertions
     would be measuring the fixture rather than the query.
+
+    `runs` matters for the same reason on the other axis: `run_uid = ?` predicates are
+    only worth an index seek when one run is a small slice of `run_postings`. With two
+    runs, half the table matches and the post-ANALYZE planner is right to scan it —
+    and whether it does varies with statistics sampling, which made the plan test
+    flake roughly one run in three on a loaded machine. Keep any run's slice well
+    under ten percent of the table.
     """
     per_source = max(1, postings // sources)
     for index in range(runs):
