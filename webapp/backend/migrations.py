@@ -718,6 +718,114 @@ CREATE INDEX IF NOT EXISTS idx_posting_redirects_to
     ON posting_redirects(to_posting_id);
 """
 
+# Phase 5's outcome-capture evidence (migration 21): "what the app showed" and
+# "what the visitor did with it," each recorded once and never mutated.
+#
+# recommendation_snapshots / recommendation_snapshot_items
+#     One header per served queue (a sweep page, an API page render, ...) plus one
+#     row per posting shown on it, in rank order. `recommendation_snapshot_items`
+#     denormalizes tier/odds/source/role_family etc. AT CAPTURE TIME, by design:
+#     these are POINT-IN-TIME facts about what the visitor actually saw, and a
+#     posting's live score can move (rescoring, a new version) without rewriting
+#     history that already happened. Joining live tables for "what did we show on
+#     day X" would silently answer a different question than was asked.
+#
+#     `recommendation_id` is NULLABLE. `recommendations.posting_version_id` and
+#     `.profile_version_id` are both NOT NULL (a recommendation is a claim about a
+#     specific version scored against a specific profile), so a `recommendations`
+#     row can only be ensured when a snapshot item resolves BOTH. An item captured
+#     before a posting has ever been versioned/scored, or captured with no
+#     resolvable profile identity, still gets its snapshot item row (the point-in-
+#     time facts are recorded regardless) but simply has no `recommendations` row
+#     to point at yet -- NULL says that honestly rather than fabricating a link.
+#
+# outcome_events
+#     One append-only row per visitor action against a posting: "opened" today,
+#     other kinds later. Deliberately NOT `recommendation_events` (migration 9's
+#     table, which stays virgin by design -- see outcomes.py's module docstring):
+#     an "open" is a fact about a job posting, not necessarily about any specific
+#     recommendation row, and a visitor can open a job the queue never served
+#     (a direct link, a bookmark). The CHECK requires at least one of
+#     posting_id/seen_key/url so every event is addressable by SOMETHING, even an
+#     unresolved url for a job this database has never tracked. `rank` additionally
+#     CHECKs >= 1 when given, and the composite (snapshot_id, rank) FK ties an
+#     event's rank to an ACTUAL served item -- MATCH SIMPLE (SQLite's only mode
+#     for multi-column FKs) means it only bites when both columns are non-NULL,
+#     so the plain `snapshot_id` FK still validates snapshot-only events with no
+#     rank. `idempotency_key` is nullable and UNIQUE (SQLite UNIQUE permits many
+#     NULLs) -- callers that supply one get de-duped inserts; callers that don't
+#     get one row per call, same as before this column existed.
+#
+# recommendation_snapshot_items also carries `title`/`company` (denormalized at
+# capture time, same reasoning as tier/odds/source above), and
+# `idx_recommendation_snapshot_items_recommendation` indexes its
+# `recommendation_id` FK for the join back to `recommendations`.
+#
+# No WITHOUT ROWID: not used elsewhere in this schema, and these tables gain
+# nothing from it (no covering-index access pattern that would benefit).
+OUTCOME_SNAPSHOTS_DDL = """
+CREATE TABLE IF NOT EXISTS recommendation_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    surface TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    profile_version_id TEXT REFERENCES profile_versions(profile_version_id) ON DELETE RESTRICT,
+    scorer_hash TEXT,
+    queue_size INTEGER NOT NULL CHECK (queue_size >= 0),
+    metadata_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_recommendation_snapshots_surface_captured
+    ON recommendation_snapshots(surface, captured_at);
+
+CREATE TABLE IF NOT EXISTS recommendation_snapshot_items (
+    snapshot_id TEXT NOT NULL REFERENCES recommendation_snapshots(snapshot_id) ON DELETE CASCADE,
+    rank INTEGER NOT NULL CHECK (rank >= 1),
+    recommendation_id TEXT REFERENCES recommendations(recommendation_id) ON DELETE RESTRICT,
+    posting_id TEXT NOT NULL REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    posting_version_id TEXT REFERENCES posting_versions(posting_version_id) ON DELETE RESTRICT,
+    score_version_id TEXT REFERENCES score_versions(score_version_id) ON DELETE RESTRICT,
+    tier INTEGER,
+    odds TEXT,
+    odds_score INTEGER,
+    source TEXT,
+    source_category TEXT,
+    match_label TEXT,
+    competition_label TEXT,
+    role_family TEXT,
+    title TEXT,
+    company TEXT,
+    PRIMARY KEY (snapshot_id, rank),
+    UNIQUE (snapshot_id, posting_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recommendation_snapshot_items_posting
+    ON recommendation_snapshot_items(posting_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_recommendation_snapshot_items_recommendation
+    ON recommendation_snapshot_items(recommendation_id);
+
+CREATE TABLE IF NOT EXISTS outcome_events (
+    outcome_event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    at TEXT NOT NULL,
+    posting_id TEXT REFERENCES postings(posting_id) ON DELETE RESTRICT,
+    seen_key TEXT,
+    url TEXT,
+    snapshot_id TEXT REFERENCES recommendation_snapshots(snapshot_id) ON DELETE RESTRICT,
+    rank INTEGER,
+    payload_json TEXT,
+    idempotency_key TEXT UNIQUE,
+    CHECK (posting_id IS NOT NULL OR seen_key IS NOT NULL OR url IS NOT NULL),
+    CHECK (rank IS NULL OR rank >= 1),
+    FOREIGN KEY (snapshot_id, rank) REFERENCES recommendation_snapshot_items(snapshot_id, rank)
+);
+CREATE INDEX IF NOT EXISTS idx_outcome_events_posting_at
+    ON outcome_events(posting_id, at);
+CREATE INDEX IF NOT EXISTS idx_outcome_events_kind_at
+    ON outcome_events(kind, at);
+CREATE INDEX IF NOT EXISTS idx_outcome_events_snapshot
+    ON outcome_events(snapshot_id, rank);
+CREATE INDEX IF NOT EXISTS idx_outcome_events_seen_key
+    ON outcome_events(seen_key, at);
+"""
+
 CANONICAL_DDL = "\n".join((
         PROFILE_VERSIONS_DDL,
         RUNS_DDL,
@@ -733,6 +841,7 @@ CANONICAL_DDL = "\n".join((
         RUN_POSTING_SOURCE_STATE_COLUMN_DDL,
         SCORE_VERSION_SUPERSESSION_DDL,
         SCORE_GRAPH_DDL,
+        OUTCOME_SNAPSHOTS_DDL,
 ))
 
 
@@ -1625,6 +1734,18 @@ def _migration_20_score_graph(conn: sqlite3.Connection) -> None:
     _execute_ddl(conn, SCORE_GRAPH_DDL)
 
 
+def _migration_21_outcome_snapshots(conn: sqlite3.Connection) -> None:
+    """Create `recommendation_snapshots`, `recommendation_snapshot_items`, and
+    `outcome_events` — Phase 5's outcome-capture evidence (see OUTCOME_SNAPSHOTS_DDL
+    above for what each table is for).
+
+    Table/index-only and `IF NOT EXISTS` throughout, so this is idempotent by
+    construction on a fresh database (CANONICAL_DDL already created all three) and
+    under the direct re-invocation the migration tests make.
+    """
+    _execute_ddl(conn, OUTCOME_SNAPSHOTS_DDL)
+
+
 # Ordered (version, name, fn). Append new migrations here; never renumber.
 MIGRATIONS = [
     (1, "state_events", _migration_1_state_events),
@@ -1647,6 +1768,7 @@ MIGRATIONS = [
     (18, "run_posting_source_state", _migration_18_run_posting_source_state),
     (19, "score_version_supersession", _migration_19_score_version_supersession),
     (20, "score_graph", _migration_20_score_graph),
+    (21, "outcome_snapshots", _migration_21_outcome_snapshots),
 ]
 
 
