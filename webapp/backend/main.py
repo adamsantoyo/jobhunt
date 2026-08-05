@@ -17,7 +17,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import config
 from .db import connect, init_db
 from .ingest import ingest
-from .routers import analytics, changes, configapi, funnel, jobs, sweepapi, state
+from .routers import analytics, changes, configapi, funnel, jobs, readsv2, runsapi, sweepapi, state
+from .runservice import recover_orphans_if_canonical, shutdown_default_service
 from .sweeprunner import runner
 
 
@@ -34,6 +35,20 @@ async def lifespan(app: FastAPI):
                 print(f"[startup] ingest FAILED: {e}", file=sys.stderr)
     finally:
         conn.close()
+    # Canonical runs left 'running' by a dead process are reconciled here, before
+    # any new run can start. Gated on the canonical schema being present and
+    # wrapped besides: the live v4 database has none of those tables, and a boot
+    # must never depend on this succeeding.
+    try:
+        report = recover_orphans_if_canonical()
+        if report is not None and report.total:
+            print(
+                f"[startup] canonical recovery: {len(report.run_uids)} run(s), "
+                f"{len(report.source_run_ids)} attempt(s) marked interrupted",
+                file=sys.stderr,
+            )
+    except Exception as e:  # noqa: BLE001 - startup must survive a locked/odd database
+        print(f"[startup] canonical recovery skipped: {e}", file=sys.stderr)
     yield
     # Teardown: never orphan a running pipeline subprocess (it lives in its own
     # session, so nothing else would reap it after the server exits).
@@ -41,6 +56,12 @@ async def lifespan(app: FastAPI):
         await runner.shutdown()
     except Exception as e:  # noqa: BLE001 - teardown must not block shutdown
         print(f"[shutdown] runner cleanup failed: {e}", file=sys.stderr)
+    # Canonical runs get the same courtesy: a cancelled run writes its own
+    # terminal rows, so stopping this way leaves evidence rather than orphans.
+    try:
+        await shutdown_default_service()
+    except Exception as e:  # noqa: BLE001 - teardown must not block shutdown
+        print(f"[shutdown] run service cleanup failed: {e}", file=sys.stderr)
 
 
 app = FastAPI(title="JobHunt", lifespan=lifespan)
@@ -81,7 +102,7 @@ app.add_middleware(CsrfGuard)
 
 
 # --- /api routers FIRST -----------------------------------------------------
-for module in (jobs, state, analytics, changes, sweepapi, configapi, funnel):
+for module in (jobs, state, analytics, changes, sweepapi, configapi, funnel, runsapi, readsv2):
     app.include_router(module.router, prefix="/api")
 
 
