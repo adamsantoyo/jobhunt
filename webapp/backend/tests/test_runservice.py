@@ -1153,6 +1153,25 @@ def test_the_default_service_is_a_process_singleton():
         runservice.reset_default_service()
 
 
+def test_the_default_service_wires_a_real_scheduler_transport():
+    """The production service must never run a fetch transportless.
+
+    Regression for the 4.7 cutover finding: a bare RunService() has no
+    scheduler transport, so every TransportKind.HTTP source fails instantly
+    with ConfigError ("this fetch context has no transport") -- 203/203
+    sources failed on the first real full-direct run. default_service() is
+    the production wiring point, so the wiring is asserted there.
+    """
+    runservice.reset_default_service()
+    try:
+        service = runservice.default_service()
+        assert service._scheduler_transport is not None
+        assert hasattr(service._scheduler_transport, "send")
+        asyncio.run(runservice._aclose_transport(service._scheduler_transport))
+    finally:
+        runservice.reset_default_service()
+
+
 def test_every_service_error_is_a_runservice_error():
     for error in (UnknownRunKind, UnsupportedRunKind, RunConflict, CanonicalSchemaUnavailable, UnknownRun):
         assert issubclass(error, RunServiceError)

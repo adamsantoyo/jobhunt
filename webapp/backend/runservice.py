@@ -1522,7 +1522,14 @@ _DEFAULT_SERVICE: RunService | None = None
 def default_service() -> RunService:
     global _DEFAULT_SERVICE
     if _DEFAULT_SERVICE is None:
-        _DEFAULT_SERVICE = RunService()
+        # The production wiring point, and the only place the real HTTP
+        # transport is attached: a fetch stage without one can only fail
+        # (contract.py raises ConfigError for every TransportKind.HTTP
+        # source), while a bare RunService() stays a network-free object for
+        # tests to build freely.
+        from .sources.transport import HttpxTransport  # noqa: PLC0415 - httpx is imported lazily
+
+        _DEFAULT_SERVICE = RunService(scheduler_transport=HttpxTransport())
     return _DEFAULT_SERVICE
 
 
@@ -1535,3 +1542,7 @@ def reset_default_service() -> None:
 async def shutdown_default_service(timeout: float = 5.0) -> None:
     if _DEFAULT_SERVICE is not None:
         await _DEFAULT_SERVICE.aclose(timeout=timeout)
+        # default_service() built this transport, so it is closed here -- the
+        # same ownership rule `_enrichment_transport_for_run` states: one
+        # built here is closed here.
+        await _aclose_transport(_DEFAULT_SERVICE._scheduler_transport)
