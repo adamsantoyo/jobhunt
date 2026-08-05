@@ -271,3 +271,72 @@ def test_outcomes_module_exposes_no_update_or_delete_sql():
     pattern = re.compile(r"\b(update|delete)\b", re.IGNORECASE)
     offenders = [lit for lit in _sql_string_literals(outcomes) if pattern.search(lit)]
     assert offenders == [], f"outcomes.py must never UPDATE/DELETE a stored row: {offenders!r}"
+
+
+# --------------------------------------------------------------------------- #
+# 6. M4: `outcome_analytics.py` seam pins -- the `_enrich_item` call shape it
+# depends on, and the monkeypatchable-attribute-access path it must use to
+# reach `_load_profile`
+# --------------------------------------------------------------------------- #
+def test_enrich_item_accepts_posting_id_only_call_shape(tmp_path, monkeypatch):
+    """`outcome_analytics._attribute_dimensions` calls `outcomes._enrich_item`
+    with the MINIMAL item shape `{"posting_id": ...}` -- no rank, no
+    overrides. This pins that call shape keeps working and that the returned
+    dict still carries (at least) every field 5.3 actually reads off it
+    today (`source`, `source_category`, `match_label`, `competition_label`,
+    `role_family`) plus the rest of the enrichment surface a future 5.3
+    change might start reading (`posting_version_id`, `score_version_id`,
+    `tier`, `odds`, `odds_score`, `title`, `company`) -- everything
+    `_enrich_item` documents itself as resolving. NOTE (deviation from the
+    task brief's literal key list): `_enrich_item`'s return dict has never
+    had a `posting_id` key -- that value is the CALLER's input, not
+    something the function echoes back -- so it is deliberately excluded
+    from the minimum-keys set pinned below rather than asserted (and
+    failing) against a key that was never part of this function's contract.
+    """
+    conn = connect(tmp_path / "enrich_item_shape.db")
+    init_db(conn)
+    profile = _FakeProfile({}, content_hash="m4-enrich-item-hash")
+    monkeypatch.setattr(outcomes, "_load_profile", lambda: profile)
+    _ensure_profile_row(conn, "m4-enrich-item-hash", content_hash="m4-enrich-item-hash")
+    _insert_posting(conn, "p1")
+    _insert_version(conn, "p1", "v1", source="greenhouse:acme", odds="Strong match / Standard")
+    conn.commit()
+
+    enriched = outcomes._enrich_item(conn, {"posting_id": "p1"}, profile)
+
+    minimum_keys = {
+        "posting_version_id", "score_version_id", "tier", "odds", "odds_score", "source",
+        "source_category", "match_label", "competition_label", "role_family", "title", "company",
+    }
+    assert minimum_keys <= set(enriched.keys())
+    assert enriched["source"] == "greenhouse:acme"
+    assert enriched["match_label"] == "Strong match"
+    assert enriched["competition_label"] == "Standard"
+    conn.close()
+
+
+def test_outcome_analytics_reaches_load_profile_via_module_attribute_access():
+    """`outcome_analytics.py` must call `outcomes._load_profile()` -- NOT
+    `from .outcomes import _load_profile` followed by a bare call -- because
+    `test_outcome_analytics.py`'s `use_fake_profile` helper (and this
+    module's own `_ensure_profile_row`/monkeypatch pattern) monkeypatches
+    `outcomes._load_profile` itself. A `from`-import binds a local name to
+    the function object AT IMPORT TIME; monkeypatching the attribute on the
+    `outcomes` module afterward would not touch that already-bound local
+    name, so every test using the fake-profile pattern would silently fall
+    through to reading the REAL profile.json (if one exists in this
+    environment) or crash (if it does not) instead of exercising the fake.
+    This is a source-text pin, not a runtime behavior pin, precisely because
+    the failure mode it guards against is invisible at call time in an
+    environment that happens to already have a real profile.json."""
+    import inspect
+
+    import backend.outcome_analytics as outcome_analytics_mod
+
+    source = inspect.getsource(outcome_analytics_mod)
+    assert "outcomes._load_profile" in source, (
+        "outcome_analytics.py must call outcomes._load_profile() via attribute "
+        "access on the outcomes module, not a `from`-import, so tests that "
+        "monkeypatch backend.outcomes._load_profile take effect"
+    )

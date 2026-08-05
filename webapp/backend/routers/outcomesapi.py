@@ -1,28 +1,33 @@
-"""Phase 5, W-5.2: HTTP wiring for `outcomes.py`'s two write paths.
+"""Phase 5, W-5.2/5.3: HTTP wiring for `outcomes.py`'s write paths and
+`outcome_analytics.py`'s read path.
 
   POST /outcomes/snapshots   record one served queue (`outcomes.capture_snapshot`).
   POST /outcomes/events      record one visitor action (`outcomes.record_outcome_event`).
+  GET  /outcomes/analytics   outcome analytics by source/band/family/feature/rank
+                              (`outcome_analytics.outcome_analytics`) -- read-only,
+                              no commit.
 
-NOT mounted in main.py -- the 5.3 consumer wires that once this task and its
-sibling land, exactly like routers/readsv2.py before Phase 4's integration.
-Every test here builds its own local FastAPI app (see
-tests/test_canonical_reads_router.py's `api` fixture for the established
-pattern), never touching webapp/app.db (repo-root conftest.py fences JOBHUNT_DB).
+NOT mounted in main.py -- the 5.4+ consumer wires that, exactly like
+routers/readsv2.py before Phase 4's integration. Every test here builds its
+own local FastAPI app (see tests/test_canonical_reads_router.py's `api`
+fixture for the established pattern), never touching webapp/app.db
+(repo-root conftest.py fences JOBHUNT_DB).
 
 Pydantic request models live in THIS file, not models.py: models.py is a
 shared file this task does not own, and these DTOs are private to the two
-routes below.
+POST routes below.
 """
 from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from .. import outcomes
 from ..db import get_db
 from ..models import b64_to_url
+from ..outcome_analytics import outcome_analytics
 
 router = APIRouter()
 
@@ -106,3 +111,11 @@ def post_event(body: OutcomeEventIn, conn: sqlite3.Connection = Depends(get_db))
         # See post_snapshot's identical clause (F18): a non-serializable
         # `payload` is a caller input error, not a server fault.
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.get("/outcomes/analytics")
+def get_outcome_analytics(
+    min_sample: int = Query(5, ge=0, le=1000),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    return outcome_analytics(conn, min_sample=min_sample)
