@@ -38,7 +38,14 @@ async def lifespan(app: FastAPI):
     conn = connect()
     try:
         init_db(conn)
-        if not config.SKIP_STARTUP_INGEST:
+        # The startup ingest is a legacy write, so 4.7's flag retires it with the
+        # rest of them. Announced on stderr rather than skipped silently: unlike
+        # JOBHUNT_SKIP_STARTUP_INGEST (asked for per-process, by whoever is
+        # watching), this one can be inherited from a cutover-time environment,
+        # and "the database stopped moving" must not be a mystery.
+        if config.WRITES_SOURCE == "canonical":
+            print(f"[startup] ingest skipped: {config.WRITE_GATE_DETAIL}", file=sys.stderr)
+        elif not config.SKIP_STARTUP_INGEST:
             try:
                 rep = ingest(conn)
                 print(f"[startup] ingest ok: {rep.model_dump()}", file=sys.stderr)

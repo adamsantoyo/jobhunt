@@ -39,6 +39,18 @@ os.environ["JOBHUNT_DB"] = str(_FENCE_DB)
 #: independent of whatever is in the developer's environment.
 os.environ["JOBHUNT_READS"] = "legacy"
 
+#: Same lesson, same placement, for 4.7's write flag (`JOBHUNT_WRITES`,
+#: `{legacy, canonical}`, default `legacy`), also read by `backend.config` at
+#: import time. Under `canonical` the three legacy write entry points refuse with
+#: 409 and the startup ingest is skipped, so a developer's shell exporting it for
+#: a manual cutover rehearsal would turn every sweep/ingest test in this suite
+#: into a refusal check -- silently changing what the suite means. The suite is
+#: pinned to `legacy` here because that is the behaviour its assertions describe
+#: (spec decision 12: flag=legacy stays byte-identical, test-pinned); the
+#: `canonical` side is exercised by monkeypatching `config.WRITES_SOURCE` in
+#: test_write_flag.py, never by the ambient environment.
+os.environ["JOBHUNT_WRITES"] = "legacy"
+
 
 @pytest.fixture(scope="session", autouse=True)
 def fence_the_live_database():
