@@ -2,11 +2,20 @@ import { useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
-import { qk, useFreshness, useReview } from "../store/queries";
+import {
+  qk,
+  useCreateRun,
+  useFreshness,
+  useReview,
+  useRuns,
+  useRunsCapability,
+} from "../store/queries";
 import { fmtDate } from "../lib/format";
 import { SOURCE_CHIP_CAP } from "../lib/ui";
+import type { RunKind } from "../api/types";
 import { JobDetailDrawer } from "./JobDetailDrawer";
 import { SweepProgress } from "./SweepProgress";
+import { RunPanel } from "./RunPanel";
 import { SettingsDialog } from "./SettingsDialog";
 
 const NAV: Array<{ to: string; label: string }> = [
@@ -25,6 +34,48 @@ export function AppShell() {
   const reviewCount = review?.length ?? 0;
   const running = freshness?.sweep.running ?? false;
 
+  // Capability probe (spec decision 7): 200 on GET /api/runs means the
+  // database has the canonical run schema and the run controls below drive
+  // POST /api/runs + SSE instead of the legacy sweep endpoints. Anything
+  // else -- still loading, a network error, an unexpected status -- resolves
+  // to "legacy", which is exactly today's behavior, so the fallback is never
+  // a broken or half-canonical UI.
+  const capability = useRunsCapability();
+  const canonical = capability.data === "canonical";
+  // True once the probe has settled either way (success or error) -- as
+  // opposed to `capability.isPending`, still true on its very first fetch.
+  // Nothing canonical- or legacy-specific renders before this: mounting
+  // SweepProgress (it opens a legacy SSE socket) speculatively during the
+  // probe, only to unmount it a moment later once canonical resolves, is
+  // exactly the open/close churn the Chrome 6-per-origin SSE cap punishes.
+  const probeSettled = !capability.isPending;
+
+  // Runs this tab is currently displaying a strip for. Seeded from any run
+  // this process is mid-executing (covers a page reload during a run, and a
+  // retry started from the Sources tab, which has no direct handle to this
+  // component -- it only invalidates the `runs` query this hook shares).
+  const [watchedRuns, setWatchedRuns] = useState<string[]>([]);
+  const runsList = useRuns(5, { enabled: canonical });
+  useEffect(() => {
+    if (!canonical) return;
+    const active = (runsList.data ?? []).filter((r) => r.active).map((r) => r.run_uid);
+    if (active.length === 0) return;
+    setWatchedRuns((prev) => {
+      const missing = active.filter((uid) => !prev.includes(uid));
+      return missing.length === 0 ? prev : [...prev, ...missing];
+    });
+  }, [canonical, runsList.data]);
+  const createRun = useCreateRun();
+
+  // Lane conflicts (runservice.py's `_EXCLUSION_GROUPS`): "daily" and
+  // "full-direct" share the direct-inventory writer lane, so either one
+  // active blocks starting the other; "aggregators" is independent and only
+  // conflicts with itself. Mirrors the legacy path's own affordance, which
+  // disables both its buttons off `freshness.sweep.running`.
+  const activeRuns = (runsList.data ?? []).filter((r) => r.active);
+  const directLaneBusy = activeRuns.some((r) => r.kind === "daily" || r.kind === "full-direct");
+  const aggregatorsLaneBusy = activeRuns.some((r) => r.kind === "aggregators");
+
   // Sweep-control outcomes render as a full-width banner under the topbar, never
   // as a native dialog: Chrome can suppress window.confirm/alert for the page,
   // which once made "Full sweep" a silent no-op.
@@ -35,7 +86,7 @@ export function AppShell() {
     if (e instanceof ApiError && e.status === 409) {
       setBanner({
         tone: "error",
-        text: "A sweep is already running — see the progress strip below, or cancel it there first.",
+        text: "A sweep is already running. See the progress strip below, or cancel it there first.",
       });
     } else {
       setBanner({ tone: "error", text: e instanceof Error ? e.message : String(e) });
@@ -66,6 +117,41 @@ export function AppShell() {
     onError: surfaceError,
     onSettled: () => qc.invalidateQueries({ queryKey: qk.freshness }),
   });
+
+  // Canonical mode's own error handling. A 409 (runservice.py's
+  // `_check_conflicts`) carries a message built for logs, not users -- it
+  // names the conflicting run by UUID. The lane-busy disabling above should
+  // catch this before the request even fires, so a 409 reaching here means a
+  // race (another tab, another process); the banner just needs to say a run
+  // is already going, not spell out which one.
+  const surfaceCanonicalError = (e: unknown) => {
+    if (e instanceof ApiError && e.status === 409) {
+      setBanner({
+        tone: "error",
+        text: "A run is already active in that lane. See the panel below, or wait for it to finish.",
+      });
+    } else if (e instanceof ApiError) {
+      setBanner({ tone: "error", text: e.message });
+    } else {
+      setBanner({ tone: "error", text: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  const startCanonical = (kind: RunKind) => {
+    setBanner(null);
+    createRun.mutate(kind, {
+      onSuccess: (data) => {
+        setWatchedRuns((prev) => (prev.includes(data.run_uid) ? prev : [...prev, data.run_uid]));
+        if (kind === "full-direct") {
+          setBanner({
+            tone: "ok",
+            text: "Full refresh started. Sources run concurrently; the panel below tracks progress.",
+          });
+        }
+      },
+      onError: surfaceCanonicalError,
+    });
+  };
 
   return (
     <div className="app-shell">
@@ -100,7 +186,7 @@ export function AppShell() {
         <header className="topbar">
           <div className="topbar-left">
             <span className="run-date">
-              Run {freshness?.latest_run ? fmtDate(freshness.latest_run) : "—"}
+              Run {freshness?.latest_run ? fmtDate(freshness.latest_run) : "-"}
             </span>
             {freshness?.kept != null && <span className="run-kept">{freshness.kept} kept</span>}
             {freshness?.new_this_run != null && freshness.new_this_run > 0 && (
@@ -114,22 +200,61 @@ export function AppShell() {
           </div>
 
           <div className="topbar-right">
-            <button
-              type="button"
-              className="btn"
-              disabled={running || quick.isPending}
-              onClick={() => quick.mutate()}
-            >
-              Quick refresh
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={running || full.isPending}
-              onClick={() => setConfirmFullOpen(true)}
-            >
-              Full sweep
-            </button>
+            {/* Nothing sweep/run-related renders until the capability probe
+                resolves -- a brief empty slot here beats mounting the legacy
+                SweepProgress SSE socket speculatively and tearing it down a
+                moment later once canonical resolves. */}
+            {probeSettled &&
+              (canonical ? (
+                <>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={createRun.isPending || directLaneBusy}
+                    title={directLaneBusy ? "A daily or full refresh is already running" : undefined}
+                    onClick={() => startCanonical("daily")}
+                  >
+                    Daily refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={createRun.isPending || directLaneBusy}
+                    title={directLaneBusy ? "A daily or full refresh is already running" : undefined}
+                    onClick={() => setConfirmFullOpen(true)}
+                  >
+                    Full refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={createRun.isPending || aggregatorsLaneBusy}
+                    title={aggregatorsLaneBusy ? "Aggregators are already running" : undefined}
+                    onClick={() => startCanonical("aggregators")}
+                  >
+                    Aggregators
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={running || quick.isPending}
+                    onClick={() => quick.mutate()}
+                  >
+                    Quick refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={running || full.isPending}
+                    onClick={() => setConfirmFullOpen(true)}
+                  >
+                    Full sweep
+                  </button>
+                </>
+              ))}
             <button
               type="button"
               className="btn btn-icon"
@@ -154,7 +279,24 @@ export function AppShell() {
           </div>
         )}
 
-        <SweepProgress />
+        {probeSettled &&
+          (canonical ? (
+            watchedRuns.length > 0 && (
+              <div className="run-panel-stack">
+                {watchedRuns.map((uid) => (
+                  <RunPanel
+                    key={uid}
+                    runUid={uid}
+                    onDismiss={() =>
+                      setWatchedRuns((prev) => prev.filter((existing) => existing !== uid))
+                    }
+                  />
+                ))}
+              </div>
+            )
+          ) : (
+            <SweepProgress />
+          ))}
 
         <main className="content">
           <Outlet />
@@ -167,11 +309,11 @@ export function AppShell() {
             className="modal"
             role="dialog"
             aria-modal="true"
-            aria-label="Confirm full sweep"
+            aria-label={canonical ? "Confirm full refresh" : "Confirm full sweep"}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-head">
-              <h2>Run a full sweep?</h2>
+              <h2>{canonical ? "Run a full refresh?" : "Run a full sweep?"}</h2>
               <button
                 type="button"
                 className="btn btn-icon"
@@ -182,10 +324,19 @@ export function AppShell() {
               </button>
             </div>
             <div className="modal-body">
-              <p className="confirm-text">
-                This re-scrapes every source (36 steps) and can take 20-45 minutes. Quick
-                refresh only re-checks known jobs and is usually what you want during the day.
-              </p>
+              {canonical ? (
+                <p className="confirm-text">
+                  This re-scrapes every direct source. Sources run concurrently, so it
+                  typically takes a few minutes rather than tens of minutes. Daily refresh only
+                  re-checks known jobs, targets under a minute, and is usually what you want
+                  during the day.
+                </p>
+              ) : (
+                <p className="confirm-text">
+                  This re-scrapes every source (36 steps) and can take 20-45 minutes. Quick
+                  refresh only re-checks known jobs and is usually what you want during the day.
+                </p>
+              )}
             </div>
             <div className="modal-foot">
               <button type="button" className="btn" onClick={() => setConfirmFullOpen(false)}>
@@ -196,10 +347,11 @@ export function AppShell() {
                 className="btn btn-primary"
                 onClick={() => {
                   setConfirmFullOpen(false);
-                  full.mutate();
+                  if (canonical) startCanonical("full-direct");
+                  else full.mutate();
                 }}
               >
-                Start full sweep
+                {canonical ? "Start full refresh" : "Start full sweep"}
               </button>
             </div>
           </div>

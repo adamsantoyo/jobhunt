@@ -19,6 +19,12 @@ import type {
   FunnelResponse,
   FollowupsResponse,
   ActivityResponse,
+  RunKind,
+  RunStartResponse,
+  RunSummary,
+  RunDetail,
+  SourceOpsResponse,
+  RetryResponse,
 } from "./types";
 
 const APP_HEADER = "X-App";
@@ -105,4 +111,30 @@ export const api = {
     request<{ started: boolean; kind: string }>("/api/sweep/full", { method: "POST" }),
   sweepCancel: () => request<unknown>("/api/sweep/cancel", { method: "POST" }),
   ingest: () => request<IngestReport>("/api/ingest", { method: "POST" }),
+
+  // canonical runs (Phase 4.3). GET /api/runs answers 503 on a legacy
+  // database -- see useRunsCapability, which is the only caller that treats
+  // that status as expected rather than an error. The event stream itself is
+  // opened directly with `new EventSource(...)` in RunPanel, not through
+  // `request()`: EventSource cannot set the X-App header, same as the
+  // existing /api/sweep/progress stream.
+  getRuns: (limit?: number) =>
+    request<RunSummary[]>(`/api/runs${limit != null ? `?limit=${limit}` : ""}`),
+  getRunDetail: (runUid: string) =>
+    request<RunDetail>(`/api/runs/${encodeURIComponent(runUid)}`),
+  createRun: (kind: RunKind) =>
+    request<RunStartResponse>("/api/runs", { method: "POST", ...jsonBody({ kind }) }),
+  cancelRun: (runUid: string) =>
+    request<{ run_uid: string; cancelling: boolean }>(
+      `/api/runs/${encodeURIComponent(runUid)}/cancel`,
+      { method: "POST" },
+    ),
+
+  // source operations panel (Phase 4.4). Pinned contract: phase4-spec.md
+  // wave-2 decision 8.
+  getSourceOps: () => request<SourceOpsResponse>("/api/sources/ops"),
+  retrySource: (source: string) =>
+    request<RetryResponse>(`/api/sources/${encodeURIComponent(source)}/retry`, {
+      method: "POST",
+    }),
 };

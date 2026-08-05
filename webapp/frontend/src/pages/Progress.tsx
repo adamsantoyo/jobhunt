@@ -20,16 +20,18 @@ import { useAnalytics, useActivity, useConfig, useFunnel } from "../store/querie
 import { ChartCard, StatCard } from "../components/progress/panels";
 import { ChartTooltip } from "../components/progress/ChartTooltip";
 import { HeatMatrix } from "../components/progress/HeatMatrix";
+import { SourceOpsPanel } from "../components/progress/SourceOpsPanel";
 import { COMPETITION_COLORS, kfmt, nfmt, TICK, TIER_COLORS, VIZ } from "../components/progress/theme";
 import { fmtDate } from "../lib/format";
 import type { FunnelTotals, StageConversion, TimeInStage } from "../api/types";
 
-// Progress = the two lenses on "how is this search going": My funnel (this
+// Progress = three lenses on "how is this search going": My funnel (this
 // applicant's own event-log-derived pipeline, computed client-side from
-// useFunnel/useActivity/useConfig) and Market (the existing scrape-wide
-// charts, ported unchanged from the old /analytics dashboard).
+// useFunnel/useActivity/useConfig), Market (the existing scrape-wide charts,
+// ported unchanged from the old /analytics dashboard), and Sources (Phase
+// 4.4's canonical-run source health panel, empty-stated until cutover).
 
-type ProgressTab = "funnel" | "market";
+type ProgressTab = "funnel" | "market" | "sources";
 
 const STATUS_ORDER = [
   "New",
@@ -80,7 +82,8 @@ function weeksRemaining(deadline: string | undefined): number {
 export default function Progress() {
   const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get("tab");
-  const tab: ProgressTab = tabParam === "market" ? "market" : "funnel";
+  const tab: ProgressTab =
+    tabParam === "market" ? "market" : tabParam === "sources" ? "sources" : "funnel";
 
   const setTab = (next: ProgressTab) => {
     setSearchParams(
@@ -113,9 +116,17 @@ export default function Progress() {
         >
           Market
         </button>
+        <button
+          type="button"
+          className="chip-toggle"
+          data-on={tab === "sources" ? "1" : "0"}
+          onClick={() => setTab("sources")}
+        >
+          Sources
+        </button>
       </div>
 
-      {tab === "funnel" ? <FunnelTab /> : <MarketTab />}
+      {tab === "funnel" ? <FunnelTab /> : tab === "market" ? <MarketTab /> : <SourceOpsPanel />}
     </div>
   );
 }

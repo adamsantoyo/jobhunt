@@ -242,6 +242,171 @@ export interface ConfigPatch {
   snooze_default_days?: number;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4.3 -- canonical runs
+// ---------------------------------------------------------------------------
+// Mirrors webapp/backend/routers/runsapi.py + runservice.py. Only wired once
+// the capability probe (GET /api/runs) answers 200; a legacy (pre-Phase-4)
+// database answers 503 and the app keeps using SweepEvent/SweepStatus below
+// instead (see useRunsCapability in store/queries.ts).
+
+/** Kinds `RunService.start_run` executes this wave (SUPPORTED_KINDS in
+ * runservice.py). `llm-review` and `manual-import` are real `RunKind`
+ * values but answer 501 until wave 3, so they are not offered here. */
+export type RunKind = "daily" | "full-direct" | "aggregators";
+
+export interface RunStartResponse {
+  run_uid: string;
+  kind: string;
+  status: "running";
+}
+
+export interface RunSummary {
+  run_uid: string;
+  kind: string;
+  status: string;
+  trigger: string | null;
+  requested_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  kept_count: number | null;
+  new_count: number | null;
+  error: unknown;
+  /** True only while THIS server process is still executing the run
+   * (RunService.is_active); false for a run recorded by another process or
+   * before/after this one's lifetime, even if `status` still says
+   * "running" (see `interrupted` recovery in runservice.py). */
+  active: boolean;
+}
+
+export interface SourceRunRow {
+  source_run_id: string;
+  source: string;
+  step: string;
+  attempt: number;
+  status: string;
+  requested_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  deadline_at: string | null;
+  item_count: number | null;
+  fetched_count: number | null;
+  accepted_count: number | null;
+  changed_count: number | null;
+  inventory_scope: string | null;
+  error: unknown;
+}
+
+export interface StageReport {
+  phase: string;
+  at: string;
+  sequence: number;
+  report?: unknown;
+  error?: unknown;
+}
+
+export interface RunSettledStageEntry {
+  status: string;
+  reason?: string;
+  report?: unknown;
+  error?: unknown;
+}
+
+/** Payload of the terminal `service.run.settled` event / `RunDetail.settled`. */
+export interface RunSettledPayload {
+  run_uid: string;
+  kind: string;
+  fetch_status: string;
+  fetch_error: unknown;
+  stages: Record<string, RunSettledStageEntry>;
+  stage_failures: string[];
+  stages_cancelled: string[];
+  outcome: "succeeded" | "partial" | "degraded" | "cancelled" | "failed" | string;
+}
+
+export interface RunDetail {
+  run_uid: string;
+  kind: string;
+  status: string;
+  trigger: string | null;
+  requested_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  kept_count: number | null;
+  new_count: number | null;
+  config_hash: string | null;
+  code_hash: string | null;
+  scorer_hash: string | null;
+  profile_version_id: string | null;
+  report: unknown;
+  error: unknown;
+  active: boolean;
+  source_runs: SourceRunRow[];
+  stages: Record<string, StageReport>;
+  settled: RunSettledPayload | null;
+  terminal: boolean;
+  change_summary: unknown;
+}
+
+/** One parsed frame from GET /api/runs/{run_uid}/events. `payload` is
+ * scheduler/service-derived and can carry adapter error text pulled from a
+ * job source -- render every field as a text node only, never through
+ * dangerouslySetInnerHTML or string-to-JSX interpolation (phase4-spec.md
+ * decision 10). */
+export interface RunEventFrame {
+  sequence: number;
+  event_type: string;
+  at: string;
+  source_run_id: string | null;
+  payload: Record<string, unknown> | null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.4 -- source operations panel
+// ---------------------------------------------------------------------------
+// Pinned contract: plans/phase4-spec.md, wave-2 decision 8. W-B implements
+// GET /api/sources/ops and POST /api/sources/{source}/retry to this shape.
+
+export interface SourceRowAnomaly {
+  flag: boolean;
+  ratio: number | null;
+}
+
+export interface SourceOpsEntry {
+  source: string;
+  /** Null when the source has no configured plan AND no adapter to fall back
+   * on (unregistered): there is nothing to categorize it by. */
+  category: string | null;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+  age_seconds: number | null;
+  /** Null when the source has never run (no freshness row yet): "stale" is
+   * meaningless without a baseline to be stale relative to. */
+  stale: boolean | null;
+  consecutive_failures: number;
+  p50_duration_seconds: number | null;
+  p95_duration_seconds: number | null;
+  last_rows: number | null;
+  median_rows: number | null;
+  row_anomaly: SourceRowAnomaly;
+  circuit_open: boolean;
+  /** Pre-formatted "Type: message" text from the last failed attempt, or null.
+   * Always a string on the wire -- never render this without going through a
+   * defensive coercion first (SourceOpsPanel's `lastErrorText`), in case a
+   * future backend change slips an object back in. */
+  last_error: string | null;
+  licenses_absence: boolean;
+}
+
+export interface SourceOpsResponse {
+  sources: SourceOpsEntry[];
+  generated_at: string;
+}
+
+export interface RetryResponse {
+  run_uid: string;
+}
+
 // SSE event shape emitted by GET /api/sweep/progress
 // SSE event shape emitted by GET /api/sweep/progress.
 // `sync` and `bye` are transport-level: `sync` is the per-subscriber catch-up frame

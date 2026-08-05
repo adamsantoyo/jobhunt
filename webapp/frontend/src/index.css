@@ -1,5 +1,5 @@
 /* ============================================================================
-   JobHunt — dark, dense design tokens + component styles.
+   JobHunt -- dark, dense design tokens + component styles.
    All colors/spacing live here as CSS variables; components use semantic classes.
    ========================================================================== */
 
@@ -1321,3 +1321,153 @@ mark.hl {
 .ce-wrap { display: flex; flex-direction: column; gap: 8px; background: var(--bg-1); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 10px; }
 .ce-footer { display: flex; align-items: center; gap: 10px; }
 .ce-error { color: var(--red); }
+
+/* ============================================================================
+   Run panel (Phase 4.3 canonical mode) -- replaces the sweep strip once the
+   capability probe confirms a canonical database. Shared `.run-chip` classes
+   also style the two stage rows (enrichment/scoring) and the per-source rows.
+   ========================================================================== */
+.run-panel-stack { display: flex; flex-direction: column; border-bottom: 1px solid var(--border); }
+.run-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--bg-2);
+  font-size: 12px;
+}
+.run-panel + .run-panel { border-top: 1px solid var(--border-soft); }
+.run-panel[data-settled="1"] { background: var(--bg-1); }
+
+.run-panel-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.run-panel-kind { font-weight: 600; color: var(--fg); }
+.run-panel-elapsed, .run-panel-planned {
+  color: var(--fg-mute);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+.run-panel-actions { margin-left: auto; display: flex; gap: 6px; }
+
+.run-chip {
+  font-weight: 700;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+}
+.run-chip-sm { font-size: 10px; padding: 1px 6px; text-transform: none; letter-spacing: 0; font-weight: 600; }
+.run-chip[data-chip="running"] { background: var(--accent-bg); color: var(--accent); border-color: var(--accent-dim); }
+.run-chip[data-chip="succeeded"] { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+.run-chip[data-chip="partial"],
+.run-chip[data-chip="retry"],
+.run-chip[data-chip="reconnecting"] { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
+.run-chip[data-chip="degraded"] { background: var(--orange-soft); color: var(--orange); border-color: var(--orange); }
+.run-chip[data-chip="failed"],
+.run-chip[data-chip="timeout"] { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+.run-chip[data-chip="cancelled"],
+.run-chip[data-chip="skipped"],
+.run-chip[data-chip="pending"] { color: var(--fg-mute); }
+/* The SSE stream gave up reconnecting (useRunEvents' MAX_RECONNECT_ATTEMPTS) --
+   distinct from "reconnecting" (still trying): this run is no longer live-tailed,
+   RunPanel now relies solely on useRunDetail's poll to learn it finished. */
+.run-chip[data-chip="stale"] { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+
+/* Capped so a wide run (e.g. a 36-source full refresh) cannot push the rest of
+   the app below the fold -- this is a topbar strip, not a dedicated page. Rows
+   are ordered running-first by RunPanel (see its `orderedSources`), so the
+   ~6-7 rows visible in this height are whatever is actually still live, not
+   just whichever sources happened to start (and finish) first. */
+.run-panel-sources { display: flex; flex-direction: column; gap: 3px; max-height: 200px; overflow-y: auto; }
+.run-source-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border-soft);
+  flex-wrap: wrap;
+}
+.run-source-row:last-child { border-bottom: none; }
+.run-source-name { font-weight: 600; min-width: 130px; }
+.run-source-attempt { color: var(--fg-faint); font-size: 10px; }
+.run-source-counts { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.run-source-elapsed { color: var(--fg-mute); font-variant-numeric: tabular-nums; font-size: 11px; }
+.run-source-deadline { color: var(--fg-faint); font-size: 11px; }
+.run-source-error {
+  color: var(--red);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+.run-source-note { color: var(--fg-faint); font-style: italic; }
+
+.run-panel-fetch-summary { display: flex; padding-top: 2px; }
+
+.run-panel-stages { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 2px; border-top: 1px solid var(--border-soft); }
+.run-stage-row { display: flex; align-items: center; gap: 6px; }
+.run-stage-label { color: var(--fg-dim); font-weight: 600; }
+.run-stage-detail { color: var(--fg-mute); font-size: 11px; }
+
+.run-panel-settled { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding-top: 2px; }
+.run-panel-counts { color: var(--fg); font-variant-numeric: tabular-nums; }
+.run-panel-note { color: var(--fg-mute); font-size: 11px; }
+.run-panel-note-error { color: var(--red); }
+
+/* ============================================================================
+   Sources
+   ========================================================================== */
+.src-ops-banner { margin: 0 0 4px; border-bottom: none; border-radius: var(--radius); }
+.src-ops-table {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg-1);
+}
+.src-ops-row {
+  display: grid;
+  grid-template-columns: 1.1fr 0.7fr 0.9fr 0.6fr 0.9fr 1.1fr 1fr 1.6fr 0.7fr;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.src-ops-row:last-child { border-bottom: none; }
+.src-ops-head {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-mute);
+  background: var(--bg-2);
+}
+.src-ops-row[data-stale] { background: rgba(217, 164, 65, 0.06); }
+.src-ops-row[data-circuit] { background: rgba(240, 85, 63, 0.07); }
+.src-ops-name { font-weight: 600; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.src-ops-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.src-ops-name .badge { font-size: 9px; flex-shrink: 0; }
+.src-ops-category { color: var(--fg-mute); }
+.src-ops-freshness { color: var(--fg-dim); }
+.src-ops-freshness[data-stale] { color: var(--amber); }
+.src-ops-failures { font-variant-numeric: tabular-nums; }
+.src-ops-failures[data-bad] { color: var(--red); font-weight: 700; }
+.src-ops-durations { color: var(--fg-dim); font-variant-numeric: tabular-nums; font-size: 11px; }
+.src-ops-rows { color: var(--fg-dim); font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 6px; }
+.src-ops-rows[data-anomaly] { color: var(--amber); }
+.src-ops-anomaly-note { font-size: 10px; color: var(--amber); border: 1px solid var(--amber); border-radius: 8px; padding: 0 5px; }
+.src-ops-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.src-ops-error {
+  color: var(--fg-mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+}
+.src-ops-error[data-expandable] { cursor: pointer; color: var(--fg-dim); }
+.src-ops-actions { text-align: right; }
+.src-ops-generated { color: var(--fg-faint); font-size: 11px; text-align: right; }

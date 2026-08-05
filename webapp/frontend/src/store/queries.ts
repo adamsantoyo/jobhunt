@@ -7,7 +7,7 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import { dateToISO, isoPlusDays, todayISO } from "../lib/format";
 import type {
   JobsResponse,
@@ -18,6 +18,7 @@ import type {
   CompanyPatch,
   ConfigPatch,
   ReconcileBody,
+  RunKind,
 } from "../api/types";
 
 export const qk = {
@@ -32,6 +33,12 @@ export const qk = {
   funnel: ["funnel"] as const,
   followups: ["followups"] as const,
   activity: ["activity"] as const,
+  // canonical runs (Phase 4.3) + source operations (Phase 4.4)
+  runsCapability: ["runsCapability"] as const,
+  runsAll: ["runs"] as const,
+  runs: (limit: number) => ["runs", limit] as const,
+  runDetail: (runUid: string) => ["runDetail", runUid] as const,
+  sourceOps: ["sourceOps"] as const,
 };
 
 // Local-naive ISO timestamp matching backend models.now_iso() (datetime.now().isoformat()).
@@ -59,7 +66,7 @@ const EMPTY_STATE: JobState = {
 
 function mergePatch(existing: JobState | null, patch: StatePatch): JobState {
   const base = existing ?? EMPTY_STATE;
-  // review_dismissed is write-only (not a JobState field) — never leak it into
+  // review_dismissed is write-only (not a JobState field) -- never leak it into
   // the cached state object.
   const rest = { ...patch };
   delete rest.review_dismissed;
@@ -126,7 +133,7 @@ export function useReconcile() {
     mutationFn: (body: ReconcileBody) => api.reconcile(body),
     onSettled: (_state, _err, body) => {
       invalidateStateDerived(qc);
-      // State moved between two url-keyed detail caches — refresh both, or the
+      // State moved between two url-keyed detail caches -- refresh both, or the
       // drawer would show stale state for either job.
       qc.invalidateQueries({ queryKey: qk.job(body.from_url_b64) });
       qc.invalidateQueries({ queryKey: qk.job(body.to_url_b64) });
@@ -266,6 +273,120 @@ export function usePatchConfig() {
       qc.invalidateQueries({ queryKey: qk.config });
       // skill_hits in job details depend on the skills list.
       qc.invalidateQueries({ queryKey: qk.jobs });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Canonical runs (Phase 4.3) + source operations (Phase 4.4)
+// ---------------------------------------------------------------------------
+
+export type RunsCapability = "legacy" | "canonical";
+
+/**
+ * Probes GET /api/runs (spec decision 7): 200 means the database has the
+ * canonical run schema and the new run UI drives it; 503 means a pre-Phase-4
+ * database, and every canonical control stays hidden in favor of the
+ * existing legacy sweep UI.
+ *
+ * A confirmed "canonical" result is cached indefinitely and never refetched
+ * on window focus: once a database has the canonical schema it never loses
+ * it again this process's lifetime, so there is nothing to re-check.
+ *
+ * A "legacy" result is NOT final the same way: a server restart runs forward
+ * migrations on an existing database (see phase4-spec.md's standing watch
+ * items), and a restart does NOT reload this SPA tab -- the tab is a
+ * long-lived page in the browser, a restart is a separate backend process,
+ * and nothing forces a reload between them. A tab left open across exactly
+ * that migration would otherwise be stuck offering the legacy sweep UI
+ * forever with no way to notice the upgrade short of a manual reload. While
+ * in "legacy", this gently re-probes every 60s (and treats the result as
+ * stale after the same interval) so such a tab picks up the migration on its
+ * own; a confirmed "canonical" result needs none of that.
+ *
+ * Any state other than a confirmed "canonical" (loading, network error, a
+ * non-503 error) must be treated by callers as legacy: the legacy path is
+ * the safe default the app already behaves like today.
+ */
+const LEGACY_RECHECK_MS = 60_000;
+
+export function useRunsCapability() {
+  return useQuery({
+    queryKey: qk.runsCapability,
+    queryFn: async (): Promise<RunsCapability> => {
+      try {
+        await api.getRuns(1);
+        return "canonical";
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 503) return "legacy";
+        throw e;
+      }
+    },
+    staleTime: (query) => (query.state.data === "canonical" ? Infinity : LEGACY_RECHECK_MS),
+    refetchInterval: (query) => (query.state.data === "canonical" ? false : LEGACY_RECHECK_MS),
+    refetchOnWindowFocus: false,
+  });
+}
+
+export function useRuns(limit = 20, options: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: qk.runs(limit),
+    queryFn: () => api.getRuns(limit),
+    enabled: options.enabled ?? true,
+    staleTime: 5_000,
+  });
+}
+
+export function useRunDetail(
+  runUid: string | null | undefined,
+  options: { refetchInterval?: number | false } = {},
+) {
+  return useQuery({
+    queryKey: qk.runDetail(runUid ?? ""),
+    queryFn: () => api.getRunDetail(runUid as string),
+    enabled: !!runUid,
+    refetchInterval: options.refetchInterval ?? false,
+  });
+}
+
+export function useCreateRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (kind: RunKind) => api.createRun(kind),
+    onSettled: () => qc.invalidateQueries({ queryKey: qk.runsAll }),
+  });
+}
+
+export function useCancelRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (runUid: string) => api.cancelRun(runUid),
+    onSettled: (_data, _err, runUid) => {
+      qc.invalidateQueries({ queryKey: qk.runsAll });
+      qc.invalidateQueries({ queryKey: qk.runDetail(runUid) });
+    },
+  });
+}
+
+export function useSourceOps(options: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: qk.sourceOps,
+    queryFn: api.getSourceOps,
+    enabled: options.enabled ?? true,
+    staleTime: 15_000,
+  });
+}
+
+export function useRetrySource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (source: string) => api.retrySource(source),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: qk.sourceOps });
+      // A retry starts a run; the mounted AppShell's `useRuns` observer
+      // picks it up and mounts a RunPanel for it without any prop plumbing
+      // between this hook's caller (the Sources tab) and AppShell.
+      qc.invalidateQueries({ queryKey: qk.runsAll });
     },
   });
 }
