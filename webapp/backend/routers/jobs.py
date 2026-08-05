@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from .. import canonical_reads, config, read_dispatch
 from ..config import ACTIVE_STATUSES
 from ..db import get_db
 from ..models import (
@@ -38,6 +39,9 @@ def _load_skills(conn: sqlite3.Connection) -> list[str]:
 
 @router.get("/jobs")
 def list_jobs(min_tier: Optional[int] = None, conn: sqlite3.Connection = Depends(get_db)):
+    if config.READS_SOURCE == "canonical":
+        read_dispatch.require_canonical(conn)
+        return canonical_reads.list_jobs(conn, min_tier=min_tier)
     sql = f"{JOB_LIGHT_SQL} WHERE j.present=1"
     params: tuple = ()
     if min_tier is not None:
@@ -55,6 +59,9 @@ def followups(conn: sqlite3.Connection = Depends(get_db)):
     full JobLight+state, so this only covers roles whose job row is still present --
     a role that both went dormant AND has a stale follow-up date has nothing live to
     render here; it's still counted in analytics' plain follow-up totals."""
+    if config.READS_SOURCE == "canonical":
+        read_dispatch.require_canonical(conn)
+        return canonical_reads.followups(conn)
     today = today_iso()
     horizon = date_plus(14)
     ph = ",".join("?" for _ in ACTIVE_STATUSES)
@@ -81,6 +88,12 @@ def job_detail(url_b64: str, conn: sqlite3.Connection = Depends(get_db)):
         url = b64_to_url(url_b64)
     except Exception:
         raise HTTPException(status_code=404, detail="unknown job")
+    if config.READS_SOURCE == "canonical":
+        read_dispatch.require_canonical(conn)
+        job = canonical_reads.job_detail(conn, url)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown job")
+        return job
     row = conn.execute(f"{JOB_JOIN_SQL} WHERE j.url=?", (url,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="unknown job")

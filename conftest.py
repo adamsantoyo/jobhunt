@@ -27,6 +27,18 @@ _FENCE_DIR = Path(tempfile.mkdtemp(prefix="jobhunt-test-db-"))
 _FENCE_DB = _FENCE_DIR / "must-not-be-the-real-app.db"
 os.environ["JOBHUNT_DB"] = str(_FENCE_DB)
 
+#: Pinned for the same reason, before collection, beside the `JOBHUNT_DB` fence
+#: above: `backend.config` also reads `JOBHUNT_READS` at import time (4.6's read
+#: flag, `{legacy, canonical}`, default `legacy`), and the suite's tests are
+#: written and pinned against `legacy` behaviour explicitly (spec decision 9:
+#: "Flag=legacy must remain byte-identical legacy behaviour (test-pinned)"). A
+#: developer's shell exporting `JOBHUNT_READS=canonical` for their own manual
+#: testing must not change what the suite means — a real repro: the suite had
+#: exactly one failure under `JOBHUNT_READS=canonical` before this pin existed.
+#: Pinning here, not merely relying on the default, makes the suite's behaviour
+#: independent of whatever is in the developer's environment.
+os.environ["JOBHUNT_READS"] = "legacy"
+
 
 @pytest.fixture(scope="session", autouse=True)
 def fence_the_live_database():

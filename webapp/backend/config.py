@@ -4,11 +4,22 @@ Environment overrides (used by tests and throwaway smoke runs):
 - JOBHUNT_ROOT: pipeline repo root (defaults to the real repo two levels up).
 - JOBHUNT_DB:   sqlite database path (defaults to webapp/app.db).
 - JOBHUNT_SKIP_STARTUP_INGEST=1: skip running ingest() on app startup.
+- JOBHUNT_READS: "legacy" (default) or "canonical" -- task 4.6's temporary read
+  flag. Selects, for the SAME /api/* read paths (jobs/followups/jobs/{id}/
+  changes/analytics/freshness), between the existing materialized-table queries
+  ("legacy") and `canonical_reads`'s canonical-schema queries ("canonical"),
+  dispatched at the top of each router handler (see `read_dispatch.py`). Any
+  other value is a configuration error, not a silent fallback, so it raises at
+  import time here -- consistent with this module's own read-at-import style.
 
 These are read at import time on purpose so a freshly-spawned process (a test, a
 smoke script, the sweep runner's ingest thread) picks up the environment it was
 launched with. Tests that need a custom RESULTS/ROOT monkeypatch the module
-attributes directly and pass their own connection to ingest().
+attributes directly and pass their own connection to ingest(). READS_SOURCE
+dispatch tests instead monkeypatch `config.READS_SOURCE` directly at runtime
+(see test_read_flag.py) since the env var itself is only consulted once, at
+process boot -- monkeypatching os.environ after this module has already
+imported has no effect.
 """
 from pathlib import Path
 import os
@@ -47,3 +58,12 @@ DEFAULT_DEADLINE = "2027-02-01"
 DEFAULT_SNOOZE_DAYS = 3
 
 SKIP_STARTUP_INGEST = os.environ.get("JOBHUNT_SKIP_STARTUP_INGEST") == "1"
+
+# Task 4.6's temporary read flag -- see module docstring. Explicit opt-in only;
+# an unrecognized value is a misconfiguration, never a silent legacy fallback.
+_READS_SOURCE_CHOICES = ("legacy", "canonical")
+READS_SOURCE = os.environ.get("JOBHUNT_READS", "legacy")
+if READS_SOURCE not in _READS_SOURCE_CHOICES:
+    raise RuntimeError(
+        f"invalid JOBHUNT_READS={READS_SOURCE!r}: must be one of {_READS_SOURCE_CHOICES}"
+    )

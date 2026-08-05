@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends
 
+from .. import canonical_reads, config, read_dispatch
 from ..db import get_db
 from ..models import JOB_LIGHT_SQL, job_light_from_row, url_to_b64
 
@@ -27,6 +28,9 @@ def _job_light(conn: sqlite3.Connection, url: str):
 
 @router.get("/changes")
 def changes(since: Optional[str] = None, conn: sqlite3.Connection = Depends(get_db)):
+    if config.READS_SOURCE == "canonical":
+        read_dispatch.require_canonical(conn)
+        return canonical_reads.changes(conn, since=since)
     runs = [r["run_date"] for r in conn.execute(
         "SELECT run_date FROM runs ORDER BY run_date").fetchall()]
     current = runs[-1] if runs else None

@@ -4,6 +4,7 @@ import sqlite3
 
 from fastapi import APIRouter, Depends
 
+from .. import canonical_reads, config, read_dispatch
 from ..config import ACTIVE_STATUSES, ADVANCED_STATUSES, DEFAULT_COMP_BAND, STATUSES
 from ..db import get_db
 from ..models import today_iso
@@ -46,6 +47,9 @@ def _comp_band(conn: sqlite3.Connection) -> list[int]:
 
 @router.get("/analytics")
 def analytics(conn: sqlite3.Connection = Depends(get_db)):
+    if config.READS_SOURCE == "canonical":
+        read_dispatch.require_canonical(conn)
+        return canonical_reads.analytics(conn)
     # Funnel: every present job counts under COALESCE(status,'New') — matching how the
     # kanban derives a card's column — plus dormant advanced states (an applied job
     # that vanished from the feed still counts in the pipeline).
@@ -143,6 +147,9 @@ def analytics(conn: sqlite3.Connection = Depends(get_db)):
 
 @router.get("/freshness")
 def freshness(conn: sqlite3.Connection = Depends(get_db)):
+    if config.READS_SOURCE == "canonical":
+        read_dispatch.require_canonical(conn)
+        return canonical_reads.freshness(conn)
     row = conn.execute(
         "SELECT run_date, ingested_at, kept, new_this_run, source_health_json, report_json "
         "FROM runs ORDER BY run_date DESC LIMIT 1"
