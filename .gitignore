@@ -2,7 +2,9 @@
 # personal profile (targets, salary band)
 config.json
 # candidate-scoring profile: target employers, comp band, skills, exclusions
+# (the glob also catches versioned backups like profile.json.v1.bak-*)
 profile.json
+profile.json.*
 # personal resume / scoring calibration
 RUBRIC.md
 # personal targeting narrative
@@ -18,6 +20,8 @@ results/
 ~$*.xlsx
 
 # ---- environment / generated ----
+# local agent session/job state
+.claude/
 .venv/
 __pycache__/
 *.pyc
