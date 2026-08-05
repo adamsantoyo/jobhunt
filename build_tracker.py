@@ -86,24 +86,33 @@ t4fill = PatternFill("solid", fgColor="E2EFDA")
 # colors/sorts on the competition half only: green=Lower bar (easiest bar),
 # amber=Standard, red=High competition (hardest). A legacy Likely/Target/Reach
 # value (written by a scorer older than Phase 3.5, possible until the next
-# sweep) has no " / " separator and falls back to the neutral "Standard"
-# bucket rather than crashing or being miscolored.
+# sweep) has no " / " separator and is UNPARSEABLE -- returned as None rather
+# than guessed into "Standard". This matches the rest of the system's posture:
+# analytics.py's `_competition_of` excludes it from the competition breakdown
+# entirely, and the frontend's `competitionRank` (format.ts) ranks it LAST,
+# after "High competition". `odds_sort_key` and the ODDS_FILL lookups below
+# mirror both -- None sorts after every known bucket and draws no odds-specific
+# fill, falling through to whatever fill the row already has (or none).
 def _competition_of(odds):
     odds = odds or ""
     if " / " not in odds:
-        return "Standard"
+        return None
     return odds.split(" / ", 1)[1]
 
 ODDS_FILL = {"Lower bar": PatternFill("solid", fgColor="92D050"),
              "Standard": PatternFill("solid", fgColor="FFE699"),
              "High competition": PatternFill("solid", fgColor="F4B7B7")}
 ODDS_RANK = {"Lower bar": 0, "Standard": 1, "High competition": 2}
+#: Legacy/unparseable (`_competition_of` returns None) ranks LAST, after every
+#: known competition bucket -- never tied with "Standard".
+_UNKNOWN_COMPETITION_RANK = len(ODDS_RANK)
 
 def odds_sort_key(r):
     # most-winnable first; break ties by numeric odds_score then company
     try: sc = int(r.get("odds_score") or 0)
     except (TypeError, ValueError): sc = 0
-    return (ODDS_RANK.get(_competition_of(r.get("odds")), 1), -sc, r["company"], r["title"])
+    rank = ODDS_RANK.get(_competition_of(r.get("odds")), _UNKNOWN_COMPETITION_RANK)
+    return (rank, -sc, r["company"], r["title"])
 
 def style_header(ws):
     for c in ws[1]:

@@ -34,7 +34,7 @@ import json
 
 import pytest
 
-from backend.sources import graph, llm_review_pass as llm, runstore
+from backend.sources import graph, llm_review_pass as llm, resolver, runstore
 from backend.sources.contract import (
     NormalizedPosting,
     PermanentSourceError,
@@ -330,6 +330,22 @@ def test_parse_verdict_accepts_exactly_the_schema():
     assert verdict == llm.Verdict(tier=5, why="matched", confidence="medium")
 
 
+def test_parse_verdict_strips_cr_and_bidi_and_zero_width_from_why():
+    """`why` is model-authored text, and a model can be made to echo whatever an
+    injected description put in front of it -- so the same CR/bidi/zero-width
+    class `sanitize_description` strips from the untrusted description must
+    also come out of the model's answer before it is stored or shown."""
+    rlo = "\u202e"
+    zwsp = "\u200b"
+    raw = json.dumps(
+        {"tier": 4, "why": f"matches\rrole {rlo}reversed{zwsp}text", "confidence": "high"}
+    )
+    verdict = llm.parse_verdict(raw)
+    assert "\r" not in verdict.why
+    assert rlo not in verdict.why
+    assert zwsp not in verdict.why
+
+
 @pytest.mark.parametrize(
     "raw, reason",
     [
@@ -380,6 +396,23 @@ def test_sanitize_strips_the_fence_markers_and_control_characters():
     assert llm.JD_CLOSE_MARKER not in clean
     assert "\x00" not in clean and "\x07" not in clean
     assert "before" in clean and "after" in clean
+
+
+def test_sanitize_strips_cr_and_bidi_and_zero_width_characters():
+    """A lone CR (no matching LF) is a line-structure trick a \\n-only reader
+    would miss; RLO (U+202E) is the bidi override a payload uses to render text
+    right-to-left and disguise what a reviewer thinks they are reading; a
+    zero-width space (U+200B) can split a blocked keyword invisibly. All three
+    must be gone from the sanitized description, not merely the C0 control
+    range this class covered before."""
+    rlo = "\u202e"
+    zwsp = "\u200b"
+    dirty = f"before\rafter {rlo}dsa.pw{zwsp} tail"
+    clean = llm.sanitize_description(dirty)
+    assert "\r" not in clean
+    assert rlo not in clean
+    assert zwsp not in clean
+    assert "before" in clean and "after" in clean and "tail" in clean
 
 
 def test_sanitize_bounds_the_description():
@@ -446,6 +479,48 @@ def test_the_report_accounting_adds_up(scene):
     assert report.eligible == report.cached_hit + report.attempted + report.deferred
     assert report.attempted == report.succeeded + report.failed_validation + report.failed_transport
     assert report.rows_written == report.attempted
+    assert report.considered == report.eligible + report.skipped_total
+
+
+def test_the_report_accounting_adds_up_with_a_redirected_posting(conn):
+    """`scene`'s two postings are both fully eligible, so the assertion above
+    passes trivially (0 skips either way) and cannot catch a `considered` that
+    over-counts. `graph.select_work`'s FULL-mode corpus query reads
+    `run_postings`, which a redirect never removes a row from, so a redirected
+    posting id is still `considered` -- but `graph.build_work_rows` skips it
+    outright (see its docstring) and it never reaches `eligibility`. Before
+    `REASON_NO_WORK_ROW` folded that skip into `skipped_by_reason`, this posting
+    inflated `considered` with nothing on the other side of the equation and
+    this test failed.
+    """
+    postings = deliver(
+        conn,
+        [
+            {"title": "Support Engineer One", "url": "https://boards.example/1", "req_id": "1"},
+            {"title": "Support Engineer Two", "url": "https://boards.example/2", "req_id": "2"},
+            {"title": "Duplicate Listing", "url": "https://boards.example/3", "req_id": "3"},
+        ],
+    )
+    profile_version_id = seed_profile_version(conn)
+    for title, (posting_id, version_id) in postings.items():
+        seed_description(conn, posting_id=posting_id, posting_version_id=version_id, body=DESC)
+        seed_score(conn, posting_id=posting_id, posting_version_id=version_id,
+                   profile_version_id=profile_version_id, tier=4)
+
+    survivor_id, _ = postings["Support Engineer One"]
+    loser_id, _ = postings["Duplicate Listing"]
+    resolver.record_redirect(
+        conn, from_posting_id=loser_id, to_posting_id=survivor_id,
+        reason="test-duplicate", at=AT,
+    )
+    conn.commit()
+
+    redirected_scene = Scene(conn, postings, profile_version_id)
+    report = redirected_scene.review(FakeClient())
+
+    assert report.considered == 3
+    assert report.eligible == 2
+    assert report.skipped_by_reason == {llm.REASON_NO_WORK_ROW: 1}
     assert report.considered == report.eligible + report.skipped_total
 
 
@@ -904,6 +979,62 @@ def test_a_failed_review_is_updated_in_place_never_duplicated(scene):
     payload = json.loads(settled["review_json"])
     assert payload["outcome"] == str(llm.ReviewOutcome.OK)
     assert payload["verdict"]["tier"] == 5
+
+
+def test_a_row_missing_outcome_is_updated_rather_than_re_attempted_forever(scene):
+    """`_reviews_on_file` reads a missing `$.outcome` as `""`, never `"ok"`, so a
+    row in this shape is never a cache hit -- correctly, it must be re-attempted.
+    What must NOT happen is the upsert silently failing to record the result of
+    that re-attempt: `_UPSERT_SQL`'s WHERE guard used to read
+    `json_extract(...) <> 'ok'`, and SQL's `<>` against NULL is NULL (neither
+    true nor false), so SQLite's UPSERT skips the DO UPDATE clause entirely --
+    no error, no row change, one silent no-op per pass, forever. The posting
+    would burn a model call on every single future pass and never settle.
+    """
+    report = scene.review(FakeClient(default=verdict_json(4)))
+    assert report.attempted == 2
+    settled = reviews(scene.conn)
+    assert len(settled) == 2
+    target = settled[0]
+
+    # Simulate a row whose review_json never got an "outcome" key at all (a
+    # legacy write, or any bug upstream of this one) -- everything else about
+    # the row, including review_hash, is untouched, so the NEXT pass computes
+    # the identical key for this posting.
+    conn = scene.conn
+    conn.execute(
+        "UPDATE llm_reviews SET review_json = json_remove(review_json, '$.outcome') "
+        "WHERE llm_review_id = ?",
+        (target["llm_review_id"],),
+    )
+    conn.commit()
+    corrupted = conn.execute(
+        "SELECT json_extract(review_json, '$.outcome') AS outcome FROM llm_reviews "
+        "WHERE llm_review_id = ?", (target["llm_review_id"],),
+    ).fetchone()
+    assert corrupted["outcome"] is None, "the fixture must actually reproduce the missing-key shape"
+
+    # A missing outcome is not "ok", so this posting is NOT a cache hit and the
+    # model is called again for it (the other, still-settled posting is).
+    second = scene.review(FakeClient(default=verdict_json(5)))
+    assert second.attempted == 1
+    assert second.cached_hit == 1
+    assert len(reviews(scene.conn)) == 2, "the re-attempt must update the row, never mint a second"
+
+    updated = conn.execute(
+        "SELECT * FROM llm_reviews WHERE llm_review_id = ?", (target["llm_review_id"],),
+    ).fetchone()
+    payload = json.loads(updated["review_json"])
+    assert payload["outcome"] == str(llm.ReviewOutcome.OK), (
+        "the upsert must actually persist the re-attempt's result, not silently no-op"
+    )
+    assert payload["verdict"]["tier"] == 5
+
+    # And now that it carries a real "ok", the row is a genuine cache hit: a
+    # third pass with a client that must not be called succeeds.
+    third = scene.review(exploding_client)
+    assert third.cached_hit == 2
+    assert third.attempted == 0
 
 
 def test_a_settled_review_is_never_overwritten_by_a_later_pass(scene):

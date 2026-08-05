@@ -1,7 +1,7 @@
 // The ONE comparator set. Kills reimplementations across Kanban/Companies/Matrix
 // (tierOddsScoreCmp) and Today (bankCmp/aimCmp, queue composition).
 import type { JobLight } from "../api/types";
-import { isActionable, oddsRank } from "./format";
+import { competitionRank, isActionable, matchRank, oddsRank } from "./format";
 
 // odds_score may be null; push nulls to the bottom of a desc sort.
 function score(j: JobLight): number {
@@ -16,16 +16,28 @@ export function tierOddsScoreCmp(a: JobLight, b: JobLight): number {
   return score(b) - score(a);
 }
 
-/** "Bank a win" — winnable first: odds rank, then odds_score desc, then tier desc. */
+/**
+ * "Bank a win" -- winnable first: competition rank (Lower bar most winnable)
+ * ascending, then match quality (Strong match best) descending, then
+ * odds_score desc, then tier desc.
+ *
+ * Competition is the PRIMARY key here, not match quality: this lane's whole
+ * point is "clear the lowest bar," so a lower-bar posting outranks a
+ * better-matched one behind a higher bar. `oddsRank` alone cannot express
+ * that -- it ranks match quality first -- so `bankCmp` composes
+ * `competitionRank` and `matchRank` directly instead of using `oddsRank`.
+ */
 export function bankCmp(a: JobLight, b: JobLight): number {
-  const o = oddsRank(a.odds) - oddsRank(b.odds);
-  if (o !== 0) return o;
+  const c = competitionRank(a.odds) - competitionRank(b.odds);
+  if (c !== 0) return c;
+  const m = matchRank(a.odds) - matchRank(b.odds);
+  if (m !== 0) return m;
   const s = score(b) - score(a);
   if (s !== 0) return s;
   return b.tier - a.tier;
 }
 
-/** "Aim high" — fit first: tier desc, then odds rank, then odds_score desc. */
+/** "Aim high" -- fit first: tier desc, then odds rank, then odds_score desc. */
 export function aimCmp(a: JobLight, b: JobLight): number {
   const t = b.tier - a.tier;
   if (t !== 0) return t;

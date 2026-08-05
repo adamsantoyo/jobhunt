@@ -225,6 +225,7 @@ __all__ = [
     "PROMPT_VERSION",
     "REASON_ELIGIBLE",
     "REASON_NO_DESCRIPTION",
+    "REASON_NO_WORK_ROW",
     "REASON_NOT_SCORED",
     "REASON_TIER_BELOW_BAND",
     "VALID_CONFIDENCES",
@@ -418,6 +419,15 @@ REASON_ELIGIBLE = "borderline_tier_with_description"
 REASON_NOT_SCORED = "not_scored"
 REASON_TIER_BELOW_BAND = "tier_below_review_band"
 REASON_NO_DESCRIPTION = "no_description"
+#: `graph.build_work_rows` skips a posting id outright -- never emits a WorkRow
+#: for it at all -- when it redirects into another posting, has no recorded
+#: content state, or the version its state names has gone missing (see that
+#: function's docstring). None of those postings reach `eligibility`, so without
+#: this reason `considered` (which counts every id `select_work` returned)
+#: would count them while nothing in `skipped_by_reason` did, breaking
+#: `ReviewReport`'s `considered == eligible + sum(skipped_by_reason.values())`
+#: invariant. See `run_review_pass`.
+REASON_NO_WORK_ROW = "no_work_row"
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,11 +462,19 @@ def eligibility(*, tier: int | None, has_description: bool) -> EligibilityDecisi
 # --------------------------------------------------------------------------- #
 # Untrusted input: sanitization and the closed response schema
 # --------------------------------------------------------------------------- #
-#: Everything outside the printable range plus tab/newline. Stripped from every
-#: untrusted string before it reaches the prompt or the database: control
-#: characters are how a payload smuggles terminal escapes, bidi overrides, and
-#: line-structure tricks past a reader's eyes.
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+#: Everything outside the printable range plus tab/newline (including CR, so a
+#: lone \r cannot fake a line-structure trick a \n-only reader would miss),
+#: plus the Unicode bidi-override/isolate and zero-width characters that would
+#: otherwise pass this filter untouched: U+200B-U+200F (zero-width space/joiners
+#: and the LTR/RTL marks), U+202A-U+202E (the LRE/RLE/PDF/LRO/RLO bidi-override
+#: family -- RLO is what makes text render right-to-left, e.g. to disguise a
+#: file extension or reorder what a reviewer reads), U+2066-U+2069 (the newer
+#: LRI/RLI/FSI/PDI bidi-isolate family), and U+FEFF (the zero-width no-break
+#: space / BOM). Stripped from every untrusted string before it reaches the
+#: prompt or the database.
+_CONTROL_CHARS = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]"
+)
 _WHITESPACE_RUN = re.compile(r"[ \t]+")
 _BLANK_LINES = re.compile(r"\n{3,}")
 
@@ -611,6 +629,13 @@ def render_prompt(
     )
     parts = [_INSTRUCTIONS, "\n"]
     if rubric_text:
+        # `max_chars=len(rubric_text)` can never actually truncate: sanitization
+        # only ever SHRINKS a string (marker removal, control-char stripping,
+        # whitespace collapse), so the cleaned text's length can never exceed the
+        # bound it started at. That is deliberate here, not a bug -- `rubric_text`
+        # is operator-supplied (a human pasted it in), not scraped from a
+        # third-party posting, so there is no untrusted-length attack to bound
+        # against; the call exists for the marker/control-char stripping alone.
         parts += ["\n<rubric>\n", sanitize_description(rubric_text, max_chars=len(rubric_text)), "\n</rubric>\n"]
     parts += ["\n<posting_facts>\n", facts, "\n</posting_facts>\n"]
     parts += ["\n", JD_OPEN_MARKER, "\n", sanitize_description(description), "\n", JD_CLOSE_MARKER, "\n"]
@@ -939,8 +964,15 @@ ON CONFLICT (posting_version_id, profile_version_id, review_hash) DO UPDATE SET
     prompt_hash = excluded.prompt_hash,
     review_json = excluded.review_json,
     created_at = excluded.created_at
-WHERE json_extract(llm_reviews.review_json, '$.outcome') <> 'ok'
+WHERE json_extract(llm_reviews.review_json, '$.outcome') IS NOT 'ok'
 """
+#: `IS NOT`, not `<>`: SQL's `<>` against NULL is NULL (neither true nor false),
+#: so a row whose `review_json` has no `$.outcome` at all (`json_extract`
+#: returns NULL) would fail this guard forever -- the UPDATE never fires, the
+#: pass keeps counting a write in its report, and the row never settles.
+#: SQLite's `IS NOT` treats NULL as an ordinary comparable value, so a missing
+#: `$.outcome` reads as "not ok" (true) exactly like any other non-"ok" value,
+#: and the row becomes updatable again.
 
 
 def _llm_review_id(*, posting_version_id: str, profile_version_id: str, digest: str) -> str:
@@ -1086,7 +1118,16 @@ def review_run(
         cursor = page[-1]
         considered += len(page)
 
-        rows, _skipped = graph.build_work_rows(conn, page, category_of=category_of)
+        rows, no_work_row = graph.build_work_rows(conn, page, category_of=category_of)
+        if no_work_row:
+            # These ids never became a WorkRow at all (redirected, no content
+            # state, or the state's version went missing) -- they never reach
+            # `eligibility` below, so `considered` (which already counted them
+            # via `len(page)`) needs a matching entry here or the accounting
+            # invariant on `ReviewReport` goes false.
+            skipped_by_reason[REASON_NO_WORK_ROW] = (
+                skipped_by_reason.get(REASON_NO_WORK_ROW, 0) + len(no_work_row)
+            )
         scores = _current_scores(
             conn,
             [r.posting_version_id for r in rows],
@@ -1104,6 +1145,15 @@ def review_run(
                 skipped_by_reason[decision.reason] = skipped_by_reason.get(decision.reason, 0) + 1
                 continue
             eligible += 1
+            # The `("", DESCRIPTION_ABSENT)` default is defensively unreachable
+            # here today: `eligibility` above already required
+            # `has_description=bool(row.description)` to be True to reach this
+            # line, and `_description_state` mirrors `scoring.description_for`'s
+            # own notion of "has a description" when it builds `states`, so a
+            # posting_id that got this far is one `_description_state` always
+            # has an entry for. Kept as a default, not asserted, because it is
+            # cheap insurance against the two functions drifting apart, not a
+            # path this code expects to take.
             desc_identity, desc_status = states.get(row.posting_id, ("", DESCRIPTION_ABSENT))
             candidates.append(
                 _Candidate(

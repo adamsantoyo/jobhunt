@@ -9,10 +9,10 @@ every listing against a personal fit rubric and emits a filterable Excel tracker
 Two scoring axes, kept orthogonal:
 
 - **Tier (1–5)** — *fit*: how well the role matches your experience, level, domain, comp, and location.
-- **Odds (match / competition)**: *hireability*, a match label (level gap, résumé↔JD skills overlap)
+- **Match / competition labels** -- *hireability*: a match label (level gap, résumé↔JD skills overlap)
   paired with a competition label (applicant-pool size, employment-type bar, comp expectation), e.g.
   "Strong match / High competition". Honest descriptive labels, not a Likely/Target/Reach prediction:
-  there's no outcome data yet to calibrate odds against.
+  there's no outcome data yet to calibrate against.
 
 ## Architecture
 

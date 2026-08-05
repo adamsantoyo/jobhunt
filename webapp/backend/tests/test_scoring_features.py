@@ -81,6 +81,19 @@ DESCRIPTIONS = [
     "Support Windows endpoints with Intune and Entra ID, Active Directory, M365, "
     "ServiceNow tickets. Salary range $150,000 - $185,000 USD. 3 years experience "
     "with hardware validation and semiconductor test equipment preferred.",
+    # Straddles the `len(d) > 400` skills-overlap gate (rubric.py) ONLY once
+    # backslashes are stripped first: 401 raw characters, 396 once the 5
+    # trailing backslashes are removed. `_hireability_core` normalizes with
+    # `.lower().replace("\\", "")` before measuring, so the real gate sees 396
+    # (<=400, skills computation skipped, "Unscored"). A test that measured the
+    # RAW string would see 401 (>400) and wrongly expect the skills-hit branch
+    # to have run.
+    "Assisting enterprise customers with break-fix tickets across a large fleet of "
+    "endpoints, coordinating with vendors, documenting steps in the internal wiki, "
+    "and escalating to engineering when a workaround is not sufficient for the issue "
+    "at hand today, while also tracking recurring incidents in the queue and updating "
+    "the knowledge base with resolution notes for the next on-call engineer on shift"
+    + "\\" * 5,
 ]
 POSTED = [None, "2026-08-01", "2025-01-01"]   # unknown / fresh / very stale
 
@@ -501,15 +514,45 @@ def test_scorer_hash_carries_the_composition_digest_as_well(monkeypatch):
     assert scoring.scorer_identity().scorer_hash != baseline.scorer_hash
 
 
-def test_the_composition_digest_moves_when_the_composition_moves(monkeypatch):
-    """Otherwise that half of the identity is decoration, exactly as above."""
+@pytest.mark.parametrize("member", scoring._COMPOSITION_SURFACE_NAMES)
+def test_the_composition_digest_moves_when_the_composition_moves(monkeypatch, member):
+    """Otherwise that half of the identity is decoration, exactly as above.
+
+    Parametrized over EVERY name in `_COMPOSITION_SURFACE_NAMES` rather than just
+    `row_from_version`: a tuple member that never moved the digest on its own would
+    sit there as decoration, indistinguishable from a member that is genuinely
+    load-bearing. This monkeypatches each named function in turn (one at a time,
+    the others left alone) and asserts the digest moves -- proving `member` is
+    actually read by `composition_digest`, not merely listed.
+    """
     before = scoring.composition_digest()
 
-    def replacement(version_row):  # a different body for a pinned member
-        return {}
+    def replacement(*args, **kwargs):  # a different body than whichever `member` has
+        return None
 
-    monkeypatch.setattr(scoring, "row_from_version", replacement)
-    assert scoring.composition_digest() != before
+    monkeypatch.setattr(scoring, member, replacement)
+    assert scoring.composition_digest() != before, member
+
+
+def test_the_composition_surface_is_exactly_row_from_version_and_score_one():
+    """Pins the SET the parametrized test above walks, not just each member in
+    isolation -- a member silently dropped from the tuple would still pass every
+    per-member check above (there would just be one fewer of them), so that test
+    alone cannot catch a shrunk tuple.
+
+    `_score_one` MUST stay in this set: it is the function that copies the fit
+    pass's flags string and recovered pay band onto the row before the odds pass
+    reads it (see `_score_one`'s docstring). Phase 3.7's legacy/new differential
+    found that omitting this composition step left `staffing_w2`/`degree_gated`
+    dead canonically while `rubric.py` was byte-identical on both sides --
+    `rubric.scorer_source_digest()` could not see that bug because nothing in
+    `rubric.py` changed. Only `_score_one` in this tuple makes `scorer_hash` move
+    when that wiring regresses, which is why dropping it from
+    `_COMPOSITION_SURFACE_NAMES` must fail this test (confirmed by mutation:
+    removing it from the tuple in `scoring.py` and re-running this suite fails
+    here before the fix is reverted).
+    """
+    assert set(scoring._COMPOSITION_SURFACE_NAMES) == {"row_from_version", "_score_one"}
 
 
 # --------------------------------------------------------------------------- #
@@ -631,7 +674,12 @@ def test_hireability_vectors_sum_to_their_score_and_compose_to_their_label(profi
         assert set(result.features) <= candidate_profile.REQUIRED_HIREABILITY_FEATURES, label
         assert sum(result.features.values()) == result.score, label
 
-        d = (desc or "").lower()
+        # Must match rubric.py's own normalization (`_hireability_core`) exactly:
+        # backslashes are stripped BEFORE the `len(d) > 400` skills-overlap gate
+        # is measured, so a test that skipped this `.replace` would compute a
+        # different length than the scorer did whenever a description carries
+        # backslashes near that boundary (see the backslash corpus row above).
+        d = (desc or "").lower().replace("\\", "")
         if "staff_principal" in result.features:
             expected_match = "Level stretch"
         elif "skills_strong" in result.features or "exact_stack" in result.features:

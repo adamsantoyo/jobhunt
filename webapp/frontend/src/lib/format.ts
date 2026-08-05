@@ -110,6 +110,12 @@ const COMPETITION_RANK: Record<string, number> = {
  * competition (Lower bar ranks better than High competition). A legacy
  * single-word value or anything else unparseable ranks after every known
  * match/competition combination -- never throws.
+ *
+ * This is the fit-first ordering: table sorting and `compare.ts`'s `aimCmp`
+ * use it as-is. The bank lane (`compare.ts`'s `bankCmp`, "winnable first") is
+ * NOT this rank reordered -- it composes `competitionRank` and `matchRank`
+ * below with competition as the primary key, because "winnable" means "lower
+ * bar to clear," not "better matched."
  */
 export function oddsRank(odds: string | null | undefined): number {
   const { match, competition } = parseOdds(odds);
@@ -117,6 +123,29 @@ export function oddsRank(odds: string | null | undefined): number {
   const m = MATCH_RANK[match] ?? MATCH_RANK.Unscored + 1;
   const c = COMPETITION_RANK[competition] ?? COMPETITION_RANK["High competition"] + 1;
   return m * 10 + c;
+}
+
+/**
+ * Sortable match-quality rank alone: the same table and fallback `oddsRank`
+ * uses for its match half (Strong match best, unknown/legacy last). Exported
+ * so `bankCmp` can order by match quality as a SECONDARY key, after
+ * `competitionRank`, without recomputing `oddsRank`'s combined value.
+ */
+export function matchRank(odds: string | null | undefined): number {
+  const { match } = parseOdds(odds);
+  return MATCH_RANK[match ?? ""] ?? MATCH_RANK.Unscored + 1;
+}
+
+/**
+ * Sortable competition rank alone: Lower bar ranks best (0, most winnable),
+ * Standard is 1, High competition is 2. A legacy single-word value or
+ * anything else unparseable ranks last (3) -- never throws. Exported so
+ * `bankCmp` can order the bank lane by "how low is the bar" as its PRIMARY
+ * key, which `oddsRank` (match-quality-first) cannot express.
+ */
+export function competitionRank(odds: string | null | undefined): number {
+  const { competition } = parseOdds(odds);
+  return COMPETITION_RANK[competition ?? ""] ?? 3;
 }
 
 /**

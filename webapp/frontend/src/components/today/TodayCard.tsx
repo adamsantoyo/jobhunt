@@ -158,7 +158,7 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
               )}
               {job.odds_why && (
                 <p>
-                  <span className="why-label">Odds</span> {job.odds_why}
+                  <span className="why-label">Match</span> {job.odds_why}
                 </p>
               )}
             </div>

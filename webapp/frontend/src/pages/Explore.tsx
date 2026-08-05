@@ -280,7 +280,7 @@ export default function Explore() {
             <SortHead label="Tier" k="tier" />
           </div>
           <div className="th">
-            <SortHead label="Odds" k="odds" />
+            <SortHead label="Match" k="odds" />
           </div>
           <div className="th">
             <SortHead label="Company" k="company" />

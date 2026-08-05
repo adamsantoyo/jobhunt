@@ -331,7 +331,25 @@ def row_from_version(version_row: Mapping[str, object]) -> dict[str, object]:
 
 
 def _score_one(row: dict, description: str | None, *, is_aggregator: bool):
-    """Both passes over ONE row, chained exactly as `rubric.cmd_score` chains them.
+    """Both passes over ONE row, chained the way `rubric.cmd_score` chains them
+    FOR EVERY INPUT THE ODDS PASS ACTUALLY READS -- not a claim of identical
+    chaining in general.
+
+    `cmd_score` appends four post-processing flags to `flags` AFTER
+    `score_row` returns and BEFORE it hands the row to `hireability`:
+    `desc-not-cached`, `tier5-proposed`, `unresolved-aggregator`, `reposted`
+    (see `cmd_score`'s pick/tier5/aggregator/reposted-ledger block). This
+    function does not, and deliberately does not: none of the four is a
+    scoring decision this module can reproduce statelessly (`reposted` in
+    particular depends on `cmd_score`'s on-disk seen-key ledger, which has no
+    canonical equivalent). The two chains are behaviorally identical TODAY only
+    because `rubric._hireability_core` gates its two flag-derived contributions
+    with a plain substring test -- `"Staffing/W2" in flags` and
+    `"degree-gated" in flags` -- and none of the four post-processing flags
+    contains either substring; a fifth flag that did would make the two chains
+    diverge silently. `test_legacy_new_differential.py`'s corpus is what pins
+    the equivalence for the inputs that matter (flags and the recovered pay
+    band) rather than this docstring's word.
 
     Returns `(ScoreResult, OddsResult)`. The single shared, MUTABLE `row` is the
     whole point, and it carries two things from the fit pass into the odds pass

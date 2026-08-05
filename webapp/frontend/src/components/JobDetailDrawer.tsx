@@ -164,7 +164,7 @@ function DrawerContent({ job, onClose }: { job: JobFull; onClose: () => void }) 
           )}
           {job.odds_why && (
             <p>
-              <span className="why-label">Odds</span> {job.odds_why}
+              <span className="why-label">Match</span> {job.odds_why}
             </p>
           )}
         </div>
