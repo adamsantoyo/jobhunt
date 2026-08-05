@@ -37,6 +37,7 @@ CANONICAL_TABLES_BY_VERSION = {
     # matches on `tbl_name`, which for them is `score_versions` (version 9).
     19: set(),
     20: {"score_passes", "score_invalidations"},
+    21: {"recommendation_snapshots", "recommendation_snapshot_items", "outcome_events"},
 }
 CANONICAL_VIEWS = {"compat_jobs", "compat_runs", "compat_job_history"}
 
@@ -306,7 +307,7 @@ def test_v4_upgrade_matches_fresh_canonical_structure(tmp_path):
     upgraded_path = tmp_path / "upgraded_equivalent.db"
     build_v4_db(upgraded_path)
     upgraded = connect(upgraded_path)
-    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 21))
+    assert [v for v, _name in run_migrations(upgraded, str(upgraded_path))] == list(range(5, 22))
 
     assert _canonical_structure(upgraded) == _canonical_structure(fresh)
     assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -846,6 +847,7 @@ def test_v10_upgrade_matches_fresh_posting_link_structure(tmp_path):
         (18, "run_posting_source_state"),
         (19, "score_version_supersession"),
         (20, "score_graph"),
+        (21, "outcome_snapshots"),
     ]
 
     for table in ("job_state", "state_events"):
@@ -885,6 +887,7 @@ def test_v11_upgrade_matches_fresh_legacy_import_ledger(tmp_path):
         (18, "run_posting_source_state"),
         (19, "score_version_supersession"),
         (20, "score_graph"),
+        (21, "outcome_snapshots"),
     ]
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(legacy_artifact_imports)")] == [
         tuple(r) for r in fresh.execute("PRAGMA table_info(legacy_artifact_imports)")
@@ -934,6 +937,7 @@ def test_v12_upgrade_classifies_current_only_membership_and_fixes_history_view(t
         (18, "run_posting_source_state"),
         (19, "score_version_supersession"),
         (20, "score_graph"),
+        (21, "outcome_snapshots"),
     ]
     assert conn.execute(
         "SELECT membership_kind FROM run_postings"
@@ -974,6 +978,7 @@ def test_v14_upgrade_matches_fresh_posting_presence_structure(tmp_path):
         (18, "run_posting_source_state"),
         (19, "score_version_supersession"),
         (20, "score_graph"),
+        (21, "outcome_snapshots"),
     ]
 
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(postings)")] == [
@@ -1035,6 +1040,7 @@ def test_migration_16_indexes_posting_versions_by_source_run(tmp_path):
         (18, "run_posting_source_state"),
         (19, "score_version_supersession"),
         (20, "score_graph"),
+        (21, "outcome_snapshots"),
     ]
 
     upgraded_sql = upgraded.execute(
@@ -1102,6 +1108,7 @@ def test_migration_17_narrows_compat_jobs_to_legacy_versions(tmp_path):
         (18, "run_posting_source_state"),
         (19, "score_version_supersession"),
         (20, "score_graph"),
+        (21, "outcome_snapshots"),
     ]
 
     assert upgraded.execute("SELECT COUNT(*) FROM compat_jobs").fetchone()[0] == 0
@@ -1158,6 +1165,7 @@ def test_migration_18_adds_the_source_state_column_without_backfilling_it(tmp_pa
         (18, "run_posting_source_state"),
         (19, "score_version_supersession"),
         (20, "score_graph"),
+        (21, "outcome_snapshots"),
     ]
 
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(run_postings)")] == [
@@ -1230,6 +1238,7 @@ def test_migration_19_adds_the_score_supersession_columns_and_indexes(tmp_path):
     assert run_migrations(upgraded, str(path)) == [
         (19, "score_version_supersession"),
         (20, "score_graph"),
+        (21, "outcome_snapshots"),
     ]
 
     assert [tuple(r) for r in upgraded.execute("PRAGMA table_info(score_versions)")] == [
@@ -1300,7 +1309,9 @@ def test_migration_20_creates_the_score_graph_tables(tmp_path):
     upgraded.execute("DELETE FROM schema_version WHERE version >= 20")
     upgraded.commit()
 
-    assert run_migrations(upgraded, str(path)) == [(20, "score_graph")]
+    assert run_migrations(upgraded, str(path)) == [
+        (20, "score_graph"), (21, "outcome_snapshots"),
+    ]
 
     for table in ("score_passes", "score_invalidations"):
         assert upgraded.execute(
@@ -1945,7 +1956,7 @@ def test_ddl_from_failed_migration_rolls_back(old_db):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
     ).fetchone()
     versions = {r["version"] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == set(range(1, 21))
+    assert versions == set(range(1, 22))
     conn.close()
 
 

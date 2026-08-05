@@ -101,10 +101,10 @@ def test_fully_backfilled_database_is_ready_and_json_safe(tmp_path):
 
     assert report["readiness"] == {"ready": True, "blockers": []}
     assert report["database"] == {
-        # Pinned to the head migration (19/20 added score-version supersession and
-        # the scoring-graph tables in Phase 3.3), so a schema bump is a deliberate
-        # edit here rather than something the audit silently starts reporting.
-        "integrity_check": "ok", "foreign_key_violation_count": 0, "schema_version": 20,
+        # Pinned to the head migration (21 added the outcome-snapshot tables in
+        # Phase 5.2), so a schema bump is a deliberate edit here rather than
+        # something the audit silently starts reporting.
+        "integrity_check": "ok", "foreign_key_violation_count": 0, "schema_version": 21,
     }
     for private_value in (
         PRIVATE_URL, PRIVATE_KEY, PRIVATE_TITLE, PRIVATE_COMPANY, PRIVATE_NOTES,
