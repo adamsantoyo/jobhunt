@@ -19,6 +19,7 @@ from .db import connect, init_db
 from .ingest import ingest
 from .routers import (
     analytics,
+    calibrationapi,
     changes,
     configapi,
     funnel,
@@ -135,6 +136,7 @@ for module in (
     sourcesops,
     queueapi,
     outcomesapi,
+    calibrationapi,
 ):
     app.include_router(module.router, prefix="/api")
 
