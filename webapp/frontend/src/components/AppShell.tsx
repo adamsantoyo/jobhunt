@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
 import {
@@ -17,6 +17,7 @@ import { JobDetailDrawer } from "./JobDetailDrawer";
 import { SweepProgress } from "./SweepProgress";
 import { RunPanel } from "./RunPanel";
 import { SettingsDialog } from "./SettingsDialog";
+import { ErrorBoundary } from "./ErrorBoundary";
 
 const NAV: Array<{ to: string; label: string }> = [
   { to: "/today", label: "Today" },
@@ -27,6 +28,7 @@ const NAV: Array<{ to: string; label: string }> = [
 
 export function AppShell() {
   const qc = useQueryClient();
+  const location = useLocation();
   const { data: freshness } = useFreshness();
   const { data: review } = useReview();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -279,27 +281,39 @@ export function AppShell() {
           </div>
         )}
 
-        {probeSettled &&
-          (canonical ? (
-            watchedRuns.length > 0 && (
-              <div className="run-panel-stack">
-                {watchedRuns.map((uid) => (
-                  <RunPanel
-                    key={uid}
-                    runUid={uid}
-                    onDismiss={() =>
-                      setWatchedRuns((prev) => prev.filter((existing) => existing !== uid))
-                    }
-                  />
-                ))}
-              </div>
-            )
-          ) : (
-            <SweepProgress />
-          ))}
+        {/* Own boundary, separate from the routed Outlet's: a throw in here
+            (RunPanel renders untrusted SSE payload data) should lose just
+            the strip, not the whole SPA, and the rest of the shell -- nav,
+            topbar, the routed page below -- should keep working. Not keyed
+            by route; the strip is route-independent. */}
+        <ErrorBoundary
+          title="The run panel hit an error."
+          hint="The rest of the app still works."
+        >
+          {probeSettled &&
+            (canonical ? (
+              watchedRuns.length > 0 && (
+                <div className="run-panel-stack">
+                  {watchedRuns.map((uid) => (
+                    <RunPanel
+                      key={uid}
+                      runUid={uid}
+                      onDismiss={() =>
+                        setWatchedRuns((prev) => prev.filter((existing) => existing !== uid))
+                      }
+                    />
+                  ))}
+                </div>
+              )
+            ) : (
+              <SweepProgress />
+            ))}
+        </ErrorBoundary>
 
         <main className="content">
-          <Outlet />
+          <ErrorBoundary key={location.pathname + location.search}>
+            <Outlet />
+          </ErrorBoundary>
         </main>
       </div>
 
