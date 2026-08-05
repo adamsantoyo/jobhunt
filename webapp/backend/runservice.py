@@ -110,6 +110,7 @@ from . import config as app_config
 from .db import connect as db_connect
 from .sources import enrichment as enrichment_module
 from .sources import graph as graph_module
+from .sources import registry as registry_module
 from .sources import resolver as resolver_module
 from .sources import runstore, scheduler as scheduler_module
 from .sources import scoring as scoring_module
@@ -235,6 +236,10 @@ class UnknownRun(RunServiceError):
     """No `pipeline_runs` row and no live handle -> 404."""
 
 
+class UnknownSource(RunServiceError):
+    """No candidate plan contains a target for this source -> 404 (4.4)."""
+
+
 class _StageCancelled(Exception):
     """Internal: a stage stopped early because the run was cancelled.
 
@@ -299,6 +304,15 @@ class _ActiveRun:
     cancel_requested: bool = False
     settled: bool = False
     stages: dict[str, Any] = field(default_factory=dict)
+    #: What `start_run`/`retry_source` were called with, captured at dispatch
+    #: time so `list_runs` can show a run that is active in this process but
+    #: has not reached `pipeline_runs` yet (see `list_runs_sync`'s merge and
+    #: `run_exists`'s docstring for the same race). `requested_at` here is this
+    #: process's clock at dispatch, not the writer's own `runstore.utc_now_iso()`
+    #: call inside the `StartRun` op -- the two are a few milliseconds apart at
+    #: most, and once the row lands the persisted value takes over.
+    trigger: str = "manual"
+    requested_at: str = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -506,6 +520,7 @@ class RunService:
 
         source_config = self.source_config()
         plan = self._plan_for(run_kind, source_config)
+        effective_trigger = trigger or self._trigger
         scheduler = Scheduler(
             self.connect,
             config=self._scheduler_config,
@@ -516,14 +531,150 @@ class RunService:
             kind=run_kind,
             config=source_config,
             plan=plan,
-            trigger=trigger or self._trigger,
+            trigger=effective_trigger,
         )
-        record = _ActiveRun(run_uid=handle.run_uid, kind=str(run_kind), handle=handle)
+        record = _ActiveRun(
+            run_uid=handle.run_uid,
+            kind=str(run_kind),
+            handle=handle,
+            trigger=effective_trigger,
+            requested_at=runstore.utc_now_iso(),
+        )
         self._active[handle.run_uid] = record
         record.supervisor = asyncio.create_task(
             self._supervise(record), name=f"runservice-{handle.run_uid}"
         )
         return {"run_uid": handle.run_uid, "kind": str(run_kind), "status": "running"}
+
+    #: The run kinds a single-source retry is tried against, in order (4.4).
+    #: `adapter.plan()` does not vary by kind -- only which sources are ELIGIBLE
+    #: for a kind does (`SourceDescriptor.runs_in`) -- so `full-direct` and
+    #: `daily` would resolve to the identical target list for a
+    #: DIRECT/STARTUP_BOARD source anyway (every such adapter declares
+    #: `run_kinds={DAILY, FULL_DIRECT}`). `full-direct` is tried first, and
+    #: MUST be -- not `daily` -- because `daily` is the only `RunProfile` with
+    #: `dueness_filtered=True` (`run_profiles.RUN_PROFILES`): a retry of a
+    #: source that already succeeded today would resolve to `daily`, get
+    #: silently dropped by `filter_due` before it ever reaches the scheduler
+    #: (no `source_runs` row, no evidence, nothing to await), and the caller's
+    #: 202 would settle "succeeded" against a run that did nothing (wave-2
+    #: review finding 1). `full-direct` shares the exact same "direct"
+    #: exclusion lane as `daily` (`_EXCLUSION_GROUPS`) and the same
+    #: `STAGED_KINDS` membership (enrichment + scoring still run), so nothing
+    #: about the retry's conflict behaviour or post-fetch stages changes --
+    #: only dueness-filtering is avoided, which is the whole point of an
+    #: explicit user-requested retry. AGGREGATOR sources (`jobspy`) declare
+    #: membership in `{AGGREGATORS}` only, so they are found on the second
+    #: try. MANUAL is deliberately absent: it declares only `MANUAL_IMPORT`, a
+    #: wave-3-deferred kind (`DEFERRED_KINDS`), so a manual source can never
+    #: appear in either candidate plan and correctly reads as "unknown source"
+    #: to a retry request rather than raising `UnsupportedRunKind` for a kind
+    #: nobody asked for.
+    _RETRY_CANDIDATE_KINDS: tuple[RunKind, ...] = (RunKind.FULL_DIRECT, RunKind.AGGREGATORS)
+
+    def _full_plan_for(
+        self, run_kind: RunKind, source_config: SourceConfig
+    ) -> Sequence[tuple[Any, Any]]:
+        """Every `(adapter, target)` pair `run_kind` would plan, resolved eagerly.
+
+        `_plan_for` answers `None` in production ("let the scheduler plan from
+        the registry"), because `start_run` hands the scheduler a bare
+        `run_kind` and lets it call `registry.plan_run` internally. A
+        single-source retry cannot use that shortcut: it needs the concrete
+        list *before* the scheduler starts, so it can filter it down to the one
+        target the caller asked for. So this reuses `_plan_for` for the test
+        seam (an injected `plan_factory`, exactly what `start_run` gets) and
+        falls back to `registry.plan_run` itself -- not to the scheduler --
+        when there is none.
+        """
+        plan = self._plan_for(run_kind, source_config)
+        if plan is not None:
+            return plan
+        return registry_module.plan_run(source_config, run_kind)
+
+    def _resolve_retry_target(
+        self, source: str, source_config: SourceConfig
+    ) -> tuple[RunKind, list[tuple[Any, Any]]] | None:
+        """`(kind, [(adapter, target)])` for the one target named `source`.
+
+        Tries each candidate kind's full plan in turn and keeps the first that
+        contains a target whose `source_run_key` equals `source` exactly --
+        this IS the category -> kind derivation (see `_RETRY_CANDIDATE_KINDS`),
+        done by asking the registry what it would actually plan rather than by
+        guessing a category from the source string. `None` means no candidate
+        plan contains this source at all, which reads as "unknown source"
+        whether that is a typo, a retired source, or one only reachable through
+        a deferred kind (manual import).
+        """
+        for candidate in self._RETRY_CANDIDATE_KINDS:
+            plan = self._full_plan_for(candidate, source_config)
+            matched = [
+                (adapter, target) for adapter, target in plan if target.source_run_key == source
+            ]
+            if matched:
+                return candidate, matched
+        return None
+
+    async def retry_source(self, source: str, *, trigger: str | None = None) -> dict[str, Any]:
+        """Begin a single-source run for exactly one source instance (4.4).
+
+        Same shape as `start_run` (schema gate, then lane conflict, then a
+        supervised run via the same `_supervise` machinery), except the plan
+        handed to the scheduler is the single-target slice
+        `_resolve_retry_target` found rather than the registry's full plan for
+        the kind. Post-fetch stages therefore follow the resolved kind's own
+        policy for free: a DIRECT/STARTUP_BOARD source resolves to
+        `full-direct` (a `STAGED_KINDS` member, same lane as `daily`, but --
+        unlike `daily` -- never dueness-filtered, so a retry of a source that
+        already succeeded today still runs instead of being silently skipped)
+        and gets enrichment + scoring exactly as a full `daily` run would; an
+        AGGREGATOR source resolves to `aggregators` and settles at fetch, same
+        as any other `aggregators` run.
+
+        Refusal order mirrors `start_run`: schema availability (503) is
+        checked first, before the source is even resolved -- resolving is moot
+        on a database the feature is unavailable on. Then "is this source
+        real" (404). Then the lane conflict the resolved kind belongs to
+        (409), which can only be decided once the kind is known.
+        """
+        await self.require_canonical_schema()
+        source_config = self.source_config()
+        resolved = await asyncio.to_thread(self._resolve_retry_target, source, source_config)
+        if resolved is None:
+            raise UnknownSource(f"no source {source!r}")
+        run_kind, plan = resolved
+        self._check_conflicts(str(run_kind))
+
+        effective_trigger = trigger or "manual-retry"
+        scheduler = Scheduler(
+            self.connect,
+            config=self._scheduler_config,
+            transport=self._scheduler_transport,
+            event_hook=self._on_committed_events,
+        )
+        handle = scheduler.start(
+            kind=run_kind,
+            config=source_config,
+            plan=plan,
+            trigger=effective_trigger,
+        )
+        record = _ActiveRun(
+            run_uid=handle.run_uid,
+            kind=str(run_kind),
+            handle=handle,
+            trigger=effective_trigger,
+            requested_at=runstore.utc_now_iso(),
+        )
+        self._active[handle.run_uid] = record
+        record.supervisor = asyncio.create_task(
+            self._supervise(record), name=f"runservice-{handle.run_uid}"
+        )
+        return {
+            "run_uid": handle.run_uid,
+            "source": source,
+            "kind": str(run_kind),
+            "status": "running",
+        }
 
     def _deliver_cancel(self, record: _ActiveRun) -> None:
         """Set the flag, stop the fetch, stop the stage that is running now.
@@ -1114,6 +1265,32 @@ class RunService:
         return (await asyncio.to_thread(self._run_row, run_uid)) is not None
 
     def list_runs_sync(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Recent runs, newest first -- persisted rows overlaid with any run this
+        process has already started but whose `StartRun` op has not reached
+        `pipeline_runs` yet.
+
+        That gap is the same race `run_exists` guards against (see its
+        docstring): `start_run`/`retry_source` return as soon as the run TASK
+        is created, not once its first op has been written by the scheduler's
+        writer, which drains on its own queue a moment later. Without this
+        merge, a client that calls `POST /api/runs` (or a retry) and
+        immediately polls `GET /api/runs` can get back a list with no trace of
+        the run it just started -- the 202 beats the row -- and a UI built to
+        mount a panel per listed run never mounts one (wave-2 review finding
+        3). `run_exists`/the SSE endpoint already tolerate this window per-run;
+        this is the same tolerance applied to the list.
+
+        The synthetic row for a not-yet-persisted run carries only what the
+        in-memory `_ActiveRun` record actually knows -- `run_uid`, `kind`,
+        `status` (always `"running"`: a record this loop reaches is by
+        definition not `settled`), `trigger`, `requested_at` (this process's
+        clock at dispatch time, not the writer's) -- everything else
+        (`started_at`, `finished_at`, `kept_count`, `new_count`, `error`) is
+        `None` because the writer has not produced it yet. Once the real row
+        lands, the next call reads it from `pipeline_runs` instead and this
+        overlay no longer applies to that run.
+        """
+
         def _query(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             rows = conn.execute(
                 "SELECT run_uid, kind, status, trigger, requested_at, started_at, "
@@ -1121,7 +1298,7 @@ class RunService:
                 "ORDER BY COALESCE(requested_at, started_at, '') DESC, rowid DESC LIMIT ?",
                 (int(limit),),
             ).fetchall()
-            return [
+            persisted = [
                 {
                     "run_uid": row["run_uid"],
                     "kind": row["kind"],
@@ -1137,6 +1314,26 @@ class RunService:
                 }
                 for row in rows
             ]
+            seen = {r["run_uid"] for r in persisted}
+            pending = [
+                {
+                    "run_uid": record.run_uid,
+                    "kind": record.kind,
+                    "status": "running",
+                    "trigger": record.trigger,
+                    "requested_at": record.requested_at,
+                    "started_at": None,
+                    "finished_at": None,
+                    "kept_count": None,
+                    "new_count": None,
+                    "error": None,
+                    "active": True,
+                }
+                for record in self._active.values()
+                if not record.settled and record.run_uid not in seen
+            ]
+            pending.sort(key=lambda r: r["requested_at"] or "", reverse=True)
+            return (pending + persisted)[: int(limit)]
 
         return self._read(_query)
 
