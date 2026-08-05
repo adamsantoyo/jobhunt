@@ -85,7 +85,16 @@ export function AppShell() {
   const [confirmFullOpen, setConfirmFullOpen] = useState(false);
 
   const surfaceError = (e: unknown) => {
-    if (e instanceof ApiError && e.status === 409) {
+    if (e instanceof ApiError && e.status === 409 && e.message.includes("JOBHUNT_WRITES")) {
+      // The 4.7 write gate (config.WRITE_GATE_DETAIL), not a sweep conflict:
+      // legacy sweep endpoints refuse with a 409 naming the flag once
+      // JOBHUNT_WRITES=canonical. Without this branch that refusal would be
+      // mislabeled as "a sweep is already running".
+      setBanner({
+        tone: "error",
+        text: "Legacy sweeps are switched off on this server (JOBHUNT_WRITES=canonical). Use the run controls in the strip below instead.",
+      });
+    } else if (e instanceof ApiError && e.status === 409) {
       setBanner({
         tone: "error",
         text: "A sweep is already running. See the progress strip below, or cancel it there first.",
