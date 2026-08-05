@@ -23,6 +23,8 @@ from .routers import (
     configapi,
     funnel,
     jobs,
+    outcomesapi,
+    queueapi,
     readsv2,
     runsapi,
     sourcesops,
@@ -131,6 +133,8 @@ for module in (
     runsapi,
     readsv2,
     sourcesops,
+    queueapi,
+    outcomesapi,
 ):
     app.include_router(module.router, prefix="/api")
 
