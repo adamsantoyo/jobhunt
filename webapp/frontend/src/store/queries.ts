@@ -5,7 +5,9 @@ import {
   useQuery,
   useMutation,
   useQueryClient,
+  keepPreviousData,
   type QueryClient,
+  type QueryKey,
 } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
 import { dateToISO, isoPlusDays, todayISO } from "../lib/format";
@@ -19,6 +21,7 @@ import type {
   ConfigPatch,
   ReconcileBody,
   RunKind,
+  QueueTodayResponse,
 } from "../api/types";
 
 export const qk = {
@@ -39,6 +42,14 @@ export const qk = {
   runs: (limit: number) => ["runs", limit] as const,
   runDetail: (runUid: string) => ["runDetail", runUid] as const,
   sourceOps: ["sourceOps"] as const,
+  // Phase 5.1/5.5: server-side Today queue, keyed by the remaining-contract
+  // cap the caller requested. `queueTodayAll` is the shared PREFIX every
+  // `queueToday(cap)` key extends -- pass it to invalidateQueries/findAll to
+  // reach every cached cap variant at once without knowing which caps exist.
+  queueTodayAll: ["queueToday"] as const,
+  queueToday: (cap: number) => ["queueToday", cap] as const,
+  rankingMetrics: (minSample?: number, ghostDays?: number) =>
+    ["rankingMetrics", minSample ?? null, ghostDays ?? null] as const,
 };
 
 // Local-naive ISO timestamp matching backend models.now_iso() (datetime.now().isoformat()).
@@ -125,6 +136,53 @@ function invalidateStateDerived(qc: QueryClient) {
   qc.invalidateQueries({ queryKey: qk.followups });
   qc.invalidateQueries({ queryKey: qk.activity });
   qc.invalidateQueries({ queryKey: qk.funnel });
+  // Server-side Today queue (5.5): a state change can move a job out of
+  // (or, via a status revert, back into) queue eligibility, and can free a
+  // company-cap/uncertainty-cap slot for the next excluded entrant -- none
+  // of which this client can compute, so the authoritative refetch matters
+  // here even though `removeFromQueueCaches` below already gives the acted
+  // card immediate optimistic feedback.
+  qc.invalidateQueries({ queryKey: qk.queueTodayAll });
+}
+
+/**
+ * Mirrors `isActionable`'s status/hidden/snoozed checks (lib/format.ts,
+ * frozen until Phase 6 deletion): optimistically drops `urlB64` from every
+ * cached `queueToday(cap)` response the instant a mutation makes the job
+ * non-actionable, so the served Today queue reacts as snappily as the old
+ * client-composed queue did, without waiting on the settle refetch above.
+ */
+function removeFromQueueCaches(qc: QueryClient, urlB64: string) {
+  qc.getQueryCache()
+    .findAll({ queryKey: qk.queueTodayAll })
+    .forEach((query) => {
+      qc.setQueryData<QueueTodayResponse>(query.queryKey, (prev) => {
+        if (!prev) return prev;
+        if (!prev.queue.some((e) => e.job.url_b64 === urlB64)) return prev;
+        return { ...prev, queue: prev.queue.filter((e) => e.job.url_b64 !== urlB64) };
+      });
+    });
+}
+
+/** A snapshot of every cached `queueToday(cap)` response, keyed by its full
+ * query key -- there can be more than one cap variant cached at once (the
+ * remaining-contract cap changes as `done` moves). Pair with
+ * `restoreQueueCaches` for the same same-discipline optimistic-rollback
+ * `usePatchState`/`useQuickAction` already give `prevJobs`/`prevJob` (5.5
+ * fix F3). */
+type QueueCacheSnapshot = Array<[QueryKey, QueueTodayResponse | undefined]>;
+
+function snapshotQueueCaches(qc: QueryClient): QueueCacheSnapshot {
+  return qc
+    .getQueryCache()
+    .findAll({ queryKey: qk.queueTodayAll })
+    .map((query) => [query.queryKey, query.state.data as QueueTodayResponse | undefined]);
+}
+
+function restoreQueueCaches(qc: QueryClient, snapshot: QueueCacheSnapshot) {
+  for (const [key, data] of snapshot) {
+    qc.setQueryData(key, data);
+  }
 }
 
 export function useReconcile() {
@@ -200,6 +258,35 @@ export function useActivity() {
   return useQuery({ queryKey: qk.activity, queryFn: api.getActivity, staleTime: 30_000 });
 }
 
+// Phase 5.1/5.5: server-side Today queue. `cap` is the REMAINING daily
+// contract the caller computed (daily_queue_size minus done-today) -- same
+// number `composeQueue` used to receive; the client concern of subtracting
+// done-today is unchanged, only the composition itself moved server-side.
+//
+// `options.enabled` (5.5 fix F2) lets the caller withhold the request until
+// its own prerequisites (config + activity resolved, remaining cap > 0) are
+// real rather than default-guessed. `placeholderData: keepPreviousData`
+// means a cap-key change (done ticking up, a cap edit) keeps rendering the
+// last-known queue while the new cap's request is in flight instead of
+// collapsing the section to a loading state every time the key changes.
+export function useQueueToday(cap: number, options: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: qk.queueToday(cap),
+    queryFn: () => api.getQueueToday(cap),
+    staleTime: 30_000,
+    enabled: options.enabled ?? true,
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useRankingMetrics(minSample?: number, ghostDays?: number) {
+  return useQuery({
+    queryKey: qk.rankingMetrics(minSample, ghostDays),
+    queryFn: () => api.getRankingMetrics(minSample, ghostDays),
+    staleTime: 60_000,
+  });
+}
+
 // ---- mutations ----
 
 export function usePatchState() {
@@ -209,15 +296,26 @@ export function usePatchState() {
       api.patchState(urlB64, patch),
     onMutate: async ({ urlB64, patch }) => {
       await qc.cancelQueries({ queryKey: qk.jobs });
+      await qc.cancelQueries({ queryKey: qk.queueTodayAll });
       const prevJobs = qc.getQueryData<JobsResponse>(qk.jobs);
       const prevJob = qc.getQueryData<JobFull>(qk.job(urlB64));
+      const prevQueue = snapshotQueueCaches(qc);
       patchJobsCache(qc, urlB64, (s) => mergePatch(s, patch));
-      return { prevJobs, prevJob, urlB64 };
+      // A status move off "New" (e.g. Shortlist -> Interested), hidden=true,
+      // or a future snooze all make the job non-actionable -- see
+      // `isActionable` in lib/format.ts, which this mirrors.
+      const leavesQueue =
+        (patch.status !== undefined && patch.status !== "New") ||
+        patch.hidden === true ||
+        (!!patch.snoozed_until && patch.snoozed_until > todayISO());
+      if (leavesQueue) removeFromQueueCaches(qc, urlB64);
+      return { prevJobs, prevJob, prevQueue, urlB64 };
     },
     onError: (_err, _vars, ctx) => {
       if (!ctx) return;
       if (ctx.prevJobs) qc.setQueryData(qk.jobs, ctx.prevJobs);
       if (ctx.prevJob) qc.setQueryData(qk.job(ctx.urlB64), ctx.prevJob);
+      restoreQueueCaches(qc, ctx.prevQueue);
     },
     onSuccess: (state, { urlB64 }) => {
       // Replace optimistic guess with the authoritative server state.
@@ -234,15 +332,24 @@ export function useQuickAction() {
       api.quickAction(urlB64, body),
     onMutate: async ({ urlB64, body }) => {
       await qc.cancelQueries({ queryKey: qk.jobs });
+      await qc.cancelQueries({ queryKey: qk.queueTodayAll });
       const prevJobs = qc.getQueryData<JobsResponse>(qk.jobs);
       const prevJob = qc.getQueryData<JobFull>(qk.job(urlB64));
+      const prevQueue = snapshotQueueCaches(qc);
       patchJobsCache(qc, urlB64, (s) => applyQuick(s, body));
-      return { prevJobs, prevJob, urlB64 };
+      // applied/snooze/pass all make the job non-actionable; star/unstar
+      // does not touch status/hidden/snoozed_until, so it leaves eligibility
+      // untouched.
+      if (body.action === "applied" || body.action === "snooze" || body.action === "pass") {
+        removeFromQueueCaches(qc, urlB64);
+      }
+      return { prevJobs, prevJob, prevQueue, urlB64 };
     },
     onError: (_err, _vars, ctx) => {
       if (!ctx) return;
       if (ctx.prevJobs) qc.setQueryData(qk.jobs, ctx.prevJobs);
       if (ctx.prevJob) qc.setQueryData(qk.job(ctx.urlB64), ctx.prevJob);
+      restoreQueueCaches(qc, ctx.prevQueue);
     },
     onSuccess: (state, { urlB64 }) => {
       patchJobsCache(qc, urlB64, () => state);

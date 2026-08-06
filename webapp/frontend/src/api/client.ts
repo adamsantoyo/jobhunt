@@ -25,7 +25,11 @@ import type {
   RunDetail,
   SourceOpsResponse,
   RetryResponse,
+  QueueTodayResponse,
+  OutcomeEventBody,
+  RankingMetricsResponse,
 } from "./types";
+import { todayISO } from "../lib/format";
 
 const APP_HEADER = "X-App";
 const APP_VALUE = "jobhunt";
@@ -137,4 +141,44 @@ export const api = {
     request<RetryResponse>(`/api/sources/${encodeURIComponent(source)}/retry`, {
       method: "POST",
     }),
+
+  // server-side Today queue (Phase 5.1/5.5). `cap` is the REMAINING daily
+  // contract (daily_queue_size minus done-today) -- the caller computes it,
+  // same as `composeQueue` received it before this flip.
+  getQueueToday: (cap: number) => request<QueueTodayResponse>(`/api/queue/today?cap=${cap}`),
+  getRankingMetrics: (minSample?: number, ghostDays?: number) => {
+    const params = new URLSearchParams();
+    if (minSample != null) params.set("min_sample", String(minSample));
+    if (ghostDays != null) params.set("ghost_days", String(ghostDays));
+    const qs = params.toString();
+    return request<RankingMetricsResponse>(`/api/ranking/metrics${qs ? `?${qs}` : ""}`);
+  },
+
+  // Open-event capture (Phase 5.5): fire-and-forget POST /api/outcomes/events.
+  // Deliberately NOT awaited by callers -- the promise is swallowed right
+  // here so a slow or failing capture can never delay or block the open it
+  // is attached to (TodayCard's window.open, JobDetailDrawer's external
+  // link). `snapshotId` is passed only when the open came from the served
+  // Today queue; omitted entirely otherwise (backend treats it as optional).
+  // No `rank` here -- 5.5 fix F1: rank never leaves the client, the server
+  // derives it from the (snapshot_id, posting) match. Every open carries an
+  // `idempotency_key` of `opened:<url_b64>:<local-date>:<surface>` (5.5 fix
+  // F6) so a double-fire (e.g. re-render, StrictMode, a second click before
+  // the request settles) counts at most one open per posting per local day
+  // PER SURFACE — the surface discriminator keeps an earlier unattributed
+  // drawer open from deduping away the queue-attributed open (seam L2).
+  captureOpened: (urlB64: string, opts: { snapshotId?: string | null } = {}): void => {
+    const surface = opts.snapshotId != null ? "queue" : "page";
+    const body: OutcomeEventBody = {
+      kind: "opened",
+      url_b64: urlB64,
+      idempotency_key: `opened:${urlB64}:${todayISO()}:${surface}`,
+    };
+    if (opts.snapshotId != null) body.snapshot_id = opts.snapshotId;
+    void request<unknown>("/api/outcomes/events", { method: "POST", ...jsonBody(body) }).catch(
+      () => {
+        /* silent by design -- open-event capture must never surface a UI error */
+      },
+    );
+  },
 };

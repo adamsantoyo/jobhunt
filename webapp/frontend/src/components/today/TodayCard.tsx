@@ -1,5 +1,6 @@
 import { useState, type CSSProperties, type KeyboardEvent } from "react";
 import { useConfig, useJobDetail, usePatchState, useQuickAction } from "../../store/queries";
+import { api } from "../../api/client";
 import { fmtSalary, flagsList, isHttpUrl } from "../../lib/format";
 import { highlightText } from "../../lib/highlight";
 import { FlagBadge, OddsBadge, TierBadge } from "../StatusBadge";
@@ -53,7 +54,18 @@ function agoLabel(dateStr: string | null | undefined): string {
 
 const skeletonBarStyle = (w: string): CSSProperties => ({ width: w });
 
-export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLight) => void }) {
+export function TodayCard({
+  job,
+  onOpen,
+  snapshotId = null,
+}: {
+  job: JobLight;
+  onOpen: (job: JobLight) => void;
+  /** Today snapshot this card was served from (5.5 open-event capture).
+   * No `rank` prop: F1 -- rank never leaves the client, the server derives
+   * it from the (snapshot_id, posting) match. */
+  snapshotId?: string | null;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [hasExpandedOnce, setHasExpandedOnce] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -79,7 +91,11 @@ export function TodayCard({ job, onOpen }: { job: JobLight; onOpen: (job: JobLig
   const startApply = () => {
     // Scraped URLs can carry any scheme; only open real web links. The confirm
     // state still shows either way so an application made elsewhere can be logged.
-    if (isHttpUrl(job.url)) window.open(job.url, "_blank", "noopener");
+    if (isHttpUrl(job.url)) {
+      window.open(job.url, "_blank", "noopener");
+      // Fire-and-forget: never awaited, never blocks/delays the open above.
+      api.captureOpened(job.url_b64, { snapshotId });
+    }
     setAppliedVia("site");
     setConfirming(true);
   };

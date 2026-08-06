@@ -407,6 +407,172 @@ export interface RetryResponse {
   run_uid: string;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5.1/5.5 -- server-side Today queue (GET /api/queue/today)
+// ---------------------------------------------------------------------------
+// Shape pinned in backend/tests/test_queue_api.py::test_happy_path_shape_and_ranking
+// (5.1) plus the 5.5 contract addition (plans/phase5-progress.md, "5.5
+// contract"): a nullable top-level `snapshot_id`, echoed on every same-day
+// response once the backend's snapshot-on-serve wave lands, null when
+// capture failed or was skipped. `evidence`/freshness/uncertainty field
+// names mirror backend/ranking.py's `QueueEntry.evidence` dict literally.
+
+export interface QueueFreshness {
+  bucket: string;
+  age_days: number | null;
+  basis: string | null;
+}
+
+export interface QueueEvidence {
+  lane: string;
+  lane_rank: number;
+  match_band: string | null;
+  competition_band: string | null;
+  odds_score: number | null;
+  tier: number;
+  freshness: QueueFreshness;
+  /** Flags like "unscored" / "no-description"; empty array when none. */
+  uncertainty: string[];
+  why: string | null;
+}
+
+export interface QueueEntry {
+  job: JobLight;
+  rank: number;
+  lane: string;
+  lane_rank: number;
+  evidence: QueueEvidence;
+}
+
+export interface QueueExcludedRow {
+  url_b64: string;
+  title: string | null;
+  company: string | null;
+  reason: string;
+  detail: string | null;
+}
+
+export interface QueueTodayResponse {
+  generated_for: string;
+  cap: number;
+  queue: QueueEntry[];
+  excluded: QueueExcludedRow[];
+  excluded_counts: Record<string, number>;
+  considered: number;
+  /** 5.5 addition: today's captured "today"-surface snapshot id, echoed on
+   * every same-day response; null when capture failed or was skipped. Lets
+   * the client attribute open events back to the served queue. */
+  snapshot_id: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5.2/5.5 -- outcome event capture (POST /api/outcomes/events)
+// ---------------------------------------------------------------------------
+// Mirrors backend/routers/outcomesapi.py's `OutcomeEventIn`. Only the
+// "opened" kind is emitted by this wave's two capture sites (TodayCard's
+// window.open, JobDetailDrawer's external link); the field is typed as
+// `string` (not a literal union) because the backend kind whitelist is
+// extensible and this DTO does not own that vocabulary.
+//
+// No `rank` field: the 5.5 fix adjudication (F1) moved rank derivation to
+// the server (outcomesapi.record_outcome_event derives rank from the
+// matching (snapshot_id, posting) item) -- the client never had an
+// authoritative rank to send in the first place, since build_queue
+// renumbers ranks per serve.
+export interface OutcomeEventBody {
+  kind: string;
+  url_b64?: string;
+  posting_id?: string;
+  snapshot_id?: string | null;
+  payload?: Record<string, unknown> | null;
+  idempotency_key?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5.5 -- ranking-quality metrics (GET /api/ranking/metrics)
+// ---------------------------------------------------------------------------
+// Mirrors backend/ranking_metrics.py::ranking_metrics's literal return dict
+// (verified read-only against the landed module + routers/queueapi.py's
+// `get_ranking_metrics`, which passes it straight through) -- not a guess
+// from the contract prose, the actual field names each cell builder returns.
+
+export interface Top10ApplicationRate {
+  n_served_top10: number;
+  n_applied: number;
+  rate: number | null;
+  low_sample: boolean;
+}
+
+export interface TimeToApplication {
+  n_served: number;
+  n_applied: number;
+  median_days: number | null;
+  low_sample: boolean;
+}
+
+export interface ResponseRateCell {
+  n_applied: number;
+  n_responded: number;
+  rate: number | null;
+  low_sample: boolean;
+}
+
+export interface StaleRateCell {
+  n_served: number;
+  n_stale_never_engaged: number;
+  rate: number | null;
+  low_sample: boolean;
+}
+
+export interface GhostRateCell {
+  n_applied_total: number;
+  n_applied_eligible: number;
+  n_ghosted: number;
+  rate: number | null;
+  low_sample: boolean;
+  ghost_days: number;
+}
+
+export interface QueueCompletionDay {
+  day: string;
+  queue_size: number;
+  n_served: number;
+  n_completed: number;
+  rate: number | null;
+}
+
+export interface QueueCompletion {
+  by_day: QueueCompletionDay[];
+  n_days: number;
+  median_rate: number | null;
+  low_sample: boolean;
+}
+
+export interface SourceYieldCell {
+  key: string;
+  n_recommended: number;
+  n_opened: number;
+  n_applied: number;
+  n_responded: number;
+  open_rate: number | null;
+  application_rate: number | null;
+  response_rate: number | null;
+  low_sample: boolean;
+}
+
+export interface RankingMetricsResponse {
+  generated_at: string;
+  min_sample: number;
+  ghost_days: number;
+  top10_application_rate: Top10ApplicationRate;
+  time_to_application: TimeToApplication;
+  response_rate: ResponseRateCell;
+  stale_rate: StaleRateCell;
+  ghost_rate: GhostRateCell;
+  queue_completion: QueueCompletion;
+  source_yield: { by_source: SourceYieldCell[]; by_source_category: SourceYieldCell[] };
+}
+
 // SSE event shape emitted by GET /api/sweep/progress
 // SSE event shape emitted by GET /api/sweep/progress.
 // `sync` and `bye` are transport-level: `sync` is the per-subscriber catch-up frame

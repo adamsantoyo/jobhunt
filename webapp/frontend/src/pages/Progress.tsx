@@ -16,22 +16,24 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { useAnalytics, useActivity, useConfig, useFunnel } from "../store/queries";
+import { useAnalytics, useActivity, useConfig, useFunnel, useRankingMetrics } from "../store/queries";
+import { ApiError } from "../api/client";
 import { ChartCard, StatCard } from "../components/progress/panels";
 import { ChartTooltip } from "../components/progress/ChartTooltip";
 import { HeatMatrix } from "../components/progress/HeatMatrix";
 import { SourceOpsPanel } from "../components/progress/SourceOpsPanel";
 import { COMPETITION_COLORS, kfmt, nfmt, TICK, TIER_COLORS, VIZ } from "../components/progress/theme";
 import { fmtDate } from "../lib/format";
-import type { FunnelTotals, StageConversion, TimeInStage } from "../api/types";
+import type { FunnelTotals, StageConversion, TimeInStage, SourceYieldCell } from "../api/types";
 
-// Progress = three lenses on "how is this search going": My funnel (this
+// Progress = four lenses on "how is this search going": My funnel (this
 // applicant's own event-log-derived pipeline, computed client-side from
 // useFunnel/useActivity/useConfig), Market (the existing scrape-wide charts,
-// ported unchanged from the old /analytics dashboard), and Sources (Phase
-// 4.4's canonical-run source health panel, empty-stated until cutover).
+// ported unchanged from the old /analytics dashboard), Sources (Phase 4.4's
+// canonical-run source health panel, empty-stated until cutover), and
+// Quality (Phase 5.5's ranking-quality panel over GET /api/ranking/metrics).
 
-type ProgressTab = "funnel" | "market" | "sources";
+type ProgressTab = "funnel" | "market" | "sources" | "quality";
 
 const STATUS_ORDER = [
   "New",
@@ -83,7 +85,13 @@ export default function Progress() {
   const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get("tab");
   const tab: ProgressTab =
-    tabParam === "market" ? "market" : tabParam === "sources" ? "sources" : "funnel";
+    tabParam === "market"
+      ? "market"
+      : tabParam === "sources"
+        ? "sources"
+        : tabParam === "quality"
+          ? "quality"
+          : "funnel";
 
   const setTab = (next: ProgressTab) => {
     setSearchParams(
@@ -124,9 +132,25 @@ export default function Progress() {
         >
           Sources
         </button>
+        <button
+          type="button"
+          className="chip-toggle"
+          data-on={tab === "quality" ? "1" : "0"}
+          onClick={() => setTab("quality")}
+        >
+          Quality
+        </button>
       </div>
 
-      {tab === "funnel" ? <FunnelTab /> : tab === "market" ? <MarketTab /> : <SourceOpsPanel />}
+      {tab === "funnel" ? (
+        <FunnelTab />
+      ) : tab === "market" ? (
+        <MarketTab />
+      ) : tab === "sources" ? (
+        <SourceOpsPanel />
+      ) : (
+        <QualityTab />
+      )}
     </div>
   );
 }
@@ -676,6 +700,322 @@ function MarketTab() {
             </ResponsiveContainer>
           )}
         </ChartCard>
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab 4 — Quality (Phase 5.5: ranking-quality metrics)
+// ---------------------------------------------------------------------------
+// Renders GET /api/ranking/metrics: how well the server-side ranker
+// (backend/ranking.py, served via GET /api/queue/today) is actually doing,
+// not just what it recommended. Every cell carries its own explicit
+// denominator and a `low_sample` badge (n below the endpoint's min_sample)
+// rather than a bare rate that quietly lies when n is tiny -- same
+// convention as outcome_analytics.py's cells, which this endpoint reuses.
+//
+// Funnel-vs-analytics label note (5.3 watch item, phase5-progress.md): /api/
+// funnel and this endpoint deliberately disagree on stage totals -- funnel.py
+// counts a posting as "responded" once it has EVER reached a response stage
+// (a reached-count, order-independent), while this endpoint's response_rate
+// is a per-application rate scoped to what the ranker actually served.
+// Different denominators, different questions -- the banner below and each
+// stat's own subtitle say so explicitly rather than let two similar-looking
+// percentages silently disagree.
+
+function LowSampleBadge({ show, title }: { show: boolean; title: string }) {
+  if (!show) return null;
+  return (
+    <span className="badge flag rk-low-sample" data-kind="amber" title={title}>
+      low n
+    </span>
+  );
+}
+
+/** min_sample is a per-response value (GET /api/ranking/metrics's own
+ * `min_sample` query param/default), not a fixed constant -- the badge's
+ * tooltip states the actual threshold in effect rather than the bare word
+ * "min_sample" (5.5 fix F6). */
+function lowSampleTitle(minSample: number): string {
+  return `Sample below min_sample=${minSample} -- rate may be noisy`;
+}
+
+function RkCellRow({
+  label,
+  numerator,
+  denominator,
+  lowSample,
+  lowSampleTitle: title,
+}: {
+  label: string;
+  numerator: number;
+  denominator: number;
+  lowSample: boolean;
+  lowSampleTitle: string;
+}) {
+  return (
+    <div className="rk-cell-row">
+      <span className="rk-cell-label">{label}</span>
+      <span className="rk-cell-value">
+        {nfmt(numerator)} / {nfmt(denominator)}
+        <LowSampleBadge show={lowSample} title={title} />
+      </span>
+    </div>
+  );
+}
+
+function SourceYieldTable({ rows, minSample }: { rows: SourceYieldCell[]; minSample: number }) {
+  if (rows.length === 0) {
+    return <div className="an-empty">No recommendation history yet.</div>;
+  }
+  const title = lowSampleTitle(minSample);
+  return (
+    <div className="rk-table-wrap">
+      <table className="rk-source-table">
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Rec'd</th>
+            <th>Opened</th>
+            <th>Applied</th>
+            <th>Responded</th>
+            <th>Open %</th>
+            <th>Apply %</th>
+            <th>Resp %</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.key}>
+              <td className="rk-source-key">
+                {r.key}
+                <LowSampleBadge show={r.low_sample} title={title} />
+              </td>
+              <td>{nfmt(r.n_recommended)}</td>
+              <td>{nfmt(r.n_opened)}</td>
+              <td>{nfmt(r.n_applied)}</td>
+              <td>{nfmt(r.n_responded)}</td>
+              <td>{pctOrDash(r.open_rate)}</td>
+              <td>{pctOrDash(r.application_rate)}</td>
+              <td>{pctOrDash(r.response_rate)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function QualityTab() {
+  const { data: metrics, isLoading, isError, error } = useRankingMetrics();
+
+  if (isLoading) return <p className="muted">Loading...</p>;
+  if (isError) {
+    // GET /api/ranking/metrics answers 503 on a pre-canonical-schema database
+    // (same precedent as GET /api/runs, see useRunsCapability) -- that is an
+    // expected "not migrated yet" state, not a failure worth an error banner.
+    if (error instanceof ApiError && error.status === 503) {
+      return (
+        <div className="an-empty">
+          Ranking-quality metrics need the canonical schema -- not migrated on this
+          database yet.
+        </div>
+      );
+    }
+    return <div className="page-error">Failed to load ranking metrics.</div>;
+  }
+  if (!metrics) return <div className="page-error">Failed to load ranking metrics.</div>;
+
+  const t10 = metrics.top10_application_rate;
+  const resp = metrics.response_rate;
+  const stale = metrics.stale_rate;
+  const ghost = metrics.ghost_rate;
+  const tta = metrics.time_to_application;
+  const completion = metrics.queue_completion;
+  const lsTitle = lowSampleTitle(metrics.min_sample);
+
+  return (
+    <>
+      <div className="rk-note">
+        Generated {fmtDate(metrics.generated_at)}. Every rate below carries its own
+        explicit denominator (the "Denominators" panel(s)) and a "low n" badge when its
+        sample is under min_sample={metrics.min_sample} -- read the badge before trusting
+        a lone percentage.
+      </div>
+
+      <h3 className="rk-group-head">Served-queue quality</h3>
+      <div className="rk-note">
+        Scoped to postings the ranker actually served: open/apply attributed back to the
+        Today queue that recommended them -- a different denominator than "Stage
+        conversion" on the My funnel tab, which counts postings that ever reached a
+        pipeline stage regardless of serve order. The two are expected to disagree; that
+        is not a bug in either panel.
+      </div>
+
+      <div className="an-stats">
+        <StatCard
+          label="Top-10 application rate"
+          value={
+            <>
+              {pctOrDash(t10.rate)} <LowSampleBadge show={t10.low_sample} title={lsTitle} />
+            </>
+          }
+          accent={rateAccent(t10.rate)}
+        />
+        <StatCard
+          label="Stale-in-queue rate"
+          value={
+            <>
+              {pctOrDash(stale.rate)} <LowSampleBadge show={stale.low_sample} title={lsTitle} />
+            </>
+          }
+          accent={stale.rate != null && stale.rate > 0.25 ? VIZ.red : VIZ.mute}
+        />
+        <StatCard
+          label="Median days to apply"
+          value={
+            <>
+              {tta.median_days == null ? "-" : `${tta.median_days.toFixed(1)}d`}{" "}
+              <LowSampleBadge show={tta.low_sample} title={lsTitle} />
+            </>
+          }
+        />
+      </div>
+
+      <div className="an-grid">
+        <ChartCard title="Denominators" subtitle="what each served-queue rate above is out of" scroll>
+          <div className="rk-cell-list">
+            <RkCellRow
+              label="Top-10 served -> applied"
+              numerator={t10.n_applied}
+              denominator={t10.n_served_top10}
+              lowSample={t10.low_sample}
+              lowSampleTitle={lsTitle}
+            />
+            <RkCellRow
+              label="Served -> stale, never engaged"
+              numerator={stale.n_stale_never_engaged}
+              denominator={stale.n_served}
+              lowSample={stale.low_sample}
+              lowSampleTitle={lsTitle}
+            />
+            <div className="rk-cell-row">
+              <span className="rk-cell-label">Time-to-application sample</span>
+              <span className="rk-cell-value">
+                n={nfmt(tta.n_applied)} of {nfmt(tta.n_served)} served
+                <LowSampleBadge show={tta.low_sample} title={lsTitle} />
+              </span>
+            </div>
+          </div>
+        </ChartCard>
+
+        <ChartCard title="Queue completion" subtitle="served jobs acted on, same local day" scroll>
+          {completion.by_day.length === 0 ? (
+            <div className="an-empty">No served-day history yet.</div>
+          ) : (
+            <div className="an-timelist">
+              <div className="an-time-row">
+                <span className="an-time-label">Median (all days)</span>
+                <span className="an-time-value">
+                  {pctOrDash(completion.median_rate)}{" "}
+                  <LowSampleBadge show={completion.low_sample} title={lsTitle} />
+                </span>
+              </div>
+              {completion.by_day.map((d) => (
+                <div className="an-time-row" key={d.day}>
+                  <span className="an-time-label">{d.day}</span>
+                  <span className="an-time-value">
+                    {/* Fraction and percentage share the SAME denominator
+                        (queue_size, 5.5 fix F5) -- n_served is context, not
+                        what either number above is computed out of. */}
+                    {nfmt(d.n_completed)}/{nfmt(d.queue_size)} · {pctOrDash(d.rate)}{" "}
+                    <span className="muted-sm">({nfmt(d.n_served)} served)</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </ChartCard>
+
+        <ChartCard title="Source yield" subtitle="recommended -> opened -> applied -> responded" scroll>
+          <SourceYieldTable rows={metrics.source_yield.by_source} minSample={metrics.min_sample} />
+        </ChartCard>
+
+        <ChartCard
+          title="Source yield by category"
+          subtitle="recommended -> opened -> applied -> responded"
+          scroll
+        >
+          <SourceYieldTable
+            rows={metrics.source_yield.by_source_category}
+            minSample={metrics.min_sample}
+          />
+        </ChartCard>
+      </div>
+
+      <h3 className="rk-group-head">All applications</h3>
+      <div className="rk-note">
+        Population-wide, NOT scoped to the served queue: every logged application counts
+        here, including ones the ranker never served or whose posting can no longer be
+        resolved (those bucket "unknown" for band/source facts). This is a different
+        question from the served-queue section above, not a stricter or looser version of
+        the same one.
+      </div>
+
+      <div className="an-stats">
+        <StatCard
+          label="Response rate (per application)"
+          value={
+            <>
+              {pctOrDash(resp.rate)} <LowSampleBadge show={resp.low_sample} title={lsTitle} />
+            </>
+          }
+          accent={rateAccent(resp.rate)}
+        />
+        <StatCard
+          label={`Ghost rate (no response ≥${ghost.ghost_days}d, mature applications)`}
+          value={
+            <>
+              {pctOrDash(ghost.rate)} <LowSampleBadge show={ghost.low_sample} title={lsTitle} />
+            </>
+          }
+          accent={ghost.rate != null && ghost.rate > 0.25 ? VIZ.red : VIZ.mute}
+        />
+      </div>
+
+      <div className="an-grid">
+        <ChartCard title="Denominators" subtitle="what each all-applications rate above is out of" scroll>
+          <div className="rk-cell-list">
+            <RkCellRow
+              label="Applied -> responded"
+              numerator={resp.n_responded}
+              denominator={resp.n_applied}
+              lowSample={resp.low_sample}
+              lowSampleTitle={lsTitle}
+            />
+            <RkCellRow
+              label="Eligible applications -> ghosted"
+              numerator={ghost.n_ghosted}
+              denominator={ghost.n_applied_eligible}
+              lowSample={ghost.low_sample}
+              lowSampleTitle={lsTitle}
+            />
+            <div className="rk-cell-row">
+              <span className="rk-cell-label">Applied total (incl. below-eligibility-window)</span>
+              <span className="rk-cell-value">n={nfmt(ghost.n_applied_total)}</span>
+            </div>
+          </div>
+        </ChartCard>
+      </div>
+
+      <div className="rk-note">
+        This ghost rate is not the My funnel tab's "Ghosted" stat: that one counts
+        applications sitting ≥14 days in a non-terminal status (status-sitting), computed
+        the moment they cross that age regardless of any reply. This one counts
+        applications with no response signal for ≥{ghost.ghost_days}d after applying
+        (response-silence), only once they are old enough to judge. Different concepts by
+        design -- both are worth watching.
       </div>
     </>
   );

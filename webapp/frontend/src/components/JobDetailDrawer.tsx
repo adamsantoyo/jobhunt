@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useConfig, useJobDetail, usePatchState, useQuickAction } from "../store/queries";
+import { api } from "../api/client";
 import { fmtDate, fmtSalary, flagsList, isHttpUrl } from "../lib/format";
 import { highlightText } from "../lib/highlight";
 import { DEFAULT_STATUSES } from "../lib/statuses";
@@ -140,7 +141,18 @@ function DrawerContent({ job, onClose }: { job: JobFull; onClose: () => void }) 
           {starred ? "★ Unstar" : "☆ Star"}
         </button>
         {isHttpUrl(job.url) ? (
-          <a className="btn btn-link" href={job.url} target="_blank" rel="noopener noreferrer">
+          <a
+            className="btn btn-link"
+            href={job.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => api.captureOpened(job.url_b64)}
+            // Middle-click / scroll-wheel-click opens the link in a new tab
+            // via the browser's native handling without necessarily firing
+            // `click` -- `auxclick` is the event that fires for those
+            // non-primary-button opens (5.5 fix F6), so capture there too.
+            onAuxClick={() => api.captureOpened(job.url_b64)}
+          >
             Open posting ↗
           </a>
         ) : (

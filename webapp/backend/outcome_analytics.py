@@ -245,6 +245,16 @@ def _application_identities(conn: sqlite3.Connection, profile) -> list:
     and re-sorted by (at, id) before outcome facts are derived, so "first
     Applied at" and "first response at" are computed over the identity's
     FULL history, not just one key's slice of it.
+
+    Each identity dict ALSO carries three keys this module's own cells never
+    read -- `applied_at` (the identity's first Applied `at`), `posting_id`
+    (the resolved posting, None for a seen_key-only identity), and
+    `identity_key` (the stable `"pid:<id>"` / `"sk:<seen_key>"` label of the
+    dedupe rule above). They exist so `ranking_metrics.py` can key this SAME
+    computation by posting instead of maintaining a third private copy of
+    "what counts as applied / as a response" (5.5 fix B6). Additive by
+    construction: every pre-existing key keeps its exact meaning, and
+    `_cell`/`_group` continue to read only the dimension and outcome keys.
     """
     event_rows = conn.execute(
         "SELECT id, seen_key, url, old_value, new_value, at, posting_id "
@@ -295,6 +305,12 @@ def _application_identities(conn: sqlite3.Connection, profile) -> list:
 
         identities.append(
             {
+                # Additive (B6) -- see this function's docstring. `posting_id`
+                # is None for a seen_key-only identity; `identity_key` names
+                # which of the two dedupe rules produced this row.
+                "applied_at": first_applied_at,
+                "posting_id": pid,
+                "identity_key": f"pid:{pid}" if pid else f"sk:{identity[1]}",
                 "responded": responded,
                 "phone_screen": "Phone screen" in reached,
                 "interview": "Interview" in reached,

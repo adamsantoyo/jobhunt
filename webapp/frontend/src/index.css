@@ -1166,6 +1166,39 @@ mark.hl {
 .an-pace-line { font-size: 12px; color: var(--fg-dim); }
 .an-pace-note { font-size: 11px; color: var(--fg-mute); }
 
+/* Quality tab (Phase 5.5): ranking-quality metrics, explicit denominators + low-sample badges. */
+.rk-note {
+  color: var(--fg-mute); font-size: 11px; line-height: 1.5;
+  padding: 2px 2px 12px; max-width: 72ch;
+}
+.rk-group-head {
+  font-size: 13px; font-weight: 600; color: var(--fg); margin: 4px 0 0;
+  padding-top: 6px; border-top: 1px solid var(--border-soft);
+}
+.rk-cell-list { display: flex; flex-direction: column; gap: 2px; padding: 4px 4px 2px; }
+.rk-cell-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 5px 6px; border-bottom: 1px solid var(--border-soft); font-size: 12px;
+}
+.rk-cell-row:last-child { border-bottom: none; }
+.rk-cell-label { color: var(--fg-dim); }
+.rk-cell-value {
+  color: var(--fg); font-variant-numeric: tabular-nums;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.rk-low-sample { font-size: 9px; padding: 1px 5px; }
+.rk-table-wrap { overflow-x: auto; }
+.rk-source-table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+.rk-source-table th, .rk-source-table td {
+  padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--border-soft);
+  font-variant-numeric: tabular-nums;
+}
+.rk-source-table th { color: var(--fg-mute); font-weight: 500; font-size: 11px; }
+.rk-source-table th:first-child, .rk-source-table td:first-child {
+  text-align: left; font-variant-numeric: normal;
+}
+.rk-source-key { display: inline-flex; align-items: center; gap: 6px; color: var(--fg-dim); }
+
 /* ============================================================================
    Today (unified styles)
    ========================================================================== */

@@ -551,6 +551,29 @@ def capture_snapshot(
     }
 
 
+def _posting_id_for_url(conn: sqlite3.Connection, url: str) -> str | None:
+    """The posting the ACTIVE (`valid_to IS NULL`) alias row carrying `url`
+    belongs to, newest-first tiebreak -- byte-identical to `canonical_reads.
+    _posting_id_for_url`'s query.
+
+    This is the bridge that actually covers the corpus (5.5 fix B1): every
+    claim writes a `posting_aliases` row (`runstore._insert_alias`), while
+    `job_state.posting_id` is only ever set by migration 19's one-shot
+    backfill -- `ingest.py`'s own `job_state` INSERT does not populate it, so
+    for anything ingested since, that column is NULL. `_capture_today_
+    snapshot` resolves a served queue entry through this same join; resolving
+    an OPEN any other way would leave the two sides of the 5.5 seam naming
+    different postings (or, far more often, one naming a posting and the
+    other naming nothing) and the derived-rank lookup in `record_outcome_
+    event` would find no item to match."""
+    row = conn.execute(
+        "SELECT posting_id FROM posting_aliases WHERE url=? AND valid_to IS NULL "
+        "ORDER BY valid_from DESC, alias_id DESC LIMIT 1",
+        (url,),
+    ).fetchone()
+    return row["posting_id"] if row else None
+
+
 def _resolve_seen_key(conn: sqlite3.Connection, url: str) -> str | None:
     """Mirrors routers/state.py's `_resolve_seen_key` exactly: the `jobs` cache
     wins for any present url, a dormant `job_state` row addressed by its own
@@ -573,10 +596,15 @@ def record_outcome_event(
     Identity resolution: an explicit `posting_id` is used as given (and must
     exist). Otherwise, given a `url`, `seen_key` is resolved the same way
     `routers/state.py._resolve_seen_key` does, and `posting_id` is filled from
-    `job_state.posting_id` when that row has one. An unresolvable url is not an
-    error -- "someone opened a job we no longer track" is still a real event --
-    it is simply stored with `url` as its only identifier; the DDL's CHECK
-    constraint is satisfied by `url` alone.
+    the active `posting_aliases` row for that url (`_posting_id_for_url`),
+    falling back to `job_state.posting_id` when the alias table does not know
+    the url. The alias step is additive (5.5 fix B1's bridge, applied to the
+    read side): every url that resolved before still resolves to the same
+    posting, and the far larger population that only the alias table can name
+    now resolves too. An unresolvable url is not an error -- "someone opened
+    a job we no longer track" is still a real event -- it is simply stored
+    with `url` as its only identifier; the DDL's CHECK constraint is
+    satisfied by `url` alone.
 
     A given `snapshot_id` must reference an existing snapshot (checked up
     front for a clean ValueError rather than relying on the FK to fail the
@@ -586,6 +614,32 @@ def record_outcome_event(
     the same clean-ValueError reason) -- a `rank` with no matching item in that
     snapshot is not "the visitor opened rank 99 of an empty queue," it is a
     caller bug.
+
+    RANK IS SERVER-DERIVED (5.5 fix B2). `rank` never has to leave the
+    client, and normally does not: a caller that names a `snapshot_id` and no
+    `rank` gets the rank looked up from the item matching (snapshot_id,
+    resolved posting_id). This is the whole reason the 5.5 seam was dead --
+    the queue renumbers ranks on every serve, so a rank the client captured
+    at display time is a claim about a DIFFERENT serve than the day's stored
+    snapshot, and validating that pair strictly rejected the exact payload
+    the real client sends.
+
+    Three rules, in the order they apply:
+
+      * `rank` WITHOUT `snapshot_id` is ignored and stored NULL. A rank that
+        names no snapshot points at nothing; storing it dangling would invite
+        a later reader to pair it with whatever snapshot happens to be handy.
+      * `snapshot_id` WITHOUT `rank`: the rank is derived. When no item in
+        that snapshot matches this event's posting (the posting was in the
+        served queue but unresolvable at capture time, or the visitor opened
+        something the day's snapshot never contained), the event DEGRADES to
+        an unattributed open -- stored with `snapshot_id` NULL and `rank`
+        NULL, never rejected. An open is a real fact about the visitor even
+        when the ranking side channel cannot place it, and 422-ing it would
+        throw the fact away to protect a nullable column.
+      * an EXPLICIT (`snapshot_id`, `rank`) pair is still validated exactly
+        as before -- a caller making a specific claim about a specific served
+        position must make a true one.
 
     `idempotency_key` is optional and, when given, deduplicates: a second call
     with the SAME key returns the FIRST call's stored event rather than
@@ -614,23 +668,53 @@ def record_outcome_event(
             raise ValueError(f"unknown posting_id: {posting_id}")
     elif url is not None:
         seen_key = _resolve_seen_key(conn, url)
-        if seen_key is not None:
+        # Alias join first, `job_state` bridge second -- the SAME order (and
+        # the same queries) `routers/queueapi._posting_ids_for` uses when it
+        # captures the day's snapshot, so the two ends of the 5.5 seam always
+        # name the same posting for the same url.
+        posting_id = _posting_id_for_url(conn, url)
+        if posting_id is None and seen_key is not None:
             row = conn.execute(
                 "SELECT posting_id FROM job_state WHERE seen_key=?", (seen_key,)
             ).fetchone()
             if row is not None and row["posting_id"] is not None:
                 posting_id = row["posting_id"]
 
-    if snapshot_id is not None and conn.execute(
-        "SELECT 1 FROM recommendation_snapshots WHERE snapshot_id=?", (snapshot_id,)
-    ).fetchone() is None:
-        raise ValueError(f"unknown snapshot_id: {snapshot_id}")
+    # B2, rule 1: a rank naming no snapshot points at nothing.
+    if snapshot_id is None:
+        rank = None
 
-    if snapshot_id is not None and rank is not None and conn.execute(
-        "SELECT 1 FROM recommendation_snapshot_items WHERE snapshot_id=? AND rank=?",
-        (snapshot_id, rank),
-    ).fetchone() is None:
-        raise ValueError(f"no snapshot item at snapshot_id={snapshot_id!r} rank={rank!r}")
+    if snapshot_id is not None:
+        if conn.execute(
+            "SELECT 1 FROM recommendation_snapshots WHERE snapshot_id=?", (snapshot_id,)
+        ).fetchone() is None:
+            raise ValueError(f"unknown snapshot_id: {snapshot_id}")
+
+        if rank is not None:
+            # B2, rule 3: an explicit pair is a specific claim -- validated.
+            if conn.execute(
+                "SELECT 1 FROM recommendation_snapshot_items WHERE snapshot_id=? AND rank=?",
+                (snapshot_id, rank),
+            ).fetchone() is None:
+                raise ValueError(
+                    f"no snapshot item at snapshot_id={snapshot_id!r} rank={rank!r}"
+                )
+        else:
+            # B2, rule 2: derive the rank from the item this snapshot holds
+            # for this posting; degrade to unattributed when there is none.
+            item = (
+                conn.execute(
+                    "SELECT rank FROM recommendation_snapshot_items "
+                    "WHERE snapshot_id=? AND posting_id=?",
+                    (snapshot_id, posting_id),
+                ).fetchone()
+                if posting_id is not None
+                else None
+            )
+            if item is None:
+                snapshot_id = None
+            else:
+                rank = item["rank"]
 
     event_id = str(uuid.uuid4())
     at_value = at or models.now_iso()
