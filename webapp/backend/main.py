@@ -19,6 +19,7 @@ from .db import connect, init_db
 from .ingest import ingest
 from .routers import (
     analytics,
+    backupapi,
     calibrationapi,
     changes,
     configapi,
@@ -137,6 +138,7 @@ for module in (
     queueapi,
     outcomesapi,
     calibrationapi,
+    backupapi,
 ):
     app.include_router(module.router, prefix="/api")
 
